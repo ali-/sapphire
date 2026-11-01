@@ -120,24 +120,9 @@ namespace Sapphire::GUI {
 		}
 
 		SDL_GPUTexture* LoadImage(std::string_view imagePath) {
-			for (const auto& image : images) if (image.path == imagePath) return image.texture;
-			const auto resourcePath = ResourcePath(imagePath);
-			const std::string path = resourcePath.string();
-			SDL_Surface* loadedSurface = SDL_LoadSurface(path.c_str());
-			if (!loadedSurface) return nullptr;
-			SDL_Surface* rgbaSurface = SDL_ConvertSurface(loadedSurface, SDL_PIXELFORMAT_RGBA32);
-			SDL_DestroySurface(loadedSurface);
-			if (!rgbaSurface) return nullptr;
-
-			const int width = rgbaSurface->w;
-			const int height = rgbaSurface->h;
-			std::vector<std::uint8_t> pixels(static_cast<std::size_t>(width) * height * 4);
-			for (int row = 0; row < height; ++row) {
-				const auto* source = static_cast<const std::uint8_t*>(rgbaSurface->pixels) + row * rgbaSurface->pitch;
-				std::memcpy(pixels.data() + static_cast<std::size_t>(row) * width * 4, source, static_cast<std::size_t>(width) * 4);
-			}
-			SDL_DestroySurface(rgbaSurface);
-			SDL_GPUTexture* texture = Graphics::CreateTexture(gpuDevice, width, height, pixels.data());
+			const std::string path(imagePath);
+			for (const auto& image : images) if (image.path == path) return image.texture;
+			SDL_GPUTexture* texture = Graphics::LoadTexture(imagePath);
 			if (texture) images.push_back({path, texture});
 			return texture;
 		}
