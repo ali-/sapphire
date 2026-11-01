@@ -82,9 +82,15 @@ namespace Sapphire {
 	class Light : public Component {
 		public:
 			enum class Type { Directional, Point, Spot };
+			bool enabled = true;
 			Type type = Type::Directional;
 			Vector3 color{1.0f, 1.0f, 1.0f};
 			float intensity = 1.0f;
+			float range = 10.0f;
+			float innerSpotAngle = 25.0f;
+			float outerSpotAngle = 30.0f;
+			bool castShadows = true;
+			float shadowBias = 0.02f;
 	};
 
 	struct MeshVertex {
@@ -107,6 +113,10 @@ namespace Sapphire {
 			std::string maskTexturePath;
 			float displacementScale = 0.05f;
 			bool cullBackfaces = true;
+			bool castShadows = true;
+			bool windAnimated = false;
+			std::uint64_t revision = 0;
+			void MarkDirty() { ++revision; }
 			static MeshData Cube();
 			static MeshData Plane(int subdivisions = 1);
 	};
@@ -162,6 +172,9 @@ namespace Sapphire {
 			Camera* activeCamera = nullptr;
 			Vector3 gravity{0.0f, -9.81f, 0.0f};
 			int chunkSize = 20;
+			bool shadowsEnabled = true;
+			float shadowFar = 10.0f;
+			int shadowResolution = 2048;
 			bool ambientLight = true;
 			Vector3 ambientLightColor{1.0f, 1.0f, 1.0f};
 			bool fogEnabled = false;

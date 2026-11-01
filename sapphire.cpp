@@ -17,7 +17,8 @@ namespace Sapphire {
 		running = true;
 		SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD);
 		Input::Initialize();
-		SDL_Window *window = SDL_CreateWindow(windowTitle, Screen::width, Screen::height, SDL_WINDOW_RESIZABLE);
+		SDL_Window *window = SDL_CreateWindow(windowTitle, Screen::width, Screen::height, SDL_WINDOW_RESIZABLE | SDL_WINDOW_FULLSCREEN);
+		SDL_SetWindowRelativeMouseMode(window, true);
 		SDL_GetWindowSize(window, &Screen::width, &Screen::height);
 		SDL_GPUDevice *gpuDevice = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_MSL, true, "metal");
 		SDL_ClaimWindowForGPUDevice(gpuDevice, window);
@@ -48,6 +49,7 @@ namespace Sapphire {
 					Screen::height = event.window.data2;
 				}
 			}
+			if (Input::GetKeyDown("Y")) Graphics::CycleShadowDebugMode();
 
 			const Uint64 current_time = frameStart;
 			const Uint64 frame_time_ns = current_time - previous_time;
@@ -73,6 +75,16 @@ namespace Sapphire {
 			SDL_WaitAndAcquireGPUSwapchainTexture(commandBuffer, window, &swapchainTexture, &swapchainWidth, &swapchainHeight);
 			if (swapchainTexture) {
 				Graphics::Render(scene, commandBuffer, swapchainTexture, swapchainWidth, swapchainHeight);
+				if (scene.shadowsEnabled && Graphics::ShadowDebugMode() == 1) GUI::Label(10, 10, "Lit green, static shadow red, dynamic blue (Y)");
+				else if (scene.shadowsEnabled && Graphics::ShadowDebugMode() == 2) {
+					const int mapSize = swapchainWidth < 2048 ? static_cast<int>(swapchainWidth / 4) : 512;
+					const int mapX = static_cast<int>(swapchainWidth) - mapSize * 2 - 32;
+					GUI::Label(mapX, 2, "Nearby static and dynamic shadow maps (Y to cycle)");
+					GUI::DebugDepthImage(mapX, 20, mapSize, mapSize, Graphics::ShadowMap(0));
+					GUI::DebugDepthImage(mapX + mapSize, 20, mapSize, mapSize, Graphics::ShadowMap(1));
+					GUI::Label(mapX, mapSize + 22, "Static");
+					GUI::Label(mapX + mapSize, mapSize + 22, "Dynamic");
+				}
 				GUI::Render(commandBuffer, swapchainTexture, swapchainWidth, swapchainHeight);
 			}
 			Graphics::Submit(commandBuffer);
