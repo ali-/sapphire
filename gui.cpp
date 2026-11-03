@@ -22,7 +22,6 @@ namespace Sapphire::GUI {
 			SDL_GPUTexture* texture;
 			Uint32 firstVertex;
 			Uint32 vertexCount;
-			bool depthTexture;
 		};
 
 		struct ImageTexture {
@@ -42,7 +41,6 @@ namespace Sapphire::GUI {
 
 		SDL_GPUDevice* gpuDevice = nullptr;
 		SDL_GPUGraphicsPipeline* pipeline = nullptr;
-		SDL_GPUGraphicsPipeline* depthPipeline = nullptr;
 		SDL_GPUBuffer* vertexBuffer = nullptr;
 		SDL_GPUSampler* sampler = nullptr;
 		SDL_GPUTransferBuffer* vertexTransferBuffer = nullptr;
@@ -73,16 +71,6 @@ namespace Sapphire::GUI {
 			fragment float4 main0(FragmentInput input [[stage_in]],
 				texture2d<float> image [[texture(0)]], sampler imageSampler [[sampler(0)]]) {
 				return image.sample(imageSampler, input.uv);
-			}
-		)";
-
-		constexpr const char* depthFragmentShaderSource = R"(
-			#include <metal_stdlib>
-			using namespace metal;
-			struct FragmentInput { float4 position [[position]]; float2 uv; };
-			fragment float4 main0(FragmentInput input [[stage_in]], depth2d<float> image [[texture(0)]], sampler imageSampler [[sampler(0)]]) {
-				const float depth = image.sample(imageSampler, input.uv);
-				return float4(depth, depth, depth, 1.0);
 			}
 		)";
 
@@ -118,7 +106,7 @@ namespace Sapphire::GUI {
 			return fontAtlas.texture != nullptr;
 		}
 
-		void QueueQuad(SDL_GPUTexture* texture, float x, float y, float width, float height, float u0, float v0, float u1, float v1, bool depthTexture = false) {
+		void QueueQuad(SDL_GPUTexture* texture, float x, float y, float width, float height, float u0, float v0, float u1, float v1) {
 			if (vertices.size() + 6 > maxVertices) return;
 			const Uint32 firstVertex = static_cast<Uint32>(vertices.size());
 			vertices.push_back({{x, y}, {u0, v0}});
@@ -127,24 +115,23 @@ namespace Sapphire::GUI {
 			vertices.push_back({{x, y}, {u0, v0}});
 			vertices.push_back({{x + width, y + height}, {u1, v1}});
 			vertices.push_back({{x, y + height}, {u0, v1}});
-			if (!drawRanges.empty() && drawRanges.back().texture == texture && drawRanges.back().depthTexture == depthTexture) drawRanges.back().vertexCount += 6;
-			else drawRanges.push_back({texture, firstVertex, 6, depthTexture});
+			if (!drawRanges.empty() && drawRanges.back().texture == texture) drawRanges.back().vertexCount += 6;
+			else drawRanges.push_back({texture, firstVertex, 6});
 		}
 
 		SDL_GPUTexture* LoadImage(std::string_view imagePath) {
-			const std::string path(imagePath);
-			for (const auto& image : images) if (image.path == path) return image.texture;
+			for (const auto& image : images) if (image.path == imagePath) return image.texture;
 			SDL_GPUTexture* texture = Graphics::LoadTexture(imagePath);
-			if (texture) images.push_back({path, texture});
+			if (texture) images.push_back({std::string(imagePath), texture});
 			return texture;
 		}
 	}
 
 	bool Initialize(SDL_GPUDevice* device, SDL_Window* window) {
+		Loading::Timer loading("GUI shaders and font atlas");
 		gpuDevice = device;
 		SDL_GPUShader* vertexShader = Graphics::CreateShader(gpuDevice, vertexShaderSource, SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL);
 		SDL_GPUShader* fragmentShader = Graphics::CreateShader(gpuDevice, fragmentShaderSource, SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 1);
-		SDL_GPUShader* depthFragmentShader = Graphics::CreateShader(gpuDevice, depthFragmentShaderSource, SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 1);
 
 		SDL_GPUVertexBufferDescription vertexBufferDescription{};
 		vertexBufferDescription.slot = 0;
@@ -182,11 +169,8 @@ namespace Sapphire::GUI {
 		pipelineInfo.target_info.num_color_targets = 1;
 		pipelineInfo.target_info.color_target_descriptions = &colorTarget;
 		pipeline = Graphics::CreatePipeline(gpuDevice, pipelineInfo);
-		pipelineInfo.fragment_shader = depthFragmentShader;
-		depthPipeline = Graphics::CreatePipeline(gpuDevice, pipelineInfo);
 		SDL_ReleaseGPUShader(gpuDevice, vertexShader);
 		SDL_ReleaseGPUShader(gpuDevice, fragmentShader);
-		SDL_ReleaseGPUShader(gpuDevice, depthFragmentShader);
 
 		SDL_GPUSamplerCreateInfo samplerInfo{};
 		samplerInfo.min_filter = SDL_GPU_FILTER_NEAREST;
@@ -197,12 +181,10 @@ namespace Sapphire::GUI {
 		samplerInfo.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
 		sampler = Graphics::CreateSampler(gpuDevice, samplerInfo);
 		vertexBuffer = Graphics::CreateBuffer(gpuDevice, SDL_GPU_BUFFERUSAGE_VERTEX, static_cast<Uint32>(sizeof(Vertex) * maxVertices));
-		return pipeline && depthPipeline && sampler && vertexBuffer && LoadFont();
+		return pipeline && sampler && vertexBuffer && LoadFont();
 	}
 
 	void BeginFrame() {
-		if (vertexTransferBuffer) SDL_ReleaseGPUTransferBuffer(gpuDevice, vertexTransferBuffer);
-		vertexTransferBuffer = nullptr;
 		vertices.clear();
 		drawRanges.clear();
 	}
@@ -232,30 +214,25 @@ namespace Sapphire::GUI {
 		}
 	}
 
-	void DebugDepthImage(int x, int y, int width, int height, SDL_GPUTexture* texture) {
-		if (texture) QueueQuad(texture, static_cast<float>(x), static_cast<float>(y), static_cast<float>(width), static_cast<float>(height), 0.0f, 0.0f, 1.0f, 1.0f, true);
-	}
-
 	void Render(SDL_GPUCommandBuffer* commandBuffer, SDL_GPUTexture* colorTarget, Uint32 width, Uint32 height) {
-		if (!colorTarget) return;
+		if (!colorTarget || !width || !height) return;
+		Graphics::FlushUploads();
 		if (!vertices.empty()) {
 			for (auto& vertex : vertices) {
 				vertex.position[0] = vertex.position[0] / static_cast<float>(width) * 2.0f - 1.0f;
 				vertex.position[1] = 1.0f - vertex.position[1] / static_cast<float>(height) * 2.0f;
 			}
-			SDL_GPUTransferBufferCreateInfo transferInfo{};
-			transferInfo.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
-			transferInfo.size = static_cast<Uint32>(vertices.size() * sizeof(Vertex));
-			vertexTransferBuffer = SDL_CreateGPUTransferBuffer(gpuDevice, &transferInfo);
-			void* mappedVertices = SDL_MapGPUTransferBuffer(gpuDevice, vertexTransferBuffer, false);
-			std::memcpy(mappedVertices, vertices.data(), transferInfo.size);
+			const Uint32 vertexBytes = static_cast<Uint32>(vertices.size() * sizeof(Vertex));
+			if (!vertexTransferBuffer) vertexTransferBuffer = Graphics::CreateTransferBuffer(gpuDevice, static_cast<Uint32>(maxVertices * sizeof(Vertex)));
+			void* mappedVertices = SDL_MapGPUTransferBuffer(gpuDevice, vertexTransferBuffer, true);
+			std::memcpy(mappedVertices, vertices.data(), vertexBytes);
 			SDL_UnmapGPUTransferBuffer(gpuDevice, vertexTransferBuffer);
 			SDL_GPUCopyPass* copyPass = SDL_BeginGPUCopyPass(commandBuffer);
 			SDL_GPUTransferBufferLocation source{};
 			source.transfer_buffer = vertexTransferBuffer;
 			SDL_GPUBufferRegion destination{};
 			destination.buffer = vertexBuffer;
-			destination.size = transferInfo.size;
+			destination.size = vertexBytes;
 			SDL_UploadToGPUBuffer(copyPass, &source, &destination, true);
 			SDL_EndGPUCopyPass(copyPass);
 		}
@@ -271,13 +248,8 @@ namespace Sapphire::GUI {
 			SDL_BindGPUVertexBuffers(renderPass, 0, &vertexBinding, 1);
 			SDL_GPUTextureSamplerBinding samplerBinding{};
 			samplerBinding.sampler = sampler;
-			SDL_GPUGraphicsPipeline* activePipeline = nullptr;
+			SDL_BindGPUGraphicsPipeline(renderPass, pipeline);
 			for (const auto& range : drawRanges) {
-				SDL_GPUGraphicsPipeline* rangePipeline = range.depthTexture ? depthPipeline : pipeline;
-				if (rangePipeline != activePipeline) {
-					SDL_BindGPUGraphicsPipeline(renderPass, rangePipeline);
-					activePipeline = rangePipeline;
-				}
 				samplerBinding.texture = range.texture;
 				SDL_BindGPUFragmentSamplers(renderPass, 0, &samplerBinding, 1);
 				SDL_DrawGPUPrimitives(renderPass, range.vertexCount, 1, range.firstVertex, 0);
@@ -288,17 +260,16 @@ namespace Sapphire::GUI {
 
 	void Shutdown() {
 		if (!gpuDevice) return;
-		if (vertexTransferBuffer) SDL_ReleaseGPUTransferBuffer(gpuDevice, vertexTransferBuffer);
-		if (vertexBuffer) SDL_ReleaseGPUBuffer(gpuDevice, vertexBuffer);
+		if (vertexTransferBuffer) Graphics::ReleaseTransferBuffer(gpuDevice, vertexTransferBuffer);
+		if (vertexBuffer) Graphics::ReleaseBuffer(gpuDevice, vertexBuffer);
 		if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
-		if (depthPipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, depthPipeline);
 		if (sampler) SDL_ReleaseGPUSampler(gpuDevice, sampler);
-		if (fontAtlas.texture) SDL_ReleaseGPUTexture(gpuDevice, fontAtlas.texture);
-		for (const auto& image : images) SDL_ReleaseGPUTexture(gpuDevice, image.texture);
+		if (fontAtlas.texture) Graphics::ReleaseTexture(gpuDevice, fontAtlas.texture);
+		for (const auto& image : images) Graphics::ReleaseTexture(gpuDevice, image.texture);
 		gpuDevice = nullptr;
 		pipeline = nullptr;
-		depthPipeline = nullptr;
 		vertexBuffer = nullptr;
+		vertexTransferBuffer = nullptr;
 		sampler = nullptr;
 		fontAtlas = FontAtlas{};
 		images.clear();

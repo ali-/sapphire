@@ -14,29 +14,37 @@ namespace Sapphire {
 	}
 
 	int App(const char* windowTitle, Scene& scene) {
+		Loading::Timer loading("Engine initialization");
+		Loading::Timer windowLoading("SDL, window and GPU device");
 		running = true;
 		SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD);
 		Input::Initialize();
 		SDL_Window *window = SDL_CreateWindow(windowTitle, Screen::width, Screen::height, SDL_WINDOW_RESIZABLE | SDL_WINDOW_FULLSCREEN);
 		SDL_SetWindowRelativeMouseMode(window, true);
 		SDL_GetWindowSize(window, &Screen::width, &Screen::height);
-		SDL_GPUDevice *gpuDevice = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_MSL, true, "metal");
+		SDL_GPUDevice *gpuDevice = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_MSL, SDL_GetHintBoolean("SAPPHIRE_GPU_DEBUG", false), "metal");
 		SDL_ClaimWindowForGPUDevice(gpuDevice, window);
 		SDL_SetWindowAspectRatio(window, 16.0f / 9.0f, 16.0f / 9.0f);
+		windowLoading.Stop();
 		Graphics::Initialize(gpuDevice, window);
 		GUI::Initialize(gpuDevice, window);
 
 		const Uint64 fixed_step_ns = static_cast<Uint64>(Time::fixedDeltaTime * 1'000'000'000.0f);
 		Uint64 accumulator = 0;
+		Loading::Timer sceneLoading("Scene object initialization");
 		for (auto& object : scene.Objects()) object->Initialize();
 		for (auto& object : scene.Objects()) {
 			if (auto* body = object->GetComponent<PhysicsBody>()) body->previousPosition = object->transform.position;
 		}
 		scene.SelectFirstCamera();
+		sceneLoading.Stop();
 		Physics::Initialize(scene);
 		Graphics::PrepareScene(scene);
+		loading.Stop();
+		bool firstFrame = true;
 		Uint64 previous_time = SDL_GetTicksNS();
 		while (running) {
+			Loading::Timer frameLoading("First frame CPU preparation, swapchain acquire and submission", firstFrame);
 			const Uint64 frameStart = SDL_GetTicksNS();
 			Input::BeginFrame();
 			GUI::BeginFrame();
@@ -49,7 +57,6 @@ namespace Sapphire {
 					Screen::height = event.window.data2;
 				}
 			}
-			if (Input::GetKeyDown("Y")) Graphics::CycleShadowDebugMode();
 
 			const Uint64 current_time = frameStart;
 			const Uint64 frame_time_ns = current_time - previous_time;
@@ -75,20 +82,12 @@ namespace Sapphire {
 			SDL_WaitAndAcquireGPUSwapchainTexture(commandBuffer, window, &swapchainTexture, &swapchainWidth, &swapchainHeight);
 			if (swapchainTexture) {
 				Graphics::Render(scene, commandBuffer, swapchainTexture, swapchainWidth, swapchainHeight);
-				if (scene.shadowsEnabled && Graphics::ShadowDebugMode() == 1) GUI::Label(10, 10, "Lit green, static shadow red, dynamic blue (Y)");
-				else if (scene.shadowsEnabled && Graphics::ShadowDebugMode() == 2) {
-					const int mapSize = swapchainWidth < 2048 ? static_cast<int>(swapchainWidth / 4) : 512;
-					const int mapX = static_cast<int>(swapchainWidth) - mapSize * 2 - 32;
-					GUI::Label(mapX, 2, "Nearby static and dynamic shadow maps (Y to cycle)");
-					GUI::DebugDepthImage(mapX, 20, mapSize, mapSize, Graphics::ShadowMap(0));
-					GUI::DebugDepthImage(mapX + mapSize, 20, mapSize, mapSize, Graphics::ShadowMap(1));
-					GUI::Label(mapX, mapSize + 22, "Static");
-					GUI::Label(mapX + mapSize, mapSize + 22, "Dynamic");
-				}
 				GUI::Render(commandBuffer, swapchainTexture, swapchainWidth, swapchainHeight);
 			}
 			Graphics::Submit(commandBuffer);
-			SDL_Delay(1);
+			frameLoading.Stop();
+			firstFrame = false;
+			if (!swapchainTexture) SDL_Delay(10);
 		}
 
 		GUI::Shutdown();
