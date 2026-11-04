@@ -7,6 +7,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <array>
+#include <map>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_gpu.h>
 #include "graphics.cpp"
@@ -20,13 +22,8 @@ namespace Sapphire::GUI {
 
 		struct DrawRange {
 			SDL_GPUTexture* texture;
-			Uint32 firstVertex;
-			Uint32 vertexCount;
-		};
-
-		struct ImageTexture {
-			std::string path;
-			SDL_GPUTexture* texture;
+			Uint32 firstIndex;
+			Uint32 indexCount;
 		};
 
 		struct FontAtlas {
@@ -37,17 +34,20 @@ namespace Sapphire::GUI {
 			int firstCharacter = 0;
 			int glyphCount = 0;
 			int advance = 0;
+			std::vector<std::array<float, 4>> glyphs;
 		};
 
 		SDL_GPUDevice* gpuDevice = nullptr;
 		SDL_GPUGraphicsPipeline* pipeline = nullptr;
 		SDL_GPUBuffer* vertexBuffer = nullptr;
+		SDL_GPUBuffer* indexBuffer = nullptr;
 		SDL_GPUSampler* sampler = nullptr;
 		SDL_GPUTransferBuffer* vertexTransferBuffer = nullptr;
 		FontAtlas fontAtlas;
 		std::vector<Vertex> vertices;
 		std::vector<DrawRange> drawRanges;
-		std::vector<ImageTexture> images;
+		std::map<std::string, SDL_GPUTexture*, std::less<>> images;
+		bool overflowReported = false;
 		constexpr std::size_t maxVertices = 16384;
 		constexpr std::size_t headerSize = 20;
 
@@ -56,9 +56,9 @@ namespace Sapphire::GUI {
 			using namespace metal;
 			struct VertexInput { float2 position [[attribute(0)]]; float2 uv [[attribute(1)]]; };
 			struct VertexOutput { float4 position [[position]]; float2 uv; };
-			vertex VertexOutput main0(VertexInput input [[stage_in]]) {
+			vertex VertexOutput main0(VertexInput input [[stage_in]], constant float2& scale [[buffer(0)]]) {
 				VertexOutput output;
-				output.position = float4(input.position, 0.0, 1.0);
+				output.position = float4(input.position * scale + float2(-1.0, 1.0), 0.0, 1.0);
 				output.uv = input.uv;
 				return output;
 			}
@@ -78,12 +78,8 @@ namespace Sapphire::GUI {
 			return static_cast<std::uint16_t>(bytes[offset] | (bytes[offset + 1] << 8));
 		}
 
-		std::filesystem::path ResourcePath(std::string_view fileName) {
-			return std::filesystem::path(SDL_GetBasePath()) / ".." / "resources" / std::string(fileName);
-		}
-
 		bool LoadFont() {
-			std::ifstream file(ResourcePath("iosevka.sbf"), std::ios::binary);
+			std::ifstream file(Graphics::ResourcePath("iosevka.sbf"), std::ios::binary);
 			std::vector<std::uint8_t> bytes(std::istreambuf_iterator<char>(file), {});
 			if (bytes.size() < headerSize || std::memcmp(bytes.data(), "SBF1", 4) != 0) return false;
 
@@ -102,27 +98,35 @@ namespace Sapphire::GUI {
 				width != fontAtlas.columns * fontAtlas.cellWidth || height != rows * fontAtlas.cellHeight ||
 				pixelBytes != bytes.size() - headerSize) return false;
 
+			fontAtlas.glyphs.reserve(fontAtlas.glyphCount);
+			for (int index = 0; index < fontAtlas.glyphCount; ++index) {
+				const int column = index % fontAtlas.columns;
+				const int row = index / fontAtlas.columns;
+				fontAtlas.glyphs.push_back({static_cast<float>(column) / fontAtlas.columns, static_cast<float>(row) / rows, static_cast<float>(column + 1) / fontAtlas.columns, static_cast<float>(row + 1) / rows});
+			}
 			fontAtlas.texture = Graphics::CreateTexture(gpuDevice, width, height, bytes.data() + headerSize);
 			return fontAtlas.texture != nullptr;
 		}
 
 		void QueueQuad(SDL_GPUTexture* texture, float x, float y, float width, float height, float u0, float v0, float u1, float v1) {
-			if (vertices.size() + 6 > maxVertices) return;
-			const Uint32 firstVertex = static_cast<Uint32>(vertices.size());
+			if (vertices.size() + 4 > maxVertices) {
+				if (!overflowReported) SDL_Log("GUI vertex capacity exceeded");
+				overflowReported = true;
+				return;
+			}
+			const Uint32 firstIndex = static_cast<Uint32>(vertices.size() / 4 * 6);
 			vertices.push_back({{x, y}, {u0, v0}});
 			vertices.push_back({{x + width, y}, {u1, v0}});
 			vertices.push_back({{x + width, y + height}, {u1, v1}});
-			vertices.push_back({{x, y}, {u0, v0}});
-			vertices.push_back({{x + width, y + height}, {u1, v1}});
 			vertices.push_back({{x, y + height}, {u0, v1}});
-			if (!drawRanges.empty() && drawRanges.back().texture == texture) drawRanges.back().vertexCount += 6;
-			else drawRanges.push_back({texture, firstVertex, 6});
+			if (!drawRanges.empty() && drawRanges.back().texture == texture) drawRanges.back().indexCount += 6;
+			else drawRanges.push_back({texture, firstIndex, 6});
 		}
 
 		SDL_GPUTexture* LoadImage(std::string_view imagePath) {
-			for (const auto& image : images) if (image.path == imagePath) return image.texture;
-			SDL_GPUTexture* texture = Graphics::LoadTexture(imagePath);
-			if (texture) images.push_back({std::string(imagePath), texture});
+			if (auto image = images.find(imagePath); image != images.end()) return image->second;
+			SDL_GPUTexture* texture = Graphics::LoadTexture(imagePath, Graphics::linearOutput, false);
+			images.emplace(std::string(imagePath), texture);
 			return texture;
 		}
 	}
@@ -130,8 +134,14 @@ namespace Sapphire::GUI {
 	bool Initialize(SDL_GPUDevice* device, SDL_Window* window) {
 		Loading::Timer loading("GUI shaders and font atlas");
 		gpuDevice = device;
-		SDL_GPUShader* vertexShader = Graphics::CreateShader(gpuDevice, vertexShaderSource, SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL);
+		SDL_GPUShader* vertexShader = Graphics::CreateShader(gpuDevice, vertexShaderSource, SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 0, 1);
 		SDL_GPUShader* fragmentShader = Graphics::CreateShader(gpuDevice, fragmentShaderSource, SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 1);
+
+		if (!vertexShader || !fragmentShader) {
+			if (vertexShader) SDL_ReleaseGPUShader(gpuDevice, vertexShader);
+			if (fragmentShader) SDL_ReleaseGPUShader(gpuDevice, fragmentShader);
+			return false;
+		}
 
 		SDL_GPUVertexBufferDescription vertexBufferDescription{};
 		vertexBufferDescription.slot = 0;
@@ -181,29 +191,46 @@ namespace Sapphire::GUI {
 		samplerInfo.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
 		sampler = Graphics::CreateSampler(gpuDevice, samplerInfo);
 		vertexBuffer = Graphics::CreateBuffer(gpuDevice, SDL_GPU_BUFFERUSAGE_VERTEX, static_cast<Uint32>(sizeof(Vertex) * maxVertices));
-		return pipeline && sampler && vertexBuffer && LoadFont();
+		std::vector<std::uint16_t> indices;
+		indices.reserve(maxVertices / 4 * 6);
+		for (std::size_t vertex = 0; vertex < maxVertices; vertex += 4) {
+			const auto first = static_cast<std::uint16_t>(vertex);
+			indices.insert(indices.end(), {first, static_cast<std::uint16_t>(first + 1), static_cast<std::uint16_t>(first + 2), first, static_cast<std::uint16_t>(first + 2), static_cast<std::uint16_t>(first + 3)});
+		}
+		indexBuffer = Graphics::UploadBuffer(SDL_GPU_BUFFERUSAGE_INDEX, indices.data(), static_cast<Uint32>(indices.size() * sizeof(std::uint16_t)));
+		return pipeline && sampler && vertexBuffer && indexBuffer && LoadFont();
+	}
+
+	void RetryImages() {
+		for (auto image = images.begin(); image != images.end();) {
+			if (!image->second) image = images.erase(image);
+			else ++image;
+		}
 	}
 
 	void BeginFrame() {
+		overflowReported = false;
 		vertices.clear();
 		drawRanges.clear();
 	}
 
 	void Label(int x, int y, std::string_view text) {
 		const int startX = x;
+		const int endCharacter = fontAtlas.firstCharacter + fontAtlas.glyphCount;
+		const int fallback = '?' >= fontAtlas.firstCharacter && '?' < endCharacter ? '?' - fontAtlas.firstCharacter : 0;
 		for (const unsigned char character : text) {
 			if (character == '\n') {
 				x = startX;
 				y += fontAtlas.cellHeight;
 				continue;
 			}
-			const int endCharacter = fontAtlas.firstCharacter + fontAtlas.glyphCount;
-			const int safeCharacter = character >= fontAtlas.firstCharacter && character < endCharacter ? character : '?';
-			const int index = safeCharacter - fontAtlas.firstCharacter;
-			const int column = index % fontAtlas.columns;
-			const int row = index / fontAtlas.columns;
-			const int rows = (fontAtlas.glyphCount + fontAtlas.columns - 1) / fontAtlas.columns;
-			QueueQuad(fontAtlas.texture, static_cast<float>(x), static_cast<float>(y), static_cast<float>(fontAtlas.cellWidth), static_cast<float>(fontAtlas.cellHeight), static_cast<float>(column) / fontAtlas.columns, static_cast<float>(row) / rows, static_cast<float>(column + 1) / fontAtlas.columns, static_cast<float>(row + 1) / rows);
+			if (character == ' ') {
+				x += fontAtlas.advance;
+				continue;
+			}
+			const int index = character >= fontAtlas.firstCharacter && character < endCharacter ? character - fontAtlas.firstCharacter : fallback;
+			const auto& uv = fontAtlas.glyphs[index];
+			QueueQuad(fontAtlas.texture, static_cast<float>(x), static_cast<float>(y), static_cast<float>(fontAtlas.cellWidth), static_cast<float>(fontAtlas.cellHeight), uv[0], uv[1], uv[2], uv[3]);
 			x += fontAtlas.advance;
 		}
 	}
@@ -217,43 +244,41 @@ namespace Sapphire::GUI {
 	void Render(SDL_GPUCommandBuffer* commandBuffer, SDL_GPUTexture* colorTarget, Uint32 width, Uint32 height) {
 		if (!colorTarget || !width || !height) return;
 		Graphics::FlushUploads();
-		if (!vertices.empty()) {
-			for (auto& vertex : vertices) {
-				vertex.position[0] = vertex.position[0] / static_cast<float>(width) * 2.0f - 1.0f;
-				vertex.position[1] = 1.0f - vertex.position[1] / static_cast<float>(height) * 2.0f;
-			}
-			const Uint32 vertexBytes = static_cast<Uint32>(vertices.size() * sizeof(Vertex));
-			if (!vertexTransferBuffer) vertexTransferBuffer = Graphics::CreateTransferBuffer(gpuDevice, static_cast<Uint32>(maxVertices * sizeof(Vertex)));
-			void* mappedVertices = SDL_MapGPUTransferBuffer(gpuDevice, vertexTransferBuffer, true);
-			std::memcpy(mappedVertices, vertices.data(), vertexBytes);
-			SDL_UnmapGPUTransferBuffer(gpuDevice, vertexTransferBuffer);
-			SDL_GPUCopyPass* copyPass = SDL_BeginGPUCopyPass(commandBuffer);
-			SDL_GPUTransferBufferLocation source{};
-			source.transfer_buffer = vertexTransferBuffer;
-			SDL_GPUBufferRegion destination{};
-			destination.buffer = vertexBuffer;
-			destination.size = vertexBytes;
-			SDL_UploadToGPUBuffer(copyPass, &source, &destination, true);
-			SDL_EndGPUCopyPass(copyPass);
-		}
+		if (vertices.empty()) return;
+		const float scale[2] = {2.0f / width, -2.0f / height};
+		SDL_PushGPUVertexUniformData(commandBuffer, 0, scale, sizeof(scale));
+		const Uint32 vertexBytes = static_cast<Uint32>(vertices.size() * sizeof(Vertex));
+		if (!vertexTransferBuffer) vertexTransferBuffer = Graphics::CreateTransferBuffer(gpuDevice, static_cast<Uint32>(maxVertices * sizeof(Vertex)));
+		void* mappedVertices = SDL_MapGPUTransferBuffer(gpuDevice, vertexTransferBuffer, true);
+		std::memcpy(mappedVertices, vertices.data(), vertexBytes);
+		SDL_UnmapGPUTransferBuffer(gpuDevice, vertexTransferBuffer);
+		SDL_GPUCopyPass* copyPass = SDL_BeginGPUCopyPass(commandBuffer);
+		SDL_GPUTransferBufferLocation source{};
+		source.transfer_buffer = vertexTransferBuffer;
+		SDL_GPUBufferRegion destination{};
+		destination.buffer = vertexBuffer;
+		destination.size = vertexBytes;
+		SDL_UploadToGPUBuffer(copyPass, &source, &destination, true);
+		Graphics::RecordUpload(vertexBytes);
+		SDL_EndGPUCopyPass(copyPass);
 
 		SDL_GPUColorTargetInfo colorInfo{};
 		colorInfo.texture = colorTarget;
 		colorInfo.load_op = SDL_GPU_LOADOP_LOAD;
 		colorInfo.store_op = SDL_GPU_STOREOP_STORE;
 		SDL_GPURenderPass* renderPass = SDL_BeginGPURenderPass(commandBuffer, &colorInfo, 1, nullptr);
-		if (!vertices.empty()) {
-			SDL_GPUBufferBinding vertexBinding{};
-			vertexBinding.buffer = vertexBuffer;
-			SDL_BindGPUVertexBuffers(renderPass, 0, &vertexBinding, 1);
-			SDL_GPUTextureSamplerBinding samplerBinding{};
-			samplerBinding.sampler = sampler;
-			SDL_BindGPUGraphicsPipeline(renderPass, pipeline);
-			for (const auto& range : drawRanges) {
-				samplerBinding.texture = range.texture;
-				SDL_BindGPUFragmentSamplers(renderPass, 0, &samplerBinding, 1);
-				SDL_DrawGPUPrimitives(renderPass, range.vertexCount, 1, range.firstVertex, 0);
-			}
+		SDL_GPUBufferBinding vertexBinding{};
+		vertexBinding.buffer = vertexBuffer;
+		SDL_BindGPUVertexBuffers(renderPass, 0, &vertexBinding, 1);
+		SDL_GPUBufferBinding indexBinding{indexBuffer, 0};
+		SDL_BindGPUIndexBuffer(renderPass, &indexBinding, SDL_GPU_INDEXELEMENTSIZE_16BIT);
+		SDL_GPUTextureSamplerBinding samplerBinding{};
+		samplerBinding.sampler = sampler;
+		SDL_BindGPUGraphicsPipeline(renderPass, pipeline);
+		for (const auto& range : drawRanges) {
+			samplerBinding.texture = range.texture;
+			SDL_BindGPUFragmentSamplers(renderPass, 0, &samplerBinding, 1);
+			SDL_DrawGPUIndexedPrimitives(renderPass, range.indexCount, 1, range.firstIndex, 0, 0);
 		}
 		SDL_EndGPURenderPass(renderPass);
 	}
@@ -262,13 +287,15 @@ namespace Sapphire::GUI {
 		if (!gpuDevice) return;
 		if (vertexTransferBuffer) Graphics::ReleaseTransferBuffer(gpuDevice, vertexTransferBuffer);
 		if (vertexBuffer) Graphics::ReleaseBuffer(gpuDevice, vertexBuffer);
+		if (indexBuffer) Graphics::ReleaseBuffer(gpuDevice, indexBuffer);
 		if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
 		if (sampler) SDL_ReleaseGPUSampler(gpuDevice, sampler);
 		if (fontAtlas.texture) Graphics::ReleaseTexture(gpuDevice, fontAtlas.texture);
-		for (const auto& image : images) Graphics::ReleaseTexture(gpuDevice, image.texture);
+		for (const auto& image : images) Graphics::ReleaseTexture(gpuDevice, image.second);
 		gpuDevice = nullptr;
 		pipeline = nullptr;
 		vertexBuffer = nullptr;
+		indexBuffer = nullptr;
 		vertexTransferBuffer = nullptr;
 		sampler = nullptr;
 		fontAtlas = FontAtlas{};

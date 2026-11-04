@@ -11,6 +11,8 @@
 #include <tuple>
 #include <unordered_map>
 #include <vector>
+#include <utility>
+#include <stdexcept>
 
 namespace Sapphire {
 	class Object;
@@ -164,7 +166,7 @@ namespace Sapphire {
 				normal.values[2] * value.x + normal.values[6] * value.y + normal.values[10] * value.z
 			};
 			const float length = std::sqrt(result.x * result.x + result.y * result.y + result.z * result.z);
-			if (length > 0.0001f) {
+			if (length > 0.0f) {
 				result.x /= length;
 				result.y /= length;
 				result.z /= length;
@@ -209,6 +211,14 @@ namespace Sapphire {
 			const Vector3 halfSize = Scale(Subtract(bounds.maximum, bounds.minimum), 0.5f);
 			const Vector3 extent{std::abs(matrix.values[0]) * halfSize.x + std::abs(matrix.values[4]) * halfSize.y + std::abs(matrix.values[8]) * halfSize.z, std::abs(matrix.values[1]) * halfSize.x + std::abs(matrix.values[5]) * halfSize.y + std::abs(matrix.values[9]) * halfSize.z, std::abs(matrix.values[2]) * halfSize.x + std::abs(matrix.values[6]) * halfSize.y + std::abs(matrix.values[10]) * halfSize.z};
 			return {Subtract(center, extent), Add(center, extent)};
+		}
+
+		std::pair<float, float> ProjectBounds(const Bounds& bounds, const Vector3& axis) {
+			const Vector3 center = Scale(Add(bounds.minimum, bounds.maximum), 0.5f);
+			const Vector3 extent = Scale(Subtract(bounds.maximum, bounds.minimum), 0.5f);
+			const float projection = Dot(center, axis);
+			const float radius = std::abs(axis.x) * extent.x + std::abs(axis.y) * extent.y + std::abs(axis.z) * extent.z;
+			return {projection - radius, projection + radius};
 		}
 
 		bool IntersectsSphere(const Bounds& bounds, const Vector3& center, float radius) {
@@ -257,6 +267,12 @@ namespace Sapphire {
 	struct MeshData {
 		std::vector<MeshVertex> vertices;
 		std::vector<std::uint32_t> indices;
+
+		void Validate() const {
+			if (vertices.size() > std::numeric_limits<std::uint32_t>::max() / sizeof(MeshVertex) || indices.size() > std::numeric_limits<std::uint32_t>::max() / sizeof(std::uint32_t)) throw std::length_error("Mesh exceeds GPU buffer size");
+			for (const auto& vertex : vertices) if (!std::isfinite(vertex.position.x) || !std::isfinite(vertex.position.y) || !std::isfinite(vertex.position.z)) throw std::invalid_argument("Mesh position must be finite");
+			for (auto index : indices) if (index >= vertices.size()) throw std::out_of_range("Mesh index exceeds vertex count");
+		}
 	};
 
 	struct Material {
@@ -300,6 +316,16 @@ namespace Sapphire {
 			static MeshData Plane(int subdivisions = 1);
 	};
 
+	struct MeshRevision {
+		std::uint64_t revision = 0;
+		const MeshVertex* vertices = nullptr;
+		const std::uint32_t* indices = nullptr;
+		std::size_t vertexCount = 0;
+		std::size_t indexCount = 0;
+		bool Matches(const Mesh& mesh) const { return revision == mesh.revision && vertices == mesh.data.vertices.data() && indices == mesh.data.indices.data() && vertexCount == mesh.data.vertices.size() && indexCount == mesh.data.indices.size(); }
+		void Set(const Mesh& mesh) { revision = mesh.revision; vertices = mesh.data.vertices.data(); indices = mesh.data.indices.data(); vertexCount = mesh.data.vertices.size(); indexCount = mesh.data.indices.size(); }
+	};
+
 	class Object {
 		public:
 			std::string name;
@@ -307,7 +333,7 @@ namespace Sapphire {
 			Scene* scene = nullptr;
 			Transform transform;
 			bool renderStatic = true;
-			explicit Object(std::string name) : name(name) {}
+			explicit Object(std::string name) : name(std::move(name)) {}
 			virtual void Initialize() {}
 			virtual void Update() {}
 			virtual void FixedUpdate() {}
@@ -317,17 +343,22 @@ namespace Sapphire {
 			template <typename T>
 			T& AddComponent() {
 				components.push_back(std::make_unique<T>());
+				componentCache.clear();
 				components.back()->owner = this;
 				return static_cast<T&>(*components.back());
 			}
 
 			template <typename T>
 			T* GetComponent() {
+				static const char type = 0;
+				for (const auto& entry : componentCache) if (entry.first == &type) return static_cast<T*>(entry.second);
 				for (auto& component : components) {
 					if (auto* match = dynamic_cast<T*>(component.get())) {
+						componentCache.emplace_back(&type, match);
 						return match;
 					}
 				}
+				componentCache.emplace_back(&type, nullptr);
 				return nullptr;
 			}
 
@@ -343,6 +374,7 @@ namespace Sapphire {
 		
 		private:
 			std::vector<std::unique_ptr<Component>> components;
+			std::vector<std::pair<const void*, Component*>> componentCache;
 			std::unordered_map<std::string, std::any> properties;
 	};
 
@@ -350,7 +382,7 @@ namespace Sapphire {
 		public:
 			Camera* activeCamera = nullptr;
 			Vector3 gravity{0.0f, -9.81f, 0.0f};
-			int chunkSize = 20;
+			int cellSize = 20;
 			bool shadowsEnabled = true;
 			float shadowFar = 10.0f;
 			int shadowResolution = 2048;
@@ -358,19 +390,18 @@ namespace Sapphire {
 			Vector3 ambientLightColor{1.0f, 1.0f, 1.0f};
 			bool fogEnabled = false;
 			Vector3 fogColor;
-			float fogNear = 0.0f;
-			float fogFar = 1000.0f;
+			Vector3 backgroundColor;
 
 			template <typename T = Object>
 			T& CreateObject(std::string name) {
-				objects.push_back(std::make_unique<T>(name));
+				objects.push_back(std::make_unique<T>(std::move(name)));
 				objects.back()->scene = this;
 				return static_cast<T&>(*objects.back());
 			}
 
 			template <typename T>
-			void AddObject(const T& object) {
-				objects.push_back(std::make_unique<T>(object));
+			void AddObject(std::unique_ptr<T> object) {
+				objects.push_back(std::move(object));
 				objects.back()->scene = this;
 			}
 

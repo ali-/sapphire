@@ -20,7 +20,7 @@ namespace Sapphire::Loading {
 				if (!enabled) return;
 				const double milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 				enabled = false;
-				std::cout << "[loading] " << name << " finished in " << milliseconds << " ms" << std::endl;
+				std::cout << "[loading] " << name << " finished in " << milliseconds << " ms\n";
 			}
 
 			~Timer() { Stop(); }

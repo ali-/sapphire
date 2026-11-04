@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
-#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -19,6 +18,17 @@ namespace Sapphire {
 			bool grounded = false;
 			float slopeLimit = 45.0f;
 			float stepHeight = 0.3f;
+			float SlopeCosine() const {
+				if (cachedSlope != slopeLimit) {
+					cachedSlope = slopeLimit;
+					cachedCosine = std::cos(slopeLimit * Math::degreesToRadians);
+				}
+				return cachedCosine;
+			}
+
+		private:
+			mutable float cachedSlope = std::numeric_limits<float>::quiet_NaN();
+			mutable float cachedCosine = 0.0f;
 	};
 
 	class Collider : public Component {
@@ -61,8 +71,6 @@ namespace Sapphire {
 
 			struct Triangle {
 				std::uint32_t indices[3];
-				Bounds bounds;
-				Vector3 center;
 			};
 
 			struct BvhNode {
@@ -73,23 +81,16 @@ namespace Sapphire {
 				int right = -1;
 			};
 
-			struct MeshRevision {
-				std::uint64_t revision = 0;
-				const MeshVertex* vertices = nullptr;
-				const std::uint32_t* indices = nullptr;
-				std::size_t vertexCount = 0;
-				std::size_t indexCount = 0;
-				bool Matches(const Mesh& mesh) const { return revision == mesh.revision && vertices == mesh.data.vertices.data() && indices == mesh.data.indices.data() && vertexCount == mesh.data.vertices.size() && indexCount == mesh.data.indices.size(); }
-				void Set(const Mesh& mesh) { revision = mesh.revision; vertices = mesh.data.vertices.data(); indices = mesh.data.indices.data(); vertexCount = mesh.data.vertices.size(); indexCount = mesh.data.indices.size(); }
-			};
 
 			struct MeshBounds {
 				Bounds bounds;
 				MeshRevision revision;
+				std::uint64_t generation = 0;
 			};
 
 			struct MeshTree {
 				MeshRevision revision;
+				std::uint64_t generation = 0;
 				std::vector<Triangle> triangles;
 				std::vector<std::uint32_t> order;
 				std::vector<BvhNode> nodes;
@@ -107,7 +108,7 @@ namespace Sapphire {
 			};
 
 			bool IsWalkable(const PhysicsBody& body, const Contact& contact) {
-				return contact.hit && contact.surfaceNormal.y >= std::cos(body.slopeLimit * Math::degreesToRadians);
+				return contact.hit && contact.surfaceNormal.y >= body.SlopeCosine();
 			}
 
 			bool IsCapsuleFootContact(const Capsule& capsule, const Contact& contact) {
@@ -121,9 +122,9 @@ namespace Sapphire {
 				return IsWalkable(body, contact) && IsCapsuleFootContact(capsule, contact);
 			}
 
-			bool PreferCapsuleHit(const Contact& candidate, const Contact& current, const Capsule& capsule, const Vector3& displacement, const PhysicsBody* floorBody) {
+			bool PreferCapsuleHit(const Contact& candidate, const Contact& current, const Capsule& capsule, float displacementSquared, const PhysicsBody* floorBody) {
 				if (!current.hit) return true;
-				if (floorBody && std::abs(candidate.time - current.time) * Length(displacement) <= axisEpsilon) {
+				if (floorBody && (candidate.time - current.time) * (candidate.time - current.time) * displacementSquared <= axisEpsilon * axisEpsilon) {
 					const bool candidateSupport = IsCapsuleSupport(capsule, *floorBody, candidate);
 					const bool currentSupport = IsCapsuleSupport(capsule, *floorBody, current);
 					if (candidateSupport != currentSupport) return candidateSupport;
@@ -134,9 +135,25 @@ namespace Sapphire {
 
 			std::unordered_map<const Mesh*, MeshBounds> meshBounds;
 			std::vector<std::uint32_t> triangleCandidates;
-			std::vector<const Mesh*> liveMeshes;
-			std::vector<const Mesh*> liveTreeMeshes;
+			std::uint64_t cacheGeneration = 0;
 			std::unordered_map<const Mesh*, MeshTree> meshTrees;
+
+			struct ColliderRecord {
+				Object* object;
+				Collider* collider;
+				PhysicsBody* body;
+				Box box;
+				Capsule capsule;
+				Bounds bounds;
+				Vector3 axes[3]{};
+			};
+			std::vector<ColliderRecord> colliderRecords;
+			struct BodyRecord {
+				Object* object;
+				PhysicsBody* body;
+				Collider* collider;
+			};
+			std::vector<BodyRecord> bodyRecords;
 
 			const Bounds& GetMeshBounds(const Mesh& mesh) {
 				auto [entry, inserted] = meshBounds.try_emplace(&mesh);
@@ -145,6 +162,7 @@ namespace Sapphire {
 					for (const auto& vertex : mesh.data.vertices) Include(entry->second.bounds, vertex.position);
 					entry->second.revision.Set(mesh);
 				}
+				entry->second.generation = cacheGeneration;
 				return entry->second.bounds;
 			}
 
@@ -189,6 +207,45 @@ namespace Sapphire {
 			Bounds CapsuleBounds(const Capsule& capsule) {
 				const Vector3 extent{capsule.radius, capsule.radius, capsule.radius};
 				return {{std::min(capsule.start.x, capsule.end.x) - extent.x, std::min(capsule.start.y, capsule.end.y) - extent.y, std::min(capsule.start.z, capsule.end.z) - extent.z}, {std::max(capsule.start.x, capsule.end.x) + extent.x, std::max(capsule.start.y, capsule.end.y) + extent.y, std::max(capsule.start.z, capsule.end.z) + extent.z}};
+			}
+
+			template <typename T>
+			void PruneCache(T& cache) {
+				for (auto entry = cache.begin(); entry != cache.end();) {
+					if (entry->second.generation != cacheGeneration) entry = cache.erase(entry);
+					else ++entry;
+				}
+			}
+
+			void SyncColliders(Scene& scene) {
+				++cacheGeneration;
+				colliderRecords.clear();
+				bodyRecords.clear();
+				for (auto& object : scene.Objects()) {
+					auto* collider = object->GetComponent<Collider>();
+					auto* body = object->GetComponent<PhysicsBody>();
+					if (body) bodyRecords.push_back({object.get(), body, collider});
+					if (!collider) continue;
+					ColliderRecord record{object.get(), collider, body, {}, {}, {}};
+					if (collider->isCapsule) {
+						record.capsule = WorldCapsule(*object, *collider);
+						record.bounds = CapsuleBounds(record.capsule);
+					}
+					else if (collider->isMesh) {
+						auto* mesh = object->GetComponent<Mesh>();
+						if (!mesh || mesh->data.vertices.empty()) continue;
+						if (auto tree = meshTrees.find(mesh); tree != meshTrees.end()) tree->second.generation = cacheGeneration;
+						GetAxes(object->transform, record.axes);
+						record.bounds = TransformBounds(GetMeshBounds(*mesh), Model(object->transform));
+					}
+					else {
+						record.box = WorldBox(*object, *collider);
+						record.bounds = BoxBounds(record.box);
+					}
+					colliderRecords.push_back(record);
+				}
+				PruneCache(meshBounds);
+				PruneCache(meshTrees);
 			}
 
 			Bounds SweptBounds(const Capsule& capsule, const Vector3& displacement) {
@@ -310,17 +367,17 @@ namespace Sapphire {
 				for (int index = 0; index < 12; ++index) for (int vertex = 0; vertex < 3; ++vertex) triangles[index][vertex] = corners[indices[index][vertex]];
 			}
 
-			int BuildNode(MeshTree& tree, std::uint32_t first, std::uint32_t count) {
+			int BuildNode(MeshTree& tree, const std::vector<Bounds>& bounds, const std::vector<Vector3>& centersData, std::uint32_t first, std::uint32_t count) {
 				const int nodeIndex = static_cast<int>(tree.nodes.size());
 				tree.nodes.emplace_back();
 				BvhNode node;
 				node.bounds = EmptyBounds();
 				Bounds centers = EmptyBounds();
 				for (std::uint32_t index = first; index < first + count; ++index) {
-					const Triangle& triangle = tree.triangles[tree.order[index]];
-					Include(node.bounds, triangle.bounds.minimum);
-					Include(node.bounds, triangle.bounds.maximum);
-					Include(centers, triangle.center);
+					const auto triangle = tree.order[index];
+					Include(node.bounds, bounds[triangle].minimum);
+					Include(node.bounds, bounds[triangle].maximum);
+					Include(centers, centersData[triangle]);
 				}
 				if (count <= trianglesPerLeaf) {
 					node.first = first;
@@ -333,25 +390,40 @@ namespace Sapphire {
 				if ((axis == 0 ? extent.x : extent.y) < extent.z) axis = 2;
 				const std::uint32_t middle = first + count / 2;
 				std::nth_element(tree.order.begin() + first, tree.order.begin() + middle, tree.order.begin() + first + count, [&](std::uint32_t a, std::uint32_t b) {
-					const Vector3& left = tree.triangles[a].center;
-					const Vector3& right = tree.triangles[b].center;
+					const Vector3& left = centersData[a];
+					const Vector3& right = centersData[b];
 					return axis == 0 ? left.x < right.x : axis == 1 ? left.y < right.y : left.z < right.z;
 				});
-				node.left = BuildNode(tree, first, middle - first);
-				node.right = BuildNode(tree, middle, first + count - middle);
+				node.left = BuildNode(tree, bounds, centersData, first, middle - first);
+				node.right = BuildNode(tree, bounds, centersData, middle, first + count - middle);
 				tree.nodes[nodeIndex] = node;
 				return nodeIndex;
 			}
 
+			struct PositionHash {
+				std::size_t operator()(const std::array<float, 3>& position) const {
+					std::size_t hash = 0;
+					for (float value : position) hash ^= std::hash<float>{}(value) + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+					return hash;
+				}
+			};
+
 			MeshTree BuildTree(const Mesh& mesh) {
+				mesh.data.Validate();
 				MeshTree tree;
 				tree.revision.Set(mesh);
 				const std::size_t triangleCount = mesh.data.indices.size() / 3;
 				Loading::Timer loading("Collision BVH: " + std::to_string(triangleCount) + " triangles");
 				tree.triangles.reserve(triangleCount);
 				tree.order.reserve(triangleCount);
+				tree.nodes.reserve(triangleCount / 2 + 1);
+				std::vector<Bounds> bounds;
+				std::vector<Vector3> centers;
+				bounds.reserve(triangleCount);
+				centers.reserve(triangleCount);
 				float signedVolume = 0.0f;
-				std::map<std::array<float, 3>, std::uint32_t> positionIds;
+				std::unordered_map<std::array<float, 3>, std::uint32_t, PositionHash> positionIds;
+				positionIds.reserve(mesh.data.vertices.size());
 				std::vector<std::uint32_t> vertexIds;
 				vertexIds.reserve(mesh.data.vertices.size());
 				for (const auto& vertex : mesh.data.vertices) {
@@ -363,6 +435,7 @@ namespace Sapphire {
 					int direction = 0;
 				};
 				std::unordered_map<std::uint64_t, EdgeUse> edges;
+				edges.reserve(triangleCount * 2);
 				for (std::size_t index = 0; index + 2 < mesh.data.indices.size(); index += 3) {
 					const Vector3& a = mesh.data.vertices[mesh.data.indices[index]].position;
 					const Vector3& b = mesh.data.vertices[mesh.data.indices[index + 1]].position;
@@ -382,24 +455,26 @@ namespace Sapphire {
 					triangle.indices[0] = mesh.data.indices[index];
 					triangle.indices[1] = mesh.data.indices[index + 1];
 					triangle.indices[2] = mesh.data.indices[index + 2];
-					triangle.bounds = EmptyBounds();
-					Include(triangle.bounds, a);
-					Include(triangle.bounds, b);
-					Include(triangle.bounds, c);
-					triangle.center = Scale(Add(Add(a, b), c), 1.0f / 3.0f);
+					Bounds triangleBounds = EmptyBounds();
+					Include(triangleBounds, a);
+					Include(triangleBounds, b);
+					Include(triangleBounds, c);
+					bounds.push_back(triangleBounds);
+					centers.push_back(Scale(Add(Add(a, b), c), 1.0f / 3.0f));
 					tree.triangles.push_back(triangle);
 					tree.order.push_back(static_cast<std::uint32_t>(tree.triangles.size() - 1));
 					signedVolume += Dot(a, Cross(b, c)) / 6.0f;
 				}
 				tree.closed = !edges.empty() && std::all_of(edges.begin(), edges.end(), [](const auto& edge) { return edge.second.count == 2 && edge.second.direction == 0; });
 				tree.winding = tree.closed && signedVolume < 0.0f ? -1.0f : 1.0f;
-				if (!tree.triangles.empty()) BuildNode(tree, 0, static_cast<std::uint32_t>(tree.triangles.size()));
+				if (!tree.triangles.empty()) BuildNode(tree, bounds, centers, 0, static_cast<std::uint32_t>(tree.triangles.size()));
 				return tree;
 			}
 
 			MeshTree& GetTree(const Mesh& mesh) {
 				auto [entry, inserted] = meshTrees.try_emplace(&mesh);
 				if (inserted || !entry->second.revision.Matches(mesh)) entry->second = BuildTree(mesh);
+				entry->second.generation = cacheGeneration;
 				return entry->second;
 			}
 
@@ -414,7 +489,7 @@ namespace Sapphire {
 				QueryNode(tree, node.right, queryBounds, output);
 			}
 
-			void QueryTree(const MeshTree& tree, Object& meshObject, const Bounds& queryBounds, std::vector<std::uint32_t>& output) {
+			void QueryTree(const MeshTree& tree, Object& meshObject, const Bounds& queryBounds, const Vector3 (&axes)[3], std::vector<std::uint32_t>& output) {
 				output.clear();
 				if (tree.nodes.empty()) return;
 				const Transform& transform = meshObject.transform;
@@ -422,18 +497,72 @@ namespace Sapphire {
 					output.assign(tree.order.begin(), tree.order.end());
 					return;
 				}
-				Vector3 axes[3];
-				GetAxes(transform, axes);
-				Bounds localBounds = EmptyBounds();
-				for (int corner = 0; corner < 8; ++corner) {
-					const Vector3 point{corner & 1 ? queryBounds.maximum.x : queryBounds.minimum.x, corner & 2 ? queryBounds.maximum.y : queryBounds.minimum.y, corner & 4 ? queryBounds.maximum.z : queryBounds.minimum.z};
-					const Vector3 offset = Subtract(point, transform.position);
-					Include(localBounds, {Dot(offset, axes[0]) / transform.scale.x, Dot(offset, axes[1]) / transform.scale.y, Dot(offset, axes[2]) / transform.scale.z});
-				}
+				const Vector3 center = Subtract(Scale(Add(queryBounds.minimum, queryBounds.maximum), 0.5f), transform.position);
+				const Vector3 extent = Scale(Subtract(queryBounds.maximum, queryBounds.minimum), 0.5f);
+				const Vector3 localCenter{Dot(center, axes[0]) / transform.scale.x, Dot(center, axes[1]) / transform.scale.y, Dot(center, axes[2]) / transform.scale.z};
+				const auto radius = [&](const Vector3& axis, float scale) { return (std::abs(axis.x) * extent.x + std::abs(axis.y) * extent.y + std::abs(axis.z) * extent.z) / std::abs(scale); };
+				const Vector3 localExtent{radius(axes[0], transform.scale.x), radius(axes[1], transform.scale.y), radius(axes[2], transform.scale.z)};
+				Bounds localBounds{Subtract(localCenter, localExtent), Add(localCenter, localExtent)};
 				const Vector3 padding{axisEpsilon, axisEpsilon, axisEpsilon};
 				localBounds.minimum = Subtract(localBounds.minimum, padding);
 				localBounds.maximum = Add(localBounds.maximum, padding);
 				QueryNode(tree, 0, localBounds, output);
+			}
+
+			float RayBounds(const Bounds& bounds, const Vector3& origin, const Vector3& direction, float distance) {
+				float enter = 0.0f;
+				const float positions[3] = {origin.x, origin.y, origin.z};
+				const float velocities[3] = {direction.x, direction.y, direction.z};
+				const float minimum[3] = {bounds.minimum.x, bounds.minimum.y, bounds.minimum.z};
+				const float maximum[3] = {bounds.maximum.x, bounds.maximum.y, bounds.maximum.z};
+				for (int axis = 0; axis < 3; ++axis) {
+					if (velocities[axis] == 0.0f) {
+						if (positions[axis] < minimum[axis] || positions[axis] > maximum[axis]) return -1.0f;
+						continue;
+					}
+					float near = (minimum[axis] - positions[axis]) / velocities[axis];
+					float far = (maximum[axis] - positions[axis]) / velocities[axis];
+					if (near > far) std::swap(near, far);
+					enter = std::max(enter, near);
+					distance = std::min(distance, far);
+					if (enter > distance) return -1.0f;
+				}
+				return enter;
+			}
+
+			bool RayNode(const MeshTree& tree, const Mesh& mesh, int index, const Vector3& origin, const Vector3& ray, float rayLength, float& distance, Vector3& normal) {
+				const auto& node = tree.nodes[index];
+				if (RayBounds(node.bounds, origin, ray, distance) < 0.0f) return false;
+				bool found = false;
+				if (node.count) {
+					for (std::uint32_t entry = node.first; entry < node.first + node.count; ++entry) {
+						const auto& triangle = tree.triangles[tree.order[entry]];
+						const Vector3 a = mesh.data.vertices[triangle.indices[0]].position;
+						const Vector3 edgeA = Subtract(mesh.data.vertices[triangle.indices[1]].position, a);
+						const Vector3 edgeB = Subtract(mesh.data.vertices[triangle.indices[2]].position, a);
+						const Vector3 perpendicular = Cross(ray, edgeB);
+						const float determinant = Dot(edgeA, perpendicular);
+						if (std::abs(determinant) <= axisEpsilon * Length(edgeA) * Length(edgeB) * rayLength) continue;
+						const Vector3 offset = Subtract(origin, a);
+						const float u = Dot(offset, perpendicular) / determinant;
+						if (u < 0.0f || u > 1.0f) continue;
+						const Vector3 cross = Cross(offset, edgeA);
+						const float v = Dot(ray, cross) / determinant;
+						if (v < 0.0f || u + v > 1.0f) continue;
+						const float candidate = Dot(edgeB, cross) / determinant;
+						if (candidate < 0.0f || candidate > distance) continue;
+						distance = candidate;
+						normal = Cross(edgeA, edgeB);
+						found = true;
+					}
+					return found;
+				}
+				int first = node.left, second = node.right;
+				const float left = RayBounds(tree.nodes[first].bounds, origin, ray, distance);
+				const float right = RayBounds(tree.nodes[second].bounds, origin, ray, distance);
+				if (left < 0.0f || (right >= 0.0f && right < left)) std::swap(first, second);
+				found = RayNode(tree, mesh, first, origin, ray, rayLength, distance, normal);
+				return RayNode(tree, mesh, second, origin, ray, rayLength, distance, normal) || found;
 			}
 
 			bool TestBoxAxis(const Box& a, const Box& b, const Vector3& axis, float& penetration, Vector3& normal) {
@@ -586,7 +715,7 @@ namespace Sapphire {
 				return true;
 			}
 
-			bool SweepCapsuleTriangle(const Capsule& capsule, const Vector3 (&triangle)[3], const Vector3& displacement, float winding, bool closed, Contact& contact) {
+			bool SweepCapsuleTriangle(const Capsule& capsule, const Vector3 (&triangle)[3], const Vector3& displacement, float displacementLength, float winding, bool closed, Contact& contact) {
 				const Vector3 face = Cross(Subtract(triangle[1], triangle[0]), Subtract(triangle[2], triangle[0]));
 				const float faceLength = Length(face);
 				if (faceLength < axisEpsilon) return false;
@@ -601,10 +730,10 @@ namespace Sapphire {
 					const float distance = Length(difference);
 					if (closed && Dot(Subtract(segmentPoint, triangle[0]), outward) < -skinWidth) return false;
 					if (distance <= capsule.radius + skinWidth + axisEpsilon) {
-						if (closed && Dot(displacement, outward) >= -axisEpsilon * Length(displacement)) return false;
+						if (closed && Dot(displacement, outward) >= -axisEpsilon * displacementLength) return false;
 						const Vector3 normal = distance > axisEpsilon ? Scale(difference, 1.0f / distance) : Scale(outward, -1.0f);
 						const Vector3 surfaceNormal = !closed && Dot(outward, difference) > 0.0f ? Scale(outward, -1.0f) : outward;
-						if (Dot(normal, surfaceNormal) < -0.9999f && Dot(displacement, surfaceNormal) >= -axisEpsilon * Length(displacement)) return false;
+						if (Dot(normal, surfaceNormal) < -0.9999f && Dot(displacement, surfaceNormal) >= -axisEpsilon * displacementLength) return false;
 						if (time <= axisEpsilon && Dot(displacement, normal) <= axisEpsilon) return false;
 						contact.time = time;
 						contact.normal = normal;
@@ -662,14 +791,15 @@ namespace Sapphire {
 				for (int corner = 0; corner < 3; ++corner) triangle[corner] = TransformPoint(meshObject.transform, axes, mesh.data.vertices[source.indices[corner]].position);
 			}
 
-			bool FindMeshOverlap(Object& meshObject, const Box& box, Contact& result) {
+			bool FindMeshOverlap(Object& meshObject, const Box& box, Contact& result, const Vector3* preparedAxes = nullptr) {
 				auto* mesh = meshObject.GetComponent<Mesh>();
 				if (!mesh) return false;
 				MeshTree& tree = GetTree(*mesh);
 				Vector3 axes[3];
-				GetAxes(meshObject.transform, axes);
+				if (preparedAxes) std::copy_n(preparedAxes, 3, axes);
+				else GetAxes(meshObject.transform, axes);
 				auto& candidates = triangleCandidates;
-				QueryTree(tree, meshObject, BoxBounds(box), candidates);
+				QueryTree(tree, meshObject, BoxBounds(box), axes, candidates);
 				bool found = false;
 				for (const auto index : candidates) {
 					Vector3 triangle[3];
@@ -683,14 +813,15 @@ namespace Sapphire {
 				return found;
 			}
 
-			bool FindMeshSweep(Object& meshObject, const Box& box, const Vector3& displacement, Contact& result) {
+			bool FindMeshSweep(Object& meshObject, const Box& box, const Vector3& displacement, Contact& result, const Vector3* preparedAxes = nullptr) {
 				auto* mesh = meshObject.GetComponent<Mesh>();
 				if (!mesh) return false;
 				MeshTree& tree = GetTree(*mesh);
 				Vector3 axes[3];
-				GetAxes(meshObject.transform, axes);
+				if (preparedAxes) std::copy_n(preparedAxes, 3, axes);
+				else GetAxes(meshObject.transform, axes);
 				auto& candidates = triangleCandidates;
-				QueryTree(tree, meshObject, SweptBounds(box, displacement), candidates);
+				QueryTree(tree, meshObject, SweptBounds(box, displacement), axes, candidates);
 				bool found = false;
 				for (const auto index : candidates) {
 					Vector3 triangle[3];
@@ -704,14 +835,15 @@ namespace Sapphire {
 				return found;
 			}
 
-			bool FindCapsuleMeshOverlap(Object& meshObject, const Capsule& capsule, Contact& result) {
+			bool FindCapsuleMeshOverlap(Object& meshObject, const Capsule& capsule, Contact& result, const Vector3* preparedAxes = nullptr) {
 				auto* mesh = meshObject.GetComponent<Mesh>();
 				if (!mesh) return false;
 				MeshTree& tree = GetTree(*mesh);
 				Vector3 axes[3];
-				GetAxes(meshObject.transform, axes);
+				if (preparedAxes) std::copy_n(preparedAxes, 3, axes);
+				else GetAxes(meshObject.transform, axes);
 				auto& candidates = triangleCandidates;
-				QueryTree(tree, meshObject, CapsuleBounds(capsule), candidates);
+				QueryTree(tree, meshObject, CapsuleBounds(capsule), axes, candidates);
 				bool found = false;
 				for (const auto index : candidates) {
 					Vector3 triangle[3];
@@ -725,20 +857,23 @@ namespace Sapphire {
 				return found;
 			}
 
-			bool FindCapsuleMeshSweep(Object& meshObject, const Capsule& capsule, const Vector3& displacement, Contact& result, const PhysicsBody* floorBody = nullptr) {
+			bool FindCapsuleMeshSweep(Object& meshObject, const Capsule& capsule, const Vector3& displacement, Contact& result, const PhysicsBody* floorBody = nullptr, const Vector3* preparedAxes = nullptr) {
 				auto* mesh = meshObject.GetComponent<Mesh>();
 				if (!mesh) return false;
 				MeshTree& tree = GetTree(*mesh);
 				Vector3 axes[3];
-				GetAxes(meshObject.transform, axes);
+				if (preparedAxes) std::copy_n(preparedAxes, 3, axes);
+				else GetAxes(meshObject.transform, axes);
 				auto& candidates = triangleCandidates;
-				QueryTree(tree, meshObject, SweptBounds(capsule, displacement), candidates);
+				QueryTree(tree, meshObject, SweptBounds(capsule, displacement), axes, candidates);
+				const float displacementSquared = Dot(displacement, displacement);
+				const float displacementLength = std::sqrt(displacementSquared);
 				bool found = false;
 				for (const auto index : candidates) {
 					Vector3 triangle[3];
 					GetWorldTriangle(meshObject, *mesh, tree.triangles[index], axes, triangle);
 					Contact contact;
-					if (SweepCapsuleTriangle(capsule, triangle, displacement, tree.winding, tree.closed, contact) && PreferCapsuleHit(contact, result, capsule, displacement, floorBody)) {
+					if (SweepCapsuleTriangle(capsule, triangle, displacement, displacementLength, tree.winding, tree.closed, contact) && PreferCapsuleHit(contact, result, capsule, displacementSquared, floorBody)) {
 						result = contact;
 						found = true;
 					}
@@ -763,10 +898,12 @@ namespace Sapphire {
 			bool FindCapsuleBoxSweep(const Box& box, const Capsule& capsule, const Vector3& displacement, Contact& result, const PhysicsBody* floorBody = nullptr) {
 				Vector3 triangles[12][3];
 				GetBoxTriangles(box, triangles);
+				const float displacementSquared = Dot(displacement, displacement);
+				const float displacementLength = std::sqrt(displacementSquared);
 				bool found = false;
 				for (const auto& triangle : triangles) {
 					Contact contact;
-					if (SweepCapsuleTriangle(capsule, triangle, displacement, 1.0f, true, contact) && PreferCapsuleHit(contact, result, capsule, displacement, floorBody)) {
+					if (SweepCapsuleTriangle(capsule, triangle, displacement, displacementLength, 1.0f, true, contact) && PreferCapsuleHit(contact, result, capsule, displacementSquared, floorBody)) {
 						result = contact;
 						found = true;
 					}
@@ -774,21 +911,50 @@ namespace Sapphire {
 				return found;
 			}
 
+			bool CapsuleContact(const Capsule& moving, const Capsule& obstacle, const Vector3& displacement, bool sweep, Contact& contact) {
+				float time = 0.0f;
+				const float radius = moving.radius + obstacle.radius;
+				for (int iteration = 0; iteration < (sweep ? 12 : 1); ++iteration) {
+					Vector3 first, second;
+					ClosestPointsOnSegments(Add(moving.start, Scale(displacement, time)), Add(moving.end, Scale(displacement, time)), obstacle.start, obstacle.end, first, second);
+					const Vector3 difference = Subtract(second, first);
+					const float distance = Length(difference);
+					const Vector3 normal = distance > axisEpsilon ? Scale(difference, 1.0f / distance) : Vector3{1.0f, 0.0f, 0.0f};
+					if (distance <= radius + (sweep ? skinWidth : 0.0f)) {
+						if (sweep && Dot(displacement, normal) <= axisEpsilon) return false;
+						contact = {time, std::max(0.0f, radius - distance), normal, Scale(normal, -1.0f), Subtract(second, Scale(normal, obstacle.radius)), true};
+						return true;
+					}
+					if (!sweep) return false;
+					const float speed = Dot(displacement, normal);
+					if (speed <= axisEpsilon) return false;
+					time += (distance - radius - skinWidth) / speed;
+					if (time > 1.0f) return false;
+				}
+				return false;
+			}
+
 			bool FindCapsuleHit(Scene& scene, Object& object, const Capsule& capsule, const Vector3& displacement, Contact& result, const PhysicsBody* floorBody = nullptr) {
+				const float displacementSquared = Dot(displacement, displacement);
 				const Bounds sweptBounds = SweptBounds(capsule, displacement);
-				for (auto& obstacle : scene.Objects()) {
-					if (obstacle.get() == &object || obstacle->GetComponent<PhysicsBody>()) continue;
-					auto* collider = obstacle->GetComponent<Collider>();
+				for (const auto& record : colliderRecords) {
+					Object* obstacle = record.object;
+					if (obstacle == &object || record.body) continue;
+					auto* collider = record.collider;
 					if (!collider) continue;
+					if (!Overlaps(sweptBounds, record.bounds)) continue;
 					Contact contact;
-					if (collider->isMesh) {
-						if (!FindCapsuleMeshSweep(*obstacle, capsule, displacement, contact, floorBody)) continue;
+					if (collider->isCapsule) {
+						if (!CapsuleContact(capsule, record.capsule, displacement, true, contact)) continue;
+					}
+					else if (collider->isMesh) {
+						if (!FindCapsuleMeshSweep(*obstacle, capsule, displacement, contact, floorBody, record.axes)) continue;
 					}
 					else {
-						const Box box = WorldBox(*obstacle, *collider);
+						const Box& box = record.box;
 						if (!Overlaps(sweptBounds, BoxBounds(box)) || !FindCapsuleBoxSweep(box, capsule, displacement, contact, floorBody)) continue;
 					}
-					if (PreferCapsuleHit(contact, result, capsule, displacement, floorBody)) result = contact;
+					if (PreferCapsuleHit(contact, result, capsule, displacementSquared, floorBody)) result = contact;
 				}
 				return result.hit;
 			}
@@ -818,14 +984,21 @@ namespace Sapphire {
 				return true;
 			}
 
-			bool FindOverlap(Object& movingObject, Object& obstacle, const Collider& movingCollider, const Collider& obstacleCollider, Contact& contact) {
+			bool FindOverlap(Object& movingObject, Object& obstacle, const Collider& movingCollider, const Collider& obstacleCollider, Contact& contact, const Vector3* preparedAxes = nullptr) {
 				if (movingCollider.isCapsule) {
 					const Capsule capsule = WorldCapsule(movingObject, movingCollider);
-					if (obstacleCollider.isMesh) return FindCapsuleMeshOverlap(obstacle, capsule, contact);
+					if (obstacleCollider.isCapsule) return CapsuleContact(capsule, WorldCapsule(obstacle, obstacleCollider), {}, false, contact);
+					if (obstacleCollider.isMesh) return FindCapsuleMeshOverlap(obstacle, capsule, contact, preparedAxes);
 					return FindCapsuleBoxOverlap(WorldBox(obstacle, obstacleCollider), capsule, contact);
 				}
 				const Box movingBox = WorldBox(movingObject, movingCollider);
-				if (obstacleCollider.isMesh) return FindMeshOverlap(obstacle, movingBox, contact);
+				if (obstacleCollider.isCapsule) {
+					if (!FindCapsuleBoxOverlap(movingBox, WorldCapsule(obstacle, obstacleCollider), contact)) return false;
+					contact.normal = Scale(contact.normal, -1.0f);
+					contact.surfaceNormal = Scale(contact.normal, -1.0f);
+					return true;
+				}
+				if (obstacleCollider.isMesh) return FindMeshOverlap(obstacle, movingBox, contact, preparedAxes);
 				return OverlapBoxes(movingBox, WorldBox(obstacle, obstacleCollider), contact);
 			}
 
@@ -858,15 +1031,17 @@ namespace Sapphire {
 			}
 
 			void ResolveOverlaps(Scene& scene, Object& object, PhysicsBody& body, Collider& collider) {
-				auto& objects = scene.Objects();
 				for (int iteration = 0; iteration < maxOverlapIterations; ++iteration) {
 					bool corrected = false;
-					for (auto& obstacle : objects) {
-						if (obstacle.get() == &object || obstacle->GetComponent<PhysicsBody>()) continue;
-						auto* obstacleCollider = obstacle->GetComponent<Collider>();
+					for (const auto& record : colliderRecords) {
+						Object* obstacle = record.object;
+						if (obstacle == &object || record.body) continue;
+						auto* obstacleCollider = record.collider;
 						if (!obstacleCollider) continue;
+						const Bounds movingBounds = collider.isCapsule ? CapsuleBounds(WorldCapsule(object, collider)) : BoxBounds(WorldBox(object, collider));
+						if (!Overlaps(movingBounds, record.bounds)) continue;
 						Contact contact;
-						if (!FindOverlap(object, *obstacle, collider, *obstacleCollider, contact)) continue;
+						if (!FindOverlap(object, *obstacle, collider, *obstacleCollider, contact, record.axes)) continue;
 						if (collider.isCapsule) ConstrainCapsuleContact(body, contact, true);
 						else ConstrainContact(body, contact);
 						object.transform.position += Scale(contact.normal, -(contact.penetration + skinWidth));
@@ -881,16 +1056,24 @@ namespace Sapphire {
 				if (collider.isCapsule) return FindCapsuleHit(scene, object, WorldCapsule(object, collider), displacement, result);
 				const Box movingBox = WorldBox(object, collider);
 				const Bounds sweptBounds = SweptBounds(movingBox, displacement);
-				for (auto& obstacle : scene.Objects()) {
-					if (obstacle.get() == &object || obstacle->GetComponent<PhysicsBody>()) continue;
-					auto* obstacleCollider = obstacle->GetComponent<Collider>();
+				for (const auto& record : colliderRecords) {
+					Object* obstacle = record.object;
+					if (obstacle == &object || record.body) continue;
+					auto* obstacleCollider = record.collider;
 					if (!obstacleCollider) continue;
+					if (!Overlaps(sweptBounds, record.bounds)) continue;
 					Contact contact;
-					if (obstacleCollider->isMesh) {
-						if (!FindMeshSweep(*obstacle, movingBox, displacement, contact)) continue;
+					if (obstacleCollider->isCapsule) {
+						if (!FindCapsuleBoxSweep(movingBox, record.capsule, Scale(displacement, -1.0f), contact)) continue;
+						contact.normal = Scale(contact.normal, -1.0f);
+						contact.surfaceNormal = Scale(contact.normal, -1.0f);
+						contact.point += Scale(displacement, contact.time);
+					}
+					else if (obstacleCollider->isMesh) {
+						if (!FindMeshSweep(*obstacle, movingBox, displacement, contact, record.axes)) continue;
 					}
 					else {
-						const Box obstacleBox = WorldBox(*obstacle, *obstacleCollider);
+						const Box& obstacleBox = record.box;
 						if (!Overlaps(sweptBounds, BoxBounds(obstacleBox)) || !SweepBoxes(movingBox, obstacleBox, displacement, contact)) continue;
 					}
 					if (!result.hit || contact.time < result.time) result = contact;
@@ -973,9 +1156,9 @@ namespace Sapphire {
 					object.transform.position += Scale(remaining, contact.time);
 					remaining = Scale(remaining, 1.0f - contact.time);
 					const bool walkable = IsWalkable(body, contact);
-					if (walking && (!walkable || -contact.normal.y < std::cos(body.slopeLimit * Math::degreesToRadians))) {
+					if (walking && (!walkable || -contact.normal.y < body.SlopeCosine())) {
 						const Capsule capsule = WorldCapsule(object, collider);
-						const bool footEdge = contact.point.y <= capsule.start.y && -contact.normal.y >= std::cos(body.slopeLimit * Math::degreesToRadians) && std::abs(Dot(Subtract(contact.point, floor->point), floor->surfaceNormal)) <= skinWidth;
+						const bool footEdge = contact.point.y <= capsule.start.y && -contact.normal.y >= body.SlopeCosine() && std::abs(Dot(Subtract(contact.point, floor->point), floor->surfaceNormal)) <= skinWidth;
 						if (footEdge && TryCapsuleTransition(scene, object, body, collider, remaining, contact, *floor, skinWidth + axisEpsilon * 2.0f, true)) return;
 						if (TryCapsuleTransition(scene, object, body, collider, remaining, contact, *floor, body.stepHeight, false)) return;
 					}
@@ -1021,24 +1204,25 @@ namespace Sapphire {
 			}
 
 			void ResolveDynamicPairs(Scene& scene) {
-				auto& objects = scene.Objects();
-				for (std::size_t i = 0; i < objects.size(); ++i) {
-					auto* bodyA = objects[i]->GetComponent<PhysicsBody>();
-					auto* colliderA = objects[i]->GetComponent<Collider>();
-					if (!bodyA || !colliderA || colliderA->isMesh) continue;
-					for (std::size_t j = i + 1; j < objects.size(); ++j) {
-						auto* bodyB = objects[j]->GetComponent<PhysicsBody>();
-						auto* colliderB = objects[j]->GetComponent<Collider>();
-						if (!bodyB || !colliderB || colliderB->isMesh) continue;
+				for (std::size_t i = 0; i < colliderRecords.size(); ++i) {
+					const auto& a = colliderRecords[i];
+					if (!a.body || a.collider->isMesh) continue;
+					for (std::size_t j = i + 1; j < colliderRecords.size(); ++j) {
+						const auto& b = colliderRecords[j];
+						if (!b.body || b.collider->isMesh) continue;
+						const Bounds first = a.collider->isCapsule ? CapsuleBounds(WorldCapsule(*a.object, *a.collider)) : BoxBounds(WorldBox(*a.object, *a.collider));
+						const Bounds second = b.collider->isCapsule ? CapsuleBounds(WorldCapsule(*b.object, *b.collider)) : BoxBounds(WorldBox(*b.object, *b.collider));
+						if (!Overlaps(first, second)) continue;
 						Contact contact;
-						if (!OverlapBoxes(WorldBox(*objects[i], *colliderA), WorldBox(*objects[j], *colliderB), contact)) continue;
-						objects[i]->transform.position += Scale(contact.normal, -contact.penetration * 0.5f);
-						objects[j]->transform.position += Scale(contact.normal, contact.penetration * 0.5f);
-						RemoveIntoSurface(*bodyA, contact.normal);
-						RemoveIntoSurface(*bodyB, Scale(contact.normal, -1.0f));
+						if (!FindOverlap(*a.object, *b.object, *a.collider, *b.collider, contact)) continue;
+						a.object->transform.position += Scale(contact.normal, -contact.penetration * 0.5f);
+						b.object->transform.position += Scale(contact.normal, contact.penetration * 0.5f);
+						RemoveIntoSurface(*a.body, contact.normal);
+						RemoveIntoSurface(*b.body, Scale(contact.normal, -1.0f));
 					}
 				}
 			}
+
 		}
 
 		bool Raycast(Scene& scene, const Vector3& origin, const Vector3& direction, float maxDistance, RaycastHit& hit) {
@@ -1047,9 +1231,11 @@ namespace Sapphire {
 			if (!std::isfinite(origin.x) || !std::isfinite(origin.y) || !std::isfinite(origin.z) || !std::isfinite(length) || length <= axisEpsilon || !std::isfinite(maxDistance) || maxDistance <= 0.0f) return false;
 			const Vector3 ray = Scale(direction, 1.0f / length);
 			float closest = maxDistance;
-			for (auto& object : scene.Objects()) {
-				auto* collider = object->GetComponent<Collider>();
-				if (!collider) continue;
+			SyncColliders(scene);
+			for (const auto& record : colliderRecords) {
+				Object* object = record.object;
+				Collider* collider = record.collider;
+				if (RayBounds(record.bounds, origin, ray, closest) < 0.0f) continue;
 				float distance = closest;
 				Vector3 normal;
 				bool found = false;
@@ -1057,36 +1243,21 @@ namespace Sapphire {
 					auto* mesh = object->GetComponent<Mesh>();
 					if (!mesh) continue;
 					MeshTree& tree = GetTree(*mesh);
-					Bounds bounds = EmptyBounds();
-					Include(bounds, origin);
-					Include(bounds, Add(origin, Scale(ray, closest)));
-					QueryTree(tree, *object, bounds, triangleCandidates);
+					const Transform& transform = object->transform;
+					if (tree.nodes.empty() || std::abs(transform.scale.x) < axisEpsilon || std::abs(transform.scale.y) < axisEpsilon || std::abs(transform.scale.z) < axisEpsilon) continue;
 					Vector3 axes[3];
-					GetAxes(object->transform, axes);
-					for (const auto index : triangleCandidates) {
-						Vector3 triangle[3];
-						GetWorldTriangle(*object, *mesh, tree.triangles[index], axes, triangle);
-						const Vector3 edgeA = Subtract(triangle[1], triangle[0]);
-						const Vector3 edgeB = Subtract(triangle[2], triangle[0]);
-						const Vector3 perpendicular = Cross(ray, edgeB);
-						const float determinant = Dot(edgeA, perpendicular);
-						if (std::abs(determinant) <= axisEpsilon * Length(edgeA) * Length(edgeB)) continue;
-						const Vector3 offset = Subtract(origin, triangle[0]);
-						const float u = Dot(offset, perpendicular) / determinant;
-						if (u < 0.0f || u > 1.0f) continue;
-						const Vector3 cross = Cross(offset, edgeA);
-						const float v = Dot(ray, cross) / determinant;
-						if (v < 0.0f || u + v > 1.0f) continue;
-						const float candidate = Dot(edgeB, cross) / determinant;
-						if (candidate < 0.0f || candidate > distance) continue;
-						normal = Cross(edgeA, edgeB);
-						normal = Scale(normal, (Dot(normal, ray) > 0.0f ? -1.0f : 1.0f) / Length(normal));
-						distance = candidate;
-						found = true;
+					std::copy_n(record.axes, 3, axes);
+					const Vector3 offset = Subtract(origin, transform.position);
+					const Vector3 localOrigin{Dot(offset, axes[0]) / transform.scale.x, Dot(offset, axes[1]) / transform.scale.y, Dot(offset, axes[2]) / transform.scale.z};
+					const Vector3 localRay{Dot(ray, axes[0]) / transform.scale.x, Dot(ray, axes[1]) / transform.scale.y, Dot(ray, axes[2]) / transform.scale.z};
+					found = RayNode(tree, *mesh, 0, localOrigin, localRay, Length(localRay), distance, normal);
+					if (found) {
+						normal = TransformNormal(NormalMatrix(transform), normal);
+						if (Dot(normal, ray) > 0.0f) normal = Scale(normal, -1.0f);
 					}
 				}
 				else if (collider->isCapsule) {
-					const Capsule capsule = WorldCapsule(*object, *collider);
+					const Capsule capsule = record.capsule;
 					const Vector3 segment = Subtract(capsule.end, capsule.start);
 					const Vector3 offset = Subtract(origin, capsule.start);
 					const float segmentLength = Dot(segment, segment);
@@ -1123,7 +1294,7 @@ namespace Sapphire {
 					}
 				}
 				else {
-					const Box box = WorldBox(*object, *collider);
+					const Box box = record.box;
 					const Vector3 offset = Subtract(origin, box.center);
 					float enter = -std::numeric_limits<float>::infinity();
 					float exit = closest;
@@ -1150,7 +1321,7 @@ namespace Sapphire {
 				}
 				if (found) {
 					closest = distance;
-					hit = {object.get(), collider, Add(origin, Scale(ray, distance)), normal, distance};
+					hit = {object, collider, Add(origin, Scale(ray, distance)), normal, distance};
 				}
 			}
 			return hit.collider != nullptr;
@@ -1158,65 +1329,41 @@ namespace Sapphire {
 
 		void Initialize(Scene& scene) {
 			Loading::Timer loading("Physics collider initialization");
-			meshBounds.clear();
-			meshTrees.clear();
-			for (auto& object : scene.Objects()) {
-				auto* collider = object->GetComponent<Collider>();
-				auto* mesh = object->GetComponent<Mesh>();
-				if (collider && collider->isMesh && mesh) GetTree(*mesh);
+			SyncColliders(scene);
+			for (const auto& record : colliderRecords) {
+				if (!record.collider->isMesh) continue;
+				if (auto* mesh = record.object->GetComponent<Mesh>()) GetTree(*mesh);
 			}
 		}
 
 		void Simulate(Scene& scene, float deltaTime) {
-			liveMeshes.clear();
-			liveTreeMeshes.clear();
-			for (auto& object : scene.Objects()) {
-				if (auto* collider = object->GetComponent<Collider>()) {
-					if (auto* mesh = object->GetComponent<Mesh>()) {
-						liveMeshes.push_back(mesh);
-						if (collider->isMesh) liveTreeMeshes.push_back(mesh);
+			SyncColliders(scene);
+			for (const auto& record : bodyRecords) {
+				Object& object = *record.object;
+				PhysicsBody& body = *record.body;
+				body.previousPosition = object.transform.position;
+				if (record.collider && record.collider->isCapsule) SimulateCapsule(scene, object, body, *record.collider, deltaTime);
+				else {
+					body.grounded = false;
+					if (body.useGravity) body.velocity += scene.gravity * deltaTime;
+					if (record.collider) {
+						ResolveOverlaps(scene, object, body, *record.collider);
+						MoveAndSlide(scene, object, body, *record.collider, deltaTime);
 					}
+					else object.transform.position += body.velocity * deltaTime;
 				}
-			}
-			std::sort(liveMeshes.begin(), liveMeshes.end(), std::less<const Mesh*>{});
-			std::sort(liveTreeMeshes.begin(), liveTreeMeshes.end(), std::less<const Mesh*>{});
-			for (auto entry = meshBounds.begin(); entry != meshBounds.end();) {
-				if (!std::binary_search(liveMeshes.begin(), liveMeshes.end(), entry->first, std::less<const Mesh*>{})) entry = meshBounds.erase(entry);
-				else ++entry;
-			}
-			for (auto entry = meshTrees.begin(); entry != meshTrees.end();) {
-				if (!std::binary_search(liveTreeMeshes.begin(), liveTreeMeshes.end(), entry->first, std::less<const Mesh*>{})) entry = meshTrees.erase(entry);
-				else ++entry;
-			}
-			for (auto& object : scene.Objects()) {
-				if (auto* body = object->GetComponent<PhysicsBody>()) {
-					body->previousPosition = object->transform.position;
-					if (auto* collider = object->GetComponent<Collider>()) {
-						if (collider->isCapsule) SimulateCapsule(scene, *object, *body, *collider, deltaTime);
-						else {
-							body->grounded = false;
-							if (body->useGravity) body->velocity += scene.gravity * deltaTime;
-							ResolveOverlaps(scene, *object, *body, *collider);
-							MoveAndSlide(scene, *object, *body, *collider, deltaTime);
-						}
-					}
-					else {
-							body->grounded = false;
-							if (body->useGravity) body->velocity += scene.gravity * deltaTime;
-							object->transform.position += body->velocity * deltaTime;
-						}
-					if (body->grounded && body->velocity.y < 0.0f) body->velocity.y = 0.0f;
-				}
+				if (body.grounded && body.velocity.y < 0.0f) body.velocity.y = 0.0f;
 			}
 			ResolveDynamicPairs(scene);
 		}
 
 		void Shutdown() {
 			std::vector<std::uint32_t>().swap(triangleCandidates);
-			std::vector<const Mesh*>().swap(liveMeshes);
-			std::vector<const Mesh*>().swap(liveTreeMeshes);
-			meshBounds.clear();
-			meshTrees.clear();
+			std::vector<ColliderRecord>().swap(colliderRecords);
+			std::vector<BodyRecord>().swap(bodyRecords);
+			decltype(meshBounds)().swap(meshBounds);
+			decltype(meshTrees)().swap(meshTrees);
+			cacheGeneration = 0;
 		}
 	}
 }

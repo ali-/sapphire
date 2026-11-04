@@ -6,6 +6,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -25,7 +26,9 @@ namespace Sapphire::Graphics {
 	SDL_GPUBuffer* CreateBuffer(SDL_GPUDevice* gpuDevice, SDL_GPUBufferUsageFlags usage, Uint32 size);
 	SDL_GPUTexture* CreateTexture(SDL_GPUDevice* gpuDevice, int width, int height, const std::uint8_t* pixels);
 	SDL_GPUTexture* CreateTexture(SDL_GPUDevice* gpuDevice, int width, int height, const std::uint8_t* pixels, bool srgb);
-	SDL_GPUTexture* UploadTexture(SDL_GPUDevice* gpuDevice, int width, int height, const void* pixels, SDL_GPUTextureFormat format, Uint32 stride, Uint32 rowPitch = 0, bool mipmaps = false, bool masked = false);
+	SDL_GPUTexture* UploadTexture(SDL_GPUDevice* gpuDevice, int width, int height, const void* pixels, SDL_GPUTextureFormat format, Uint32 stride, Uint32 rowPitch = 0, bool mipmaps = false, bool masked = false, bool blended = false);
+	SDL_GPUTexture* LoadTexture(std::string_view fileName, bool srgb, bool mipmaps, bool blended);
+	inline bool linearOutput = false;
 	SDL_GPUTexture* LoadTexture(std::string_view fileName);
 	SDL_GPUTexture* LoadTexture(std::string_view fileName, bool srgb);
 	SDL_GPUTexture* LoadTexture(std::string_view fileName, bool srgb, bool mipmaps);
@@ -35,6 +38,7 @@ namespace Sapphire::Graphics {
 	void ReleaseBuffer(SDL_GPUDevice* device, SDL_GPUBuffer* buffer);
 	void ReleaseTexture(SDL_GPUDevice* device, SDL_GPUTexture* texture);
 	void FlushUploads();
+	void RecordUpload(Uint32 size);
 
 	namespace {
 		using namespace Math;
@@ -42,7 +46,7 @@ namespace Sapphire::Graphics {
 		constexpr int maxPointLights = 16;
 		constexpr float shadowSlopeFactor = 3.0f;
 		Uint32 shadowMapResolution = 2048;
-		using ChunkKey = std::tuple<int, int, int>;
+		using CellKey = std::tuple<int, int, int>;
 
 		struct GpuMesh;
 
@@ -54,8 +58,13 @@ namespace Sapphire::Graphics {
 			int cellY = 0;
 			int cellZ = 0;
 			Bounds bounds;
-			GpuMesh* gpu = nullptr;
-			Uint32 lightMask = 0;
+			mutable GpuMesh* gpu = nullptr;
+			mutable Uint32 lightMask = 0;
+			mutable Vector3 shadowDirection{};
+			mutable Bounds lightBounds{};
+			mutable bool lightBoundsReady = false;
+			mutable float viewDepth = 0.0f;
+			mutable float depthBucket = 0.0f;
 		};
 
 		struct ObjectUniforms {
@@ -80,6 +89,7 @@ namespace Sapphire::Graphics {
 			float cameraPosition[4];
 			float fogColor[4];
 			float fogParameters[4];
+			float fogHeightParameters[4];
 			float ambientLight[4];
 			float directionalDirection[4];
 			float directionalColor[4];
@@ -123,8 +133,8 @@ namespace Sapphire::Graphics {
 			bool staticValid = false;
 			bool dynamicValid = false;
 			bool relevant = false;
-			std::vector<RenderItem> staticCasters;
-			std::vector<RenderItem> dynamicCasters;
+			std::vector<const RenderItem*> staticCasters;
+			std::vector<const RenderItem*> dynamicCasters;
 		};
 
 		struct ShadowMapData {
@@ -139,7 +149,7 @@ namespace Sapphire::Graphics {
 			bool ready = false;
 		};
 
-		using MaterialTextures = std::array<std::string, 6>;
+		using MaterialTextures = std::array<std::string, 7>;
 
 		struct GpuMaterial {
 			const MaterialTextures* source = nullptr;
@@ -154,6 +164,32 @@ namespace Sapphire::Graphics {
 			SDL_GPUBuffer* indexBuffer = nullptr;
 			GpuMaterial* material = nullptr;
 			Uint32 indexCount = 0;
+			Uint32 vertexCapacity = 0;
+			Uint32 indexCapacity = 0;
+			bool geometryDirty = false;
+			Material cachedMaterial;
+			FragmentUniforms fragment{};
+			float uv[4]{};
+			float displacementScale = 0.0f;
+			bool uniformsReady = false;
+		};
+
+		struct BufferBindings {
+			SDL_GPUBuffer* vertices = nullptr;
+			SDL_GPUBuffer* indices = nullptr;
+
+			void Bind(SDL_GPURenderPass* pass, const GpuMesh& mesh) {
+				if (vertices != mesh.vertexBuffer) {
+					SDL_GPUBufferBinding binding{mesh.vertexBuffer, 0};
+					SDL_BindGPUVertexBuffers(pass, 0, &binding, 1);
+					vertices = mesh.vertexBuffer;
+				}
+				if (indices != mesh.indexBuffer) {
+					SDL_GPUBufferBinding binding{mesh.indexBuffer, 0};
+					SDL_BindGPUIndexBuffer(pass, &binding, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+					indices = mesh.indexBuffer;
+				}
+			}
 		};
 
 		struct PendingGpuSubmission {
@@ -175,11 +211,12 @@ namespace Sapphire::Graphics {
 		std::vector<PointShadowState> pointShadowStates;
 		ShadowMapData fallbackShadowMap;
 		bool fallbackShadowReady = false;
-		int batchChunkSize = -1;
+		int batchCellSize = -1;
 		bool loadingFrame = true;
 		const Light* shadowLight = nullptr;
-		std::map<ChunkKey, StaticShadowMap> staticShadowMaps;
-		std::unordered_map<Mesh*, ChunkKey> staticBatchCells;
+		std::map<CellKey, StaticShadowMap> staticShadowMaps;
+		std::unordered_map<Mesh*, CellKey> staticBatchCells;
+		std::unordered_map<Mesh*, const Object*> staticBatchOwners;
 		Vector3 staticShadowDirection{};
 		SDL_GPUTexture* whiteTexture = nullptr;
 		SDL_GPUSampler* sampler = nullptr;
@@ -192,6 +229,26 @@ namespace Sapphire::Graphics {
 		std::uint64_t renderTimeNanoseconds = 0;
 		std::uint64_t drawCallCount = 0;
 		std::uint64_t sceneTriangleCount = 0;
+		std::uint64_t shadowDrawCount = 0;
+		std::uint64_t shadowTriangleCount = 0;
+		std::uint64_t meshRebuildCount = 0;
+		std::uint64_t uploadedBytes = 0;
+		std::uint64_t previousUploadedBytes = 0;
+		std::uint64_t frameUploadedBytes = 0;
+		std::size_t peakUploadBytes = 0;
+		struct Allocation {
+			std::uint64_t bytes;
+			bool texture;
+		};
+		std::unordered_map<const void*, Allocation> allocations;
+		std::uint64_t textureBytes = 0;
+		std::uint64_t bufferBytes = 0;
+		std::uint64_t peakResourceBytes = 0;
+		std::array<float, 120> frameSamples{};
+		std::size_t frameSampleCount = 0;
+		std::size_t frameSampleIndex = 0;
+		float medianFrameTime = 0.0f;
+		float slowFrameTime = 0.0f;
 		std::uint64_t submitTimeNanoseconds = 0;
 		std::uint64_t gpuCompletionLatencyNanoseconds = 0;
 		bool hasGpuCompletionLatency = false;
@@ -200,32 +257,49 @@ namespace Sapphire::Graphics {
 		std::unordered_map<Mesh*, GpuMesh> gpuMeshes;
 		std::map<MaterialTextures, GpuMaterial> gpuMaterials;
 		std::unordered_map<Mesh*, Bounds> meshBounds;
+		std::unordered_map<Mesh*, float> windAmplitudes;
 		std::unordered_map<std::string, SDL_GPUTexture*> textures;
 		std::deque<PendingGpuSubmission> pendingGpuSubmissions;
 		std::vector<std::unique_ptr<Mesh>> staticBatches;
 		std::vector<RenderItem> staticDraws;
-		std::vector<RenderItem> renderItems;
-		std::vector<RenderItem> staticItems;
-		std::vector<RenderItem> dynamicItems;
-		std::vector<RenderItem> visibleItems;
-		std::vector<RenderItem> shadowCasters;
-		std::vector<RenderItem> faceCasters;
+		std::vector<const RenderItem*> renderItems;
+		std::vector<const RenderItem*> staticItems;
+		std::vector<const RenderItem*> dynamicItems;
+		std::vector<const RenderItem*> visibleItems;
+		std::vector<const RenderItem*> shadowCasters;
+		std::vector<const RenderItem*> faceCasters;
 		std::vector<PointLightData> pointLights;
-		std::vector<ChunkKey> visibleCells;
+		std::vector<CellKey> visibleCells;
 		struct MeshSource {
 			Mesh* mesh = nullptr;
+			PhysicsBody* body = nullptr;
 			std::uint64_t signature = 0;
 			std::uint64_t geometrySignature = 0;
+			std::uint64_t spatialSignature = 0;
+			std::uint64_t boundsSignature = 0;
+			std::uint64_t shadowSignature = 0;
 			bool batched = false;
 			bool staticCaster = false;
 			bool seen = false;
-			std::set<ChunkKey> cells;
+			std::set<CellKey> cells;
+			std::vector<CellKey> triangleCells;
+			std::vector<Vector3> preparedPositions;
 			RenderItem draw{};
 			bool drawReady = false;
 			Bounds shadowBounds{};
 		};
 		std::unordered_map<const Object*, MeshSource> meshSources;
-		std::set<ChunkKey> dirtyCells;
+		struct MeshEntry {
+			const Object* object;
+			MeshSource* source;
+		};
+		struct LightEntry {
+			const Object* object;
+			Light* light;
+		};
+		std::vector<MeshEntry> meshEntries;
+		std::vector<LightEntry> lightEntries;
+		std::set<CellKey> dirtyCells;
 		std::vector<Bounds> shadowChanges;
 
 		std::unordered_map<SDL_GPUTexture*, bool> maskedTextures;
@@ -233,7 +307,33 @@ namespace Sapphire::Graphics {
 		SDL_GPUCommandBuffer* uploadCommandBuffer = nullptr;
 		SDL_GPUCopyPass* uploadPass = nullptr;
 		std::vector<SDL_GPUTransferBuffer*> uploadTransfers;
+		std::size_t uploadBytes = 0;
 
+
+		void TrackAllocation(const void* resource, std::uint64_t bytes, bool texture) {
+			if (!resource) return;
+			allocations.emplace(resource, Allocation{bytes, texture});
+			(texture ? textureBytes : bufferBytes) += bytes;
+			peakResourceBytes = std::max(peakResourceBytes, textureBytes + bufferBytes);
+		}
+
+		void ReleaseAllocation(const void* resource) {
+			const auto allocation = allocations.find(resource);
+			if (allocation == allocations.end()) return;
+			(allocation->second.texture ? textureBytes : bufferBytes) -= allocation->second.bytes;
+			allocations.erase(allocation);
+		}
+
+		SDL_GPUTexture* CreateTextureResource(SDL_GPUDevice* device, const SDL_GPUTextureCreateInfo& info) {
+			SDL_GPUTexture* texture = SDL_CreateGPUTexture(device, &info);
+			std::uint64_t bytes = 0;
+			for (Uint32 level = 0; level < info.num_levels; ++level) {
+				const Uint32 layers = info.type == SDL_GPU_TEXTURETYPE_3D ? std::max(1u, info.layer_count_or_depth >> level) : info.layer_count_or_depth;
+				bytes += static_cast<std::uint64_t>(SDL_CalculateGPUTextureFormatSize(info.format, std::max(1u, info.width >> level), std::max(1u, info.height >> level), 1)) * layers;
+			}
+			TrackAllocation(texture, bytes * (1u << info.sample_count), true);
+			return texture;
+		}
 
 		SDL_GPUCopyPass* BeginUploads() {
 			if (!uploadCommandBuffer) uploadCommandBuffer = SDL_AcquireGPUCommandBuffer(gpuDevice);
@@ -253,12 +353,14 @@ namespace Sapphire::Graphics {
 		void AddHash(std::uint64_t& hash, const std::string& value) { hash = Hash(hash, value.c_str(), value.size() + 1); }
 
 		std::uint64_t GeometrySignature(const Mesh& mesh) {
+			MeshRevision revision;
+			revision.Set(mesh);
 			std::uint64_t hash = 14695981039346656037ull;
-			AddHash(hash, mesh.revision);
-			AddHash(hash, mesh.data.vertices.size());
-			AddHash(hash, mesh.data.indices.size());
-			AddHash(hash, mesh.data.vertices.data());
-			AddHash(hash, mesh.data.indices.data());
+			AddHash(hash, revision.revision);
+			AddHash(hash, revision.vertexCount);
+			AddHash(hash, revision.indexCount);
+			AddHash(hash, revision.vertices);
+			AddHash(hash, revision.indices);
 			return hash;
 		}
 
@@ -280,6 +382,38 @@ namespace Sapphire::Graphics {
 			AddHash(hash, mesh.data.indices.size());
 			AddHash(hash, mesh.data.vertices.data());
 			AddHash(hash, mesh.data.indices.data());
+			return hash;
+		}
+
+		std::uint64_t BoundsSignature(const Mesh& mesh) {
+			std::uint64_t hash = GeometrySignature(mesh);
+			AddHash(hash, mesh.windAnimated);
+			AddHash(hash, mesh.material.displacementTexturePath.empty());
+			AddHash(hash, mesh.material.displacementScale);
+			return hash;
+		}
+
+		std::uint64_t SpatialSignature(const Object& object, const Mesh& mesh) {
+			std::uint64_t hash = GeometrySignature(mesh);
+			AddHash(hash, object.transform.position);
+			AddHash(hash, object.transform.rotation);
+			AddHash(hash, object.transform.scale);
+			return hash;
+		}
+
+		std::uint64_t ShadowSignature(const Object& object, const Mesh& mesh) {
+			std::uint64_t hash = SpatialSignature(object, mesh);
+			AddHash(hash, object.renderStatic);
+			AddHash(hash, mesh.castShadows);
+			AddHash(hash, mesh.windAnimated);
+			AddHash(hash, mesh.cullBackfaces);
+			AddHash(hash, mesh.material.baseTexturePath);
+			AddHash(hash, mesh.material.displacementTexturePath);
+			AddHash(hash, mesh.material.displacementMaskTexturePath);
+			AddHash(hash, mesh.material.displacementScale);
+			AddHash(hash, mesh.material.uvScale);
+			AddHash(hash, mesh.material.uvOffset);
+			AddHash(hash, mesh.material.transparent);
 			return hash;
 		}
 
@@ -338,7 +472,7 @@ namespace Sapphire::Graphics {
 			using namespace metal;
 			struct FragmentInput { float4 position [[position]]; float2 uv; float4 color; float3 worldPosition; float3 worldNormal; float4 shadowPosition0; float4 shadowPosition1; float4 shadowPosition2; };
 			struct FragmentUniforms { float4 shadowParameters[3]; float4 lightingParameters; float4 baseColor; float4 surfaceParameters; uint4 pointLightIndices[4]; };
-			struct FrameUniforms { float4 cameraPosition; float4 fogColor; float4 fogParameters; float4 ambientLight; float4 directionalDirection; float4 directionalColor; float4 pointLightPositionRange[16]; float4 pointLightColorIntensity[16]; float4 pointLightShadowInfo[16]; float4 pointLightShadowBias[16]; };
+			struct FrameUniforms { float4 cameraPosition; float4 fogColor; float4 fogParameters; float4 fogHeightParameters; float4 ambientLight; float4 directionalDirection; float4 directionalColor; float4 pointLightPositionRange[16]; float4 pointLightColorIntensity[16]; float4 pointLightShadowInfo[16]; float4 pointLightShadowBias[16]; };
 			float ShadowCoverage(float4 position, float4 parameters) {
 				if (parameters.x < 0.5) return 0.0;
 				float3 projected = position.xyz / position.w;
@@ -423,14 +557,33 @@ namespace Sapphire::Graphics {
 				return (diffuse + distribution * visibility * fresnel) * nDotL;
 			}
 
-			float3 EncodeColor(float3 color) {
+			float3 EncodeColor(float3 color, constant FrameUniforms& frame) {
+				if (frame.fogHeightParameters.w > 0.5) return color;
 				color = max(color, float3(0.0));
 				return select(1.055 * pow(color, float3(1.0 / 2.4)) - 0.055, color * 12.92, color <= 0.0031308);
 			}
+			float HeightFog(float3 position, constant FrameUniforms& frame) {
+				if (frame.fogParameters.z < 0.5) return 0.0;
+				float3 ray = position - frame.cameraPosition.xyz;
+				float rayLength = length(ray);
+				float endDistance = min(rayLength, frame.fogParameters.y);
+				float verticalDirection = ray.y / max(rayLength, 0.000001);
+				float startHeight = frame.cameraPosition.y;
+				float endHeight = frame.cameraPosition.y + verticalDirection * endDistance;
+				float falloff = frame.fogHeightParameters.y;
+				float density = frame.fogHeightParameters.x * exp2(clamp(-falloff * (min(startHeight, endHeight) - frame.fogHeightParameters.z), -80.0, 80.0));
+				float heightChange = falloff * abs(endHeight - startHeight) * 0.69314718056;
+				float integral = heightChange < 0.01 ? 1.0 - heightChange * 0.5 + heightChange * heightChange / 6.0 : (1.0 - exp2(-heightChange * 1.44269504089)) / heightChange;
+				float distance = min(rayLength / frame.fogParameters.y, 1.0);
+				float distanceSquared = distance * distance;
+				float distanceFourth = distanceSquared * distanceSquared;
+				float opticalDepth = min(density * endDistance * integral + 4.6 * distanceFourth * distanceFourth, 80.0);
+				return 1.0 - exp2(-opticalDepth * 1.44269504089);
+			}
 			fragment float4 main0(FragmentInput input [[stage_in]], constant FragmentUniforms& uniforms [[buffer(0)]], constant FrameUniforms& frame [[buffer(1)]], texture2d<float> image [[texture(0)]], sampler imageSampler [[sampler(0)]], depth2d<float> detailMap [[texture(1)]], sampler detailSampler [[sampler(1)]], depth2d<float> fallbackMap [[texture(2)]], sampler fallbackSampler [[sampler(2)]], depth2d<float> dynamicMap [[texture(3)]], sampler dynamicSampler [[sampler(3)]], depth2d_array<float> pointShadowMap [[texture(4)]], sampler pointShadowSampler [[sampler(4)]], texture2d<float> normalMap [[texture(5)]], sampler normalSampler [[sampler(5)]], texture2d<float> roughnessMap [[texture(6)]], sampler roughnessSampler [[sampler(6)]], texture2d<float> aoMap [[texture(7)]], sampler aoSampler [[sampler(7)]]) {
 				uint materialFlags = uint(uniforms.lightingParameters.x);
-				float3 normal = normalize(input.worldNormal);
-				if ((materialFlags & 9u) != 0u) {
+				float3 normal = (materialFlags & 16u) != 0u ? float3(0.0) : normalize(input.worldNormal);
+				if ((materialFlags & 16u) == 0u && (materialFlags & 9u) != 0u) {
 					float3 dpdx = dfdx(input.worldPosition);
 					float3 dpdy = dfdy(input.worldPosition);
 					if ((materialFlags & 8u) != 0u) {
@@ -460,12 +613,12 @@ namespace Sapphire::Graphics {
 				#if ALPHA_MASKED
 				if (texel.a < 0.5) discard_fragment();
 				#endif
-				float fog = frame.fogParameters.z > 0.5 ? clamp((distance(input.worldPosition, frame.cameraPosition.xyz) - frame.fogParameters.x) / max(frame.fogParameters.y - frame.fogParameters.x, 0.0001), 0.0, 1.0) : 0.0;
+				float fog = HeightFog(input.worldPosition, frame);
 				float opacity = input.color.a * texel.a * uniforms.lightingParameters.y;
-				if (fog >= 1.0) return float4(EncodeColor(frame.fogColor.rgb), opacity);
+				if (fog >= 1.0) return float4(EncodeColor(frame.fogColor.rgb, frame), opacity);
 				if ((materialFlags & 16u) != 0u) {
 					float3 tint = input.color.rgb * uniforms.baseColor.rgb * texel.rgb;
-					return float4(EncodeColor(mix(tint, frame.fogColor.rgb, fog)), opacity);
+					return float4(EncodeColor(mix(tint, frame.fogColor.rgb, fog), frame), opacity);
 				}
 				float3 albedo = input.color.rgb * texel.rgb * uniforms.baseColor.rgb;
 				float roughness = clamp(uniforms.surfaceParameters.x * ((materialFlags & 2u) != 0u ? roughnessMap.sample(roughnessSampler, input.uv).r : 1.0), 0.045, 1.0);
@@ -486,7 +639,7 @@ namespace Sapphire::Graphics {
 				}
 				float dynamicShadow = 0.0;
 				if (directionalShadow) dynamicShadow = ShadowAmount(input.shadowPosition2, dynamicMap, dynamicSampler, uniforms.shadowParameters[2]);
-				float3 direct = EvaluateLight(surface, -frame.directionalDirection.xyz) * frame.directionalColor.rgb * frame.directionalDirection.w * (1.0 - staticShadow) * (1.0 - dynamicShadow);
+				float3 direct = frame.directionalDirection.w > 0.0 ? EvaluateLight(surface, -frame.directionalDirection.xyz) * frame.directionalColor.rgb * frame.directionalDirection.w * (1.0 - staticShadow) * (1.0 - dynamicShadow) : float3(0.0);
 				float3 pointLighting = float3(0.0);
 				for (int light = 0; light < int(uniforms.lightingParameters.w); ++light) {
 					uint index = uniforms.pointLightIndices[light / 4][light % 4];
@@ -509,7 +662,7 @@ namespace Sapphire::Graphics {
 				}
 				float3 ambient = frame.ambientLight.a > 0.5 ? frame.ambientLight.rgb : float3(0.0);
 				float3 color = albedo * ambient * ao * (1.0 - metallic) + direct + pointLighting;
-				return float4(EncodeColor(mix(color, frame.fogColor.rgb, fog)), opacity);
+				return float4(EncodeColor(mix(color, frame.fogColor.rgb, fog), frame), opacity);
 			}
 		)";
 
@@ -550,34 +703,6 @@ namespace Sapphire::Graphics {
 			return transform;
 		}
 
-		Matrix4 View(const Transform& transform) {
-			const float pitch = transform.rotation.x * Math::degreesToRadians;
-			const float yaw = transform.rotation.y * Math::degreesToRadians;
-			const float cosPitch = std::cos(pitch);
-			const float sinPitch = std::sin(pitch);
-			const float cosYaw = std::cos(yaw);
-			const float sinYaw = std::sin(yaw);
-			const Vector3 right{cosYaw, 0.0f, -sinYaw};
-			const Vector3 up{sinYaw * sinPitch, cosPitch, cosYaw * sinPitch};
-			const Vector3 forward{sinYaw * cosPitch, -sinPitch, cosYaw * cosPitch};
-			const Vector3 position = transform.position;
-			Matrix4 matrix = Identity();
-			matrix.values[0] = right.x;
-			matrix.values[4] = right.y;
-			matrix.values[8] = right.z;
-			matrix.values[12] = -(right.x * position.x + right.y * position.y + right.z * position.z);
-			matrix.values[1] = up.x;
-			matrix.values[5] = up.y;
-			matrix.values[9] = up.z;
-			matrix.values[13] = -(up.x * position.x + up.y * position.y + up.z * position.z);
-			matrix.values[2] = forward.x;
-			matrix.values[6] = forward.y;
-			matrix.values[10] = forward.z;
-			matrix.values[14] = -(forward.x * position.x + forward.y * position.y + forward.z * position.z);
-			return matrix;
-		}
-
-
 		Matrix4 Perspective(float fieldOfView, float aspectRatio, float nearClip, float farClip) {
 			const float scale = 1.0f / std::tan(fieldOfView * Math::degreesToRadians * 0.5f);
 			Matrix4 matrix{};
@@ -609,11 +734,12 @@ namespace Sapphire::Graphics {
 			return matrix;
 		}
 
-		LightData CollectLights(Scene& scene) {
+		LightData CollectLights() {
 			LightData directional{};
 			pointLights.clear();
-			for (auto& object : scene.Objects()) {
-				auto* light = object->GetComponent<Light>();
+			for (const auto& entry : lightEntries) {
+				const Object* object = entry.object;
+				Light* light = entry.light;
 				if (!light || !light->enabled || light->intensity <= 0.0f) continue;
 				if (light->type == Light::Type::Directional && !directional.source) directional = {Normalize(object->transform.Forward()), light->color, light->intensity, light->castShadows, light->shadowBias, object->renderStatic, light};
 				else if (light->type == Light::Type::Point && light->range > 0.0f && pointLights.size() < maxPointLights) {
@@ -634,6 +760,8 @@ namespace Sapphire::Graphics {
 				float tanHalfFov;
 				float aspectRatio;
 				float farClip;
+				Vector3 planes[6]{};
+				float offsets[6]{};
 			};
 
 			struct Basic {
@@ -642,15 +770,27 @@ namespace Sapphire::Graphics {
 			};
 			constexpr Basic basic{};
 
-			Frustum FromCamera(const Camera& camera, float aspectRatio) {
-				const Transform transform = CameraWorldTransform(camera);
+			void PrepareFrustum(Frustum& frustum) {
+				const float height = frustum.tanHalfFov * basic.fovPadding;
+				const float width = height * frustum.aspectRatio;
+				frustum.planes[0] = Add(frustum.right, Scale(frustum.forward, width));
+				frustum.planes[1] = Add(Scale(frustum.right, -1.0f), Scale(frustum.forward, width));
+				frustum.planes[2] = Add(frustum.up, Scale(frustum.forward, height));
+				frustum.planes[3] = Add(Scale(frustum.up, -1.0f), Scale(frustum.forward, height));
+				frustum.planes[4] = Scale(frustum.forward, -1.0f);
+				frustum.planes[5] = frustum.forward;
+				frustum.offsets[4] = frustum.farClip;
+				frustum.offsets[5] = basic.behindCameraDistance;
+			}
+
+			Frustum FromCamera(const Camera& camera, const Transform& transform, float aspectRatio) {
 				const float pitch = transform.rotation.x * Math::degreesToRadians;
 				const float yaw = transform.rotation.y * Math::degreesToRadians;
 				const float cosPitch = std::cos(pitch);
 				const float sinPitch = std::sin(pitch);
 				const float cosYaw = std::cos(yaw);
 				const float sinYaw = std::sin(yaw);
-				return {
+				Frustum frustum{
 					transform.position,
 					{cosYaw, 0.0f, -sinYaw},
 					{sinYaw * sinPitch, cosPitch, cosYaw * sinPitch},
@@ -659,6 +799,8 @@ namespace Sapphire::Graphics {
 					aspectRatio,
 					camera.farClip
 				};
+				PrepareFrustum(frustum);
+				return frustum;
 			}
 
 			const Bounds& GetBounds(Mesh* mesh) {
@@ -671,6 +813,7 @@ namespace Sapphire::Graphics {
 						Include(entry->second, vertex.position);
 						if (mesh->windAnimated) windPadding = std::max(windPadding, std::abs(vertex.color[0]) * 0.08f);
 					}
+					windAmplitudes[mesh] = windPadding;
 					if (mesh->windAnimated) {
 						entry->second.minimum.x -= windPadding;
 						entry->second.maximum.x += windPadding;
@@ -689,41 +832,19 @@ namespace Sapphire::Graphics {
 			}
 
 			bool IsVisible(const Bounds& bounds, const Frustum& frustum) {
-				bool outsideLeft = true;
-				bool outsideRight = true;
-				bool outsideBottom = true;
-				bool outsideTop = true;
-				bool outsideFar = true;
-				bool outsideBehind = true;
-				const float halfHeightScale = frustum.tanHalfFov * basic.fovPadding;
-				const float halfWidthScale = halfHeightScale * frustum.aspectRatio;
-				for (int corner = 0; corner < 8; ++corner) {
-					const Vector3 localPoint{
-						corner & 1 ? bounds.maximum.x : bounds.minimum.x,
-						corner & 2 ? bounds.maximum.y : bounds.minimum.y,
-						corner & 4 ? bounds.maximum.z : bounds.minimum.z
-					};
-					const Vector3& point = localPoint;
-					const float x = point.x - frustum.position.x;
-					const float y = point.y - frustum.position.y;
-					const float z = point.z - frustum.position.z;
-					const float depth = x * frustum.forward.x + y * frustum.forward.y + z * frustum.forward.z;
-					const float horizontal = x * frustum.right.x + y * frustum.right.y + z * frustum.right.z;
-					const float vertical = x * frustum.up.x + y * frustum.up.y + z * frustum.up.z;
-					outsideLeft = outsideLeft && horizontal < -depth * halfWidthScale;
-					outsideRight = outsideRight && horizontal > depth * halfWidthScale;
-					outsideBottom = outsideBottom && vertical < -depth * halfHeightScale;
-					outsideTop = outsideTop && vertical > depth * halfHeightScale;
-					outsideFar = outsideFar && depth > frustum.farClip;
-					outsideBehind = outsideBehind && depth < -basic.behindCameraDistance;
+				const Vector3 center = Subtract(Scale(Add(bounds.minimum, bounds.maximum), 0.5f), frustum.position);
+				const Vector3 extent = Scale(Subtract(bounds.maximum, bounds.minimum), 0.5f);
+				for (int index = 0; index < 6; ++index) {
+					const Vector3& normal = frustum.planes[index];
+					if (Dot(normal, center) + frustum.offsets[index] + std::abs(normal.x) * extent.x + std::abs(normal.y) * extent.y + std::abs(normal.z) * extent.z < 0.0f) return false;
 				}
-				return !(outsideLeft || outsideRight || outsideBottom || outsideTop || outsideFar || outsideBehind);
+				return true;
 			}
 		}
 
-		void PointShadowCasters(const std::vector<RenderItem>& items, const Vector3& position, float range, std::vector<RenderItem>& casters) {
+		void PointShadowCasters(const std::vector<const RenderItem*>& items, const Vector3& position, float range, std::vector<const RenderItem*>& casters) {
 			casters.clear();
-			for (const auto& item : items) if (item.mesh->castShadows && IntersectsSphere(item.bounds, position, range)) casters.push_back(item);
+			for (const auto* item : items) if (item->mesh->castShadows && IntersectsSphere(item->bounds, position, range)) casters.push_back(item);
 		}
 
 		const Vector3 pointDirections[6] = {{1.0f, 0.0f, 0.0f}, {-1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, -1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f}};
@@ -773,26 +894,59 @@ namespace Sapphire::Graphics {
 			return corners;
 		}
 
-		ShadowMapData BuildStaticShadowMap(const Vector3& lightDirection, int cellX, int cellY, int cellZ, int chunkSize, const std::vector<RenderItem>& items, std::vector<RenderItem>& casters) {
+		struct ShadowBasis {
+			Vector3 source;
+			Vector3 direction;
+			Vector3 right;
+			Vector3 up;
+			bool ready = false;
+		};
+
+		const ShadowBasis& GetShadowBasis(const Vector3& direction) {
+			static ShadowBasis basis;
+			if (!basis.ready || basis.source.x != direction.x || basis.source.y != direction.y || basis.source.z != direction.z) {
+				basis.source = direction;
+				basis.direction = Normalize(direction);
+				const Vector3 referenceUp = std::abs(basis.direction.y) > 0.99f ? Vector3{1.0f, 0.0f, 0.0f} : Vector3{0.0f, 1.0f, 0.0f};
+				basis.right = Normalize(Cross(referenceUp, basis.direction));
+				basis.up = Normalize(Cross(basis.direction, basis.right));
+				basis.ready = true;
+			}
+			return basis;
+		}
+
+		const Bounds& LightBounds(const RenderItem& item, const Vector3& direction, const Vector3& right, const Vector3& up) {
+			if (!item.lightBoundsReady || item.shadowDirection.x != direction.x || item.shadowDirection.y != direction.y || item.shadowDirection.z != direction.z) {
+				const auto x = ProjectBounds(item.bounds, right);
+				const auto y = ProjectBounds(item.bounds, up);
+				const auto z = ProjectBounds(item.bounds, direction);
+				item.lightBounds = {{x.first, y.first, z.first}, {x.second, y.second, z.second}};
+				item.shadowDirection = direction;
+				item.lightBoundsReady = true;
+			}
+			return item.lightBounds;
+		}
+
+		ShadowMapData BuildStaticShadowMap(const Vector3& lightDirection, int cellX, int cellY, int cellZ, int cellSize, const std::vector<const RenderItem*>& items, std::vector<const RenderItem*>& casters) {
 			ShadowMapData shadowMap{};
 			casters.clear();
 			if (items.empty()) return shadowMap;
-			const Vector3 direction = Normalize(lightDirection);
-			const Vector3 referenceUp = std::abs(Dot(direction, {0.0f, 1.0f, 0.0f})) > 0.99f ? Vector3{1.0f, 0.0f, 0.0f} : Vector3{0.0f, 1.0f, 0.0f};
-			const Vector3 right = Normalize(Cross(referenceUp, direction));
-			const Vector3 up = Normalize(Cross(direction, right));
+			const auto& basis = GetShadowBasis(lightDirection);
+			const Vector3& direction = basis.direction;
+			const Vector3& right = basis.right;
+			const Vector3& up = basis.up;
 			float minimumX = std::numeric_limits<float>::max();
 			float maximumX = std::numeric_limits<float>::lowest();
 			float minimumY = std::numeric_limits<float>::max();
 			float maximumY = std::numeric_limits<float>::lowest();
 			float minimumDepth = std::numeric_limits<float>::max();
 			float maximumDepth = std::numeric_limits<float>::lowest();
-			if (chunkSize > 0) {
+			if (cellSize > 0) {
 				for (int corner = 0; corner < 8; ++corner) {
 					const Vector3 point{
-						(corner & 1 ? cellX + 1 : cellX) * static_cast<float>(chunkSize),
-						(corner & 2 ? cellY + 1 : cellY) * static_cast<float>(chunkSize),
-						(corner & 4 ? cellZ + 1 : cellZ) * static_cast<float>(chunkSize)
+						(corner & 1 ? cellX + 1 : cellX) * static_cast<float>(cellSize),
+						(corner & 2 ? cellY + 1 : cellY) * static_cast<float>(cellSize),
+						(corner & 4 ? cellZ + 1 : cellZ) * static_cast<float>(cellSize)
 					};
 					const float x = Dot(right, point);
 					const float y = Dot(up, point);
@@ -806,18 +960,17 @@ namespace Sapphire::Graphics {
 				}
 			}
 			else {
-				for (const RenderItem& item : items) {
-					const Bounds& bounds = item.bounds;
-					for (int corner = 0; corner < 8; ++corner) {
-						const Vector3 localPoint{corner & 1 ? bounds.maximum.x : bounds.minimum.x, corner & 2 ? bounds.maximum.y : bounds.minimum.y, corner & 4 ? bounds.maximum.z : bounds.minimum.z};
-						const Vector3 point = localPoint;
-						minimumX = std::min(minimumX, Dot(right, point));
-						maximumX = std::max(maximumX, Dot(right, point));
-						minimumY = std::min(minimumY, Dot(up, point));
-						maximumY = std::max(maximumY, Dot(up, point));
-						minimumDepth = std::min(minimumDepth, Dot(direction, point));
-						maximumDepth = std::max(maximumDepth, Dot(direction, point));
-					}
+				for (const auto* item : items) {
+					const Bounds& projected = LightBounds(*item, direction, right, up);
+					const float minX = projected.minimum.x, maxX = projected.maximum.x;
+					const float minY = projected.minimum.y, maxY = projected.maximum.y;
+					const float minDepth = projected.minimum.z, maxDepth = projected.maximum.z;
+					minimumX = std::min(minimumX, minX);
+					maximumX = std::max(maximumX, maxX);
+					minimumY = std::min(minimumY, minY);
+					maximumY = std::max(maximumY, maxY);
+					minimumDepth = std::min(minimumDepth, minDepth);
+					maximumDepth = std::max(maximumDepth, maxDepth);
 				}
 			}
 			const float extent = std::max(maximumX - minimumX, maximumY - minimumY);
@@ -827,27 +980,17 @@ namespace Sapphire::Graphics {
 			const float centerY = std::round((minimumY + maximumY) * 0.5f / texel) * texel;
 			const Vector3 center = Add(Scale(right, centerX), Scale(up, centerY));
 			bool hasCaster = false;
-			for (const RenderItem& item : items) {
+			for (const RenderItem* itemPointer : items) {
+				const RenderItem& item = *itemPointer;
 				if (!item.mesh->castShadows) continue;
-				const Bounds& bounds = item.bounds;
-				float itemMinimumX = std::numeric_limits<float>::max();
-				float itemMaximumX = std::numeric_limits<float>::lowest();
-				float itemMinimumY = std::numeric_limits<float>::max();
-				float itemMaximumY = std::numeric_limits<float>::lowest();
-				float itemMinimumDepth = std::numeric_limits<float>::max();
-				for (int corner = 0; corner < 8; ++corner) {
-					const Vector3 localPoint{corner & 1 ? bounds.maximum.x : bounds.minimum.x, corner & 2 ? bounds.maximum.y : bounds.minimum.y, corner & 4 ? bounds.maximum.z : bounds.minimum.z};
-					const Vector3 point = localPoint;
-					itemMinimumX = std::min(itemMinimumX, Dot(right, point));
-					itemMaximumX = std::max(itemMaximumX, Dot(right, point));
-					itemMinimumY = std::min(itemMinimumY, Dot(up, point));
-					itemMaximumY = std::max(itemMaximumY, Dot(up, point));
-					itemMinimumDepth = std::min(itemMinimumDepth, Dot(direction, point));
-				}
+				const Bounds& projected = LightBounds(item, direction, right, up);
+				const float itemMinimumX = projected.minimum.x, itemMaximumX = projected.maximum.x;
+				const float itemMinimumY = projected.minimum.y, itemMaximumY = projected.maximum.y;
+				const float itemMinimumDepth = projected.minimum.z;
 				const bool overlaps = !(itemMaximumX < centerX - radius || itemMinimumX > centerX + radius || itemMaximumY < centerY - radius || itemMinimumY > centerY + radius);
 				if (!overlaps || itemMinimumDepth > maximumDepth) continue;
 				minimumDepth = std::min(minimumDepth, itemMinimumDepth);
-				casters.push_back(item);
+				casters.push_back(&item);
 				hasCaster = true;
 			}
 			if (!hasCaster) return shadowMap;
@@ -859,16 +1002,15 @@ namespace Sapphire::Graphics {
 			return shadowMap;
 		}
 
-		ShadowMapData BuildDynamicShadowMap(const Camera& camera, float aspectRatio, float shadowFar, const LightData& light, const std::vector<RenderItem>& items, std::vector<RenderItem>& casters) {
+		ShadowMapData BuildDynamicShadowMap(const Camera& camera, const Culling::Frustum& frustum, float shadowFar, const LightData& light, const std::vector<const RenderItem*>& items, std::vector<const RenderItem*>& casters) {
 			ShadowMapData map{};
 			casters.clear();
-			const auto frustum = Culling::FromCamera(camera, aspectRatio);
 			const float near = std::max(camera.nearClip, 0.01f);
 			const auto corners = FrustumCorners(frustum, near, std::max(near + 0.1f, std::min(camera.farClip, shadowFar)));
-			const Vector3 direction = Normalize(light.direction);
-			const Vector3 referenceUp = std::abs(direction.y) > 0.99f ? Vector3{1.0f, 0.0f, 0.0f} : Vector3{0.0f, 1.0f, 0.0f};
-			const Vector3 right = Normalize(Cross(referenceUp, direction));
-			const Vector3 up = Normalize(Cross(direction, right));
+			const auto& basis = GetShadowBasis(light.direction);
+			const Vector3& direction = basis.direction;
+			const Vector3& right = basis.right;
+			const Vector3& up = basis.up;
 			float receiverMinX = std::numeric_limits<float>::max();
 			float receiverMaxX = std::numeric_limits<float>::lowest();
 			float receiverMinY = receiverMinX;
@@ -887,25 +1029,15 @@ namespace Sapphire::Graphics {
 			float maximumY = maximumX;
 			float minimumDepth = minimumX;
 			bool hasCaster = false;
-			for (const auto& item : items) {
+			for (const RenderItem* itemPointer : items) {
+				const RenderItem& item = *itemPointer;
 				if (!item.mesh->castShadows) continue;
-				const auto& bounds = item.bounds;
-				float minX = std::numeric_limits<float>::max();
-				float maxX = std::numeric_limits<float>::lowest();
-				float minY = minX;
-				float maxY = maxX;
-				float depth = minX;
-				for (int corner = 0; corner < 8; ++corner) {
-					const Vector3 local{corner & 1 ? bounds.maximum.x : bounds.minimum.x, corner & 2 ? bounds.maximum.y : bounds.minimum.y, corner & 4 ? bounds.maximum.z : bounds.minimum.z};
-					const Vector3 point = local;
-					minX = std::min(minX, Dot(right, point));
-					maxX = std::max(maxX, Dot(right, point));
-					minY = std::min(minY, Dot(up, point));
-					maxY = std::max(maxY, Dot(up, point));
-					depth = std::min(depth, Dot(direction, point));
-				}
+				const Bounds& projected = LightBounds(item, direction, right, up);
+				const float minX = projected.minimum.x, maxX = projected.maximum.x;
+				const float minY = projected.minimum.y, maxY = projected.maximum.y;
+				const float depth = projected.minimum.z;
 				if (maxX < receiverMinX || minX > receiverMaxX || maxY < receiverMinY || minY > receiverMaxY || depth > maximumDepth) continue;
-				casters.push_back(item);
+				casters.push_back(&item);
 				minimumX = std::min(minimumX, std::max(minX, receiverMinX));
 				maximumX = std::max(maximumX, std::min(maxX, receiverMaxX));
 				minimumY = std::min(minimumY, std::max(minY, receiverMinY));
@@ -935,12 +1067,13 @@ namespace Sapphire::Graphics {
 			const auto paths = MaterialPaths(material);
 			MaterialTextures key;
 			for (std::size_t index = 0; index < paths.size(); ++index) key[index] = *paths[index];
+			key[6] = material.transparent ? "blended" : "masked";
 			auto [entry, inserted] = gpuMaterials.try_emplace(std::move(key));
 			auto& gpu = entry->second;
 			if (inserted) {
 				gpu.source = &entry->first;
 				for (std::size_t index = 0; index < gpu.textures.size(); ++index) {
-					SDL_GPUTexture* texture = entry->first[index].empty() ? nullptr : LoadTexture(entry->first[index], index == 0, index < 4);
+					SDL_GPUTexture* texture = entry->first[index].empty() ? nullptr : LoadTexture(entry->first[index], index == 0, index < 4, index == 0 && material.transparent);
 					gpu.textures[index] = texture ? texture : whiteTexture;
 					if (texture && index > 0 && index < 5) gpu.flags |= 1u << (index - 1);
 				}
@@ -959,30 +1092,66 @@ namespace Sapphire::Graphics {
 
 		GpuMesh& GetMesh(Mesh* mesh);
 
-		RenderItem PrepareDraw(Mesh* mesh, const Transform& transform, const ChunkKey& cell) {
+		RenderItem PrepareDraw(Mesh* mesh, const Transform& transform, const CellKey& cell) {
 			RenderItem item{mesh, Model(transform), NormalMatrix(transform), std::get<0>(cell), std::get<1>(cell), std::get<2>(cell)};
 			item.bounds = TransformBounds(Culling::GetBounds(mesh), item.model);
-			item.gpu = &GetMesh(mesh);
+			if (mesh->windAnimated && std::abs(transform.scale.y) > std::abs(transform.scale.x)) {
+				const float amplitude = windAmplitudes.at(mesh);
+				const Vector3 padding{std::abs(item.model.values[0]), std::abs(item.model.values[1]), std::abs(item.model.values[2])};
+				const float extra = amplitude * (std::abs(transform.scale.y) / std::max(std::abs(transform.scale.x), 0.0001f) - 1.0f);
+				item.bounds.minimum = Subtract(item.bounds.minimum, Scale(padding, extra));
+				item.bounds.maximum = Add(item.bounds.maximum, Scale(padding, extra));
+			}
+			const auto gpu = gpuMeshes.find(mesh);
+			item.gpu = gpu == gpuMeshes.end() ? nullptr : &gpu->second;
 			return item;
 		}
 
 		void ReleaseMesh(Mesh* mesh, bool geometryOnly = false) {
 			meshBounds.erase(mesh);
+			windAmplitudes.erase(mesh);
 			const auto entry = gpuMeshes.find(mesh);
 			if (entry == gpuMeshes.end()) return;
 			auto& gpuMesh = entry->second;
+			if (geometryOnly) {
+				gpuMesh.geometryDirty = true;
+				return;
+			}
 			ReleaseBuffer(gpuDevice, gpuMesh.vertexBuffer);
 			ReleaseBuffer(gpuDevice, gpuMesh.indexBuffer);
 			gpuMesh.vertexBuffer = nullptr;
 			gpuMesh.indexBuffer = nullptr;
 			gpuMesh.indexCount = 0;
-			if (geometryOnly) return;
 			ReleaseMaterial(gpuMesh.material);
 			gpuMeshes.erase(entry);
 		}
 
+		CellKey TriangleCell(const Vector3& a, const Vector3& b, const Vector3& c, int cellSize) {
+			if (cellSize <= 0) return {};
+			const Vector3 center = Scale(Add(Add(a, b), c), 1.0f / 3.0f);
+			return {static_cast<int>(std::floor(center.x / cellSize)), static_cast<int>(std::floor(center.y / cellSize)), static_cast<int>(std::floor(center.z / cellSize))};
+		}
+
+		void PrepareSourceCells(MeshSource& source, const Object& object, int cellSize) {
+			const auto& data = source.mesh->data;
+			source.preparedPositions.clear();
+			source.triangleCells.clear();
+			source.cells.clear();
+			const Matrix4 model = Model(object.transform);
+			source.preparedPositions.reserve(data.vertices.size());
+			for (const auto& vertex : data.vertices) source.preparedPositions.push_back(TransformPoint(model, vertex.position));
+			source.triangleCells.reserve(data.indices.size() / 3);
+			for (std::size_t index = 0; index + 2 < data.indices.size(); index += 3) {
+				const auto& positions = source.preparedPositions;
+				const CellKey cell = TriangleCell(positions[data.indices[index]], positions[data.indices[index + 1]], positions[data.indices[index + 2]], cellSize);
+				source.triangleCells.push_back(cell);
+				source.cells.insert(cell);
+			}
+		}
+
 		void BuildStaticBatches(Scene& scene, bool rebuildAll) {
-			Loading::Timer loading("Static mesh batching and upload recording");
+			Loading::Timer loading("Static mesh batching and upload recording", loadingFrame);
+			++meshRebuildCount;
 			std::vector<GpuMaterial*> retainedMaterials;
 			for (auto batch = staticBatches.begin(); batch != staticBatches.end();) {
 				Mesh* mesh = batch->get();
@@ -994,13 +1163,19 @@ namespace Sapphire::Graphics {
 					}
 					ReleaseMesh(mesh);
 					staticBatchCells.erase(mesh);
+					staticBatchOwners.erase(mesh);
 					batch = staticBatches.erase(batch);
 				}
 				else ++batch;
 			}
-			using BatchKey = std::tuple<int, int, int, Material, bool, bool, bool>;
+			using GroupKey = std::tuple<Material, bool, bool, bool>;
+			using BatchKey = std::tuple<int, int, int, std::size_t>;
+			std::map<GroupKey, std::size_t> groups;
+			std::vector<GroupKey> groupData;
 			using CellKey = std::tuple<int, int, int>;
 			std::map<BatchKey, MeshData> batchData;
+			std::map<BatchKey, const Object*> batchOwners;
+			std::vector<Vector3> positions;
 			for (auto& object : scene.Objects()) {
 				if (!object->renderStatic) continue;
 				Mesh* mesh = object->GetComponent<Mesh>();
@@ -1008,29 +1183,51 @@ namespace Sapphire::Graphics {
 				if (!mesh || mesh->data.vertices.empty() || mesh->data.indices.empty()) continue;
 				if (!rebuildAll) {
 					const auto& cells = meshSources.at(object.get()).cells;
-					if (std::none_of(cells.begin(), cells.end(), [&](const ChunkKey& cell) { return dirtyCells.count(cell); })) continue;
+					if (std::none_of(cells.begin(), cells.end(), [&](const CellKey& cell) { return dirtyCells.count(cell); })) continue;
 				}
 				const Matrix4 model = Model(object->transform);
 				const Matrix4 normal = NormalMatrix(object->transform);
+				const GroupKey group{mesh->material, mesh->cullBackfaces, mesh->castShadows, mesh->windAnimated};
+				const auto [groupEntry, groupInserted] = groups.try_emplace(group, groupData.size());
+				if (groupInserted) groupData.push_back(group);
+				auto& source = meshSources.at(object.get());
+				positions.clear();
+				if (!source.preparedPositions.empty()) positions.swap(source.preparedPositions);
+				else {
+					positions.reserve(mesh->data.vertices.size());
+					for (const auto& vertex : mesh->data.vertices) positions.push_back(TransformPoint(model, vertex.position));
+				}
+				std::vector<Vector3>().swap(source.preparedPositions);
+				const bool cacheCells = source.triangleCells.size() != mesh->data.indices.size() / 3;
+				if (cacheCells) source.triangleCells.reserve(mesh->data.indices.size() / 3);
 				std::map<CellKey, std::unordered_map<std::uint32_t, std::uint32_t>> vertexMaps;
+				CellKey previousCell{};
+				MeshData* previousOutput = nullptr;
+				std::unordered_map<std::uint32_t, std::uint32_t>* previousVertices = nullptr;
 				for (std::size_t index = 0; index + 2 < mesh->data.indices.size(); index += 3) {
 					const std::uint32_t sourceIndices[3] = {mesh->data.indices[index], mesh->data.indices[index + 1], mesh->data.indices[index + 2]};
 					const Vector3 worldPositions[3] = {
-						TransformPoint(model, mesh->data.vertices[sourceIndices[0]].position),
-						TransformPoint(model, mesh->data.vertices[sourceIndices[1]].position),
-						TransformPoint(model, mesh->data.vertices[sourceIndices[2]].position)
+						positions[sourceIndices[0]],
+						positions[sourceIndices[1]],
+						positions[sourceIndices[2]]
 					};
-					const float centerX = (worldPositions[0].x + worldPositions[1].x + worldPositions[2].x) / 3.0f;
-					const float centerY = (worldPositions[0].y + worldPositions[1].y + worldPositions[2].y) / 3.0f;
-					const float centerZ = (worldPositions[0].z + worldPositions[1].z + worldPositions[2].z) / 3.0f;
-					const int cellX = scene.chunkSize > 0 ? static_cast<int>(std::floor(centerX / scene.chunkSize)) : 0;
-					const int cellY = scene.chunkSize > 0 ? static_cast<int>(std::floor(centerY / scene.chunkSize)) : 0;
-					const int cellZ = scene.chunkSize > 0 ? static_cast<int>(std::floor(centerZ / scene.chunkSize)) : 0;
-					const CellKey cellKey{cellX, cellY, cellZ};
-					if (rebuildAll) meshSources.at(object.get()).cells.insert(cellKey);
+					const CellKey cellKey = cacheCells ? TriangleCell(worldPositions[0], worldPositions[1], worldPositions[2], scene.cellSize) : source.triangleCells[index / 3];
+					if (cacheCells) {
+						source.triangleCells.push_back(cellKey);
+						source.cells.insert(cellKey);
+					}
+					const auto [cellX, cellY, cellZ] = cellKey;
 					if (!rebuildAll && !dirtyCells.count(cellKey)) continue;
-					auto& output = batchData[{cellX, cellY, cellZ, mesh->material, mesh->cullBackfaces, mesh->castShadows, mesh->windAnimated}];
-					auto& vertexMap = vertexMaps[cellKey];
+					if (!previousOutput || previousCell != cellKey) {
+						const BatchKey key{cellX, cellY, cellZ, groupEntry->second};
+						auto [owner, insertedOwner] = batchOwners.try_emplace(key, object.get());
+						if (!insertedOwner && owner->second != object.get()) owner->second = nullptr;
+						previousOutput = &batchData[key];
+						previousVertices = &vertexMaps[cellKey];
+						previousCell = cellKey;
+					}
+					auto& output = *previousOutput;
+					auto& vertexMap = *previousVertices;
 					for (int corner = 0; corner < 3; ++corner) {
 						auto [entry, inserted] = vertexMap.try_emplace(sourceIndices[corner], static_cast<std::uint32_t>(output.vertices.size()));
 						if (inserted) {
@@ -1048,12 +1245,14 @@ namespace Sapphire::Graphics {
 			for (auto& [key, data] : batchData) {
 				auto batch = std::make_unique<Mesh>();
 				batch->data = std::move(data);
-				batch->material = std::get<3>(key);
-				batch->cullBackfaces = std::get<4>(key);
-				batch->castShadows = std::get<5>(key);
-				batch->windAnimated = std::get<6>(key);
-				const ChunkKey cellKey{std::get<0>(key), std::get<1>(key), std::get<2>(key)};
+				const auto& group = groupData[std::get<3>(key)];
+				batch->material = std::get<0>(group);
+				batch->cullBackfaces = std::get<1>(group);
+				batch->castShadows = std::get<2>(group);
+				batch->windAnimated = std::get<3>(group);
+				const CellKey cellKey{std::get<0>(key), std::get<1>(key), std::get<2>(key)};
 				staticBatchCells.emplace(batch.get(), cellKey);
+				staticBatchOwners.emplace(batch.get(), batchOwners.at(key));
 				Culling::GetBounds(batch.get());
 				GetMesh(batch.get());
 				batch->data = {};
@@ -1116,25 +1315,42 @@ namespace Sapphire::Graphics {
 			return mesh;
 		}
 
-		SDL_GPUBuffer* UploadBuffer(SDL_GPUBufferUsageFlags usage, const void* data, Uint32 size) {
-			SDL_GPUBuffer* buffer = CreateBuffer(gpuDevice, usage, size);
+		SDL_GPUBuffer* UploadBuffer(SDL_GPUBufferUsageFlags usage, const void* data, Uint32 size, SDL_GPUBuffer* existing = nullptr) {
+			SDL_GPUBuffer* buffer = existing ? existing : CreateBuffer(gpuDevice, usage, size);
+			if (uploadBytes + size > 32 * 1024 * 1024) FlushUploads();
+			uploadBytes += size;
+			RecordUpload(size);
+			peakUploadBytes = std::max(peakUploadBytes, uploadBytes);
 			SDL_GPUTransferBuffer* transferBuffer = CreateTransferBuffer(gpuDevice, size);
 			void* mappedData = SDL_MapGPUTransferBuffer(gpuDevice, transferBuffer, false);
 			std::memcpy(mappedData, data, size);
 			SDL_UnmapGPUTransferBuffer(gpuDevice, transferBuffer);
 			SDL_GPUTransferBufferLocation source{transferBuffer, 0};
 			SDL_GPUBufferRegion destination{buffer, 0, size};
-			SDL_UploadToGPUBuffer(BeginUploads(), &source, &destination, false);
+			SDL_UploadToGPUBuffer(BeginUploads(), &source, &destination, existing != nullptr);
 			uploadTransfers.push_back(transferBuffer);
 			return buffer;
 		}
 
-		GpuMesh UploadMesh(const MeshData& mesh) {
-			GpuMesh gpuMesh;
-			gpuMesh.vertexBuffer = UploadBuffer(SDL_GPU_BUFFERUSAGE_VERTEX, mesh.vertices.data(), static_cast<Uint32>(mesh.vertices.size() * sizeof(MeshVertex)));
-			gpuMesh.indexBuffer = UploadBuffer(SDL_GPU_BUFFERUSAGE_INDEX, mesh.indices.data(), static_cast<Uint32>(mesh.indices.size() * sizeof(std::uint32_t)));
-			gpuMesh.indexCount = static_cast<Uint32>(mesh.indices.size());
-			return gpuMesh;
+		GpuMesh UploadMesh(const MeshData& mesh, GpuMesh previous = {}) {
+			const auto vertexBytes = mesh.vertices.size() * sizeof(MeshVertex);
+			const auto indexBytes = mesh.indices.size() * sizeof(std::uint32_t);
+			mesh.Validate();
+			if (previous.vertexCapacity < vertexBytes) {
+				ReleaseBuffer(gpuDevice, previous.vertexBuffer);
+				previous.vertexBuffer = nullptr;
+			}
+			if (previous.indexCapacity < indexBytes) {
+				ReleaseBuffer(gpuDevice, previous.indexBuffer);
+				previous.indexBuffer = nullptr;
+			}
+			previous.vertexBuffer = UploadBuffer(SDL_GPU_BUFFERUSAGE_VERTEX, mesh.vertices.data(), static_cast<Uint32>(vertexBytes), previous.vertexBuffer);
+			previous.indexBuffer = UploadBuffer(SDL_GPU_BUFFERUSAGE_INDEX, mesh.indices.data(), static_cast<Uint32>(indexBytes), previous.indexBuffer);
+			previous.vertexCapacity = std::max(previous.vertexCapacity, static_cast<Uint32>(vertexBytes));
+			previous.indexCapacity = std::max(previous.indexCapacity, static_cast<Uint32>(indexBytes));
+			previous.indexCount = static_cast<Uint32>(mesh.indices.size());
+			previous.geometryDirty = false;
+			return previous;
 		}
 
 		SDL_GPUTexture* CreateDepthTexture(Uint32 width, Uint32 height) {
@@ -1147,7 +1363,7 @@ namespace Sapphire::Graphics {
 			textureInfo.layer_count_or_depth = 1;
 			textureInfo.num_levels = 1;
 			textureInfo.sample_count = SDL_GPU_SAMPLECOUNT_1;
-			return SDL_CreateGPUTexture(gpuDevice, &textureInfo);
+			return CreateTextureResource(gpuDevice, textureInfo);
 		}
 
 		SDL_GPUTexture* CreateShadowTexture(Uint32 resolution) {
@@ -1160,15 +1376,18 @@ namespace Sapphire::Graphics {
 			textureInfo.layer_count_or_depth = 1;
 			textureInfo.num_levels = 1;
 			textureInfo.sample_count = SDL_GPU_SAMPLECOUNT_1;
-			return SDL_CreateGPUTexture(gpuDevice, &textureInfo);
+			return CreateTextureResource(gpuDevice, textureInfo);
 		}
 
-		void EnsurePointShadowTexture(bool layoutChanged) {
+		void EnsurePointShadowTexture(bool layoutChanged, SDL_GPUCommandBuffer* commandBuffer, const std::vector<std::pair<const Light*, bool>>& previousSlots) {
 			const Uint32 resolution = pointShadowSlots.empty() ? 1 : shadowMapResolution;
 			if (!layoutChanged && resolution == pointShadowResolution && pointShadowTexture) return;
-			if (pointShadowTexture) ReleaseTexture(gpuDevice, pointShadowTexture);
+			SDL_GPUTexture* previousTexture = pointShadowTexture;
+			const bool preserve = previousTexture && pointShadowResolution == resolution;
 			pointShadowResolution = resolution;
-			for (auto& state : pointShadowStates) state.staticReady = false;
+			for (auto& state : pointShadowStates) {
+				if (!preserve || std::find(previousSlots.begin(), previousSlots.end(), std::pair<const Light*, bool>{state.source, false}) == previousSlots.end()) state.staticReady = false;
+			}
 			SDL_GPUTextureCreateInfo textureInfo{};
 			textureInfo.type = SDL_GPU_TEXTURETYPE_2D_ARRAY;
 			textureInfo.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
@@ -1178,7 +1397,26 @@ namespace Sapphire::Graphics {
 			textureInfo.layer_count_or_depth = static_cast<Uint32>(std::max<std::size_t>(pointShadowSlots.size(), 1) * 6);
 			textureInfo.num_levels = 1;
 			textureInfo.sample_count = SDL_GPU_SAMPLECOUNT_1;
-			pointShadowTexture = SDL_CreateGPUTexture(gpuDevice, &textureInfo);
+			pointShadowTexture = CreateTextureResource(gpuDevice, textureInfo);
+			if (preserve && layoutChanged) {
+				SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(commandBuffer);
+				for (std::size_t index = 0; index < pointShadowSlots.size(); ++index) {
+					if (pointShadowSlots[index].second) continue;
+					const auto previous = std::find(previousSlots.begin(), previousSlots.end(), pointShadowSlots[index]);
+					if (previous == previousSlots.end()) continue;
+					for (Uint32 face = 0; face < 6; ++face) {
+						SDL_GPUTextureLocation source{};
+						source.texture = previousTexture;
+						source.layer = static_cast<Uint32>(previous - previousSlots.begin()) * 6 + face;
+						SDL_GPUTextureLocation destination{};
+						destination.texture = pointShadowTexture;
+						destination.layer = static_cast<Uint32>(index) * 6 + face;
+						SDL_CopyGPUTextureToTexture(copy, &source, &destination, resolution, resolution, 1, false);
+					}
+				}
+				SDL_EndGPUCopyPass(copy);
+			}
+			if (previousTexture) ReleaseTexture(gpuDevice, previousTexture);
 		}
 
 		void EnsureShadowResolution(int requestedResolution) {
@@ -1222,68 +1460,157 @@ namespace Sapphire::Graphics {
 			}
 		}
 
+		void PrepareMaterial(GpuMesh& gpu, const Material& material) {
+			if (gpu.uniformsReady && gpu.cachedMaterial.Key() == material.Key()) return;
+			gpu.cachedMaterial = material;
+			gpu.uniformsReady = true;
+			Uint32 materialFlags = gpu.material->flags;
+			if (material.normalScale <= 0.0f) materialFlags &= ~1u;
+			if (material.aoStrength <= 0.0f) materialFlags &= ~4u;
+			if (material.displacementScale == 0.0f) materialFlags &= ~8u;
+			if (material.unlit) materialFlags |= 16u;
+			gpu.fragment.lightingParameters[0] = static_cast<float>(materialFlags);
+			gpu.fragment.lightingParameters[1] = std::clamp(material.opacity, 0.0f, 1.0f);
+			gpu.fragment.baseColor[0] = material.baseColor.x;
+			gpu.fragment.baseColor[1] = material.baseColor.y;
+			gpu.fragment.baseColor[2] = material.baseColor.z;
+			gpu.fragment.baseColor[3] = std::clamp(material.metallic, 0.0f, 1.0f);
+			gpu.fragment.surfaceParameters[0] = std::clamp(material.roughness, 0.0f, 1.0f);
+			gpu.fragment.surfaceParameters[1] = std::max(material.normalScale, 0.0f);
+			gpu.fragment.surfaceParameters[2] = std::clamp(material.aoStrength, 0.0f, 1.0f);
+			gpu.fragment.surfaceParameters[3] = material.flipNormalY ? -1.0f : 1.0f;
+			gpu.uv[0] = material.uvScale[0];
+			gpu.uv[1] = material.uvScale[1];
+			gpu.uv[2] = material.uvOffset[0];
+			gpu.uv[3] = material.uvOffset[1];
+			gpu.displacementScale = (gpu.material->flags & 8u) ? material.displacementScale : 0.0f;
+		}
+
 		GpuMesh& GetMesh(Mesh* mesh) {
 			GpuMesh& gpuMesh = gpuMeshes.try_emplace(mesh).first->second;
-			if (!gpuMesh.vertexBuffer && !mesh->data.vertices.empty() && !mesh->data.indices.empty()) {
-				auto uploaded = UploadMesh(mesh->data);
+			if ((!gpuMesh.vertexBuffer || gpuMesh.geometryDirty) && !mesh->data.vertices.empty() && !mesh->data.indices.empty()) {
+				auto uploaded = UploadMesh(mesh->data, gpuMesh);
+				gpuMesh.vertexCapacity = uploaded.vertexCapacity;
+				gpuMesh.indexCapacity = uploaded.indexCapacity;
+				gpuMesh.geometryDirty = false;
 				gpuMesh.vertexBuffer = uploaded.vertexBuffer;
 				gpuMesh.indexBuffer = uploaded.indexBuffer;
 				gpuMesh.indexCount = uploaded.indexCount;
 			}
 			const auto paths = MaterialPaths(mesh->material);
-			bool changed = !gpuMesh.material;
+			bool changed = !gpuMesh.material || (*gpuMesh.material->source)[6] != (mesh->material.transparent ? "blended" : "masked");
 			for (std::size_t index = 0; gpuMesh.material && index < paths.size(); ++index) changed = changed || *paths[index] != (*gpuMesh.material->source)[index];
 			if (changed) {
 				GpuMaterial* next = AcquireMaterial(mesh->material);
 				ReleaseMaterial(gpuMesh.material);
 				gpuMesh.material = next;
+				gpuMesh.uniformsReady = false;
 			}
+			PrepareMaterial(gpuMesh, mesh->material);
 			return gpuMesh;
 		}
 
+		bool UpdateBatchMaterial(const Object& object, const Mesh& mesh, const MeshSource& source) {
+			bool found = false;
+			for (const auto& batch : staticBatches) {
+				if (!source.cells.count(staticBatchCells.at(batch.get()))) continue;
+				if (staticBatchOwners.at(batch.get()) != &object) return false;
+				found = true;
+			}
+			if (!found) return false;
+			for (auto& batch : staticBatches) {
+				if (staticBatchOwners.at(batch.get()) != &object) continue;
+				batch->material = mesh.material;
+				GetMesh(batch.get());
+			}
+			return true;
+		}
+
+		MeshSource* UpdateMeshSource(Object& object, int cellSize, bool rebuildAll) {
+			Mesh* mesh = object.GetComponent<Mesh>();
+			if (!mesh) return nullptr;
+			sceneTriangleCount += mesh->data.indices.size() / 3;
+			auto [entry, inserted] = meshSources.try_emplace(&object);
+			auto& source = entry->second;
+			source.body = object.GetComponent<PhysicsBody>();
+			source.seen = true;
+			const auto signature = MeshSignature(object, *mesh);
+			if (!inserted && source.signature == signature && (!rebuildAll || !source.batched)) return &source;
+			const auto spatialSignature = SpatialSignature(object, *mesh);
+			const auto shadowSignature = ShadowSignature(object, *mesh);
+			const bool shadowChanged = inserted || source.shadowSignature != shadowSignature;
+			const bool spatialChanged = inserted || source.spatialSignature != spatialSignature;
+			if (!rebuildAll && !shadowChanged && !spatialChanged && source.batched && !mesh->material.transparent && mesh->material.displacementTexturePath.empty() && UpdateBatchMaterial(object, *mesh, source)) {
+				source.signature = signature;
+				return &source;
+			}
+			dirtyCells.insert(source.cells.begin(), source.cells.end());
+			if (shadowChanged && source.staticCaster) shadowChanges.push_back(source.shadowBounds);
+			const bool batched = object.renderStatic && !mesh->material.transparent && mesh->material.displacementTexturePath.empty();
+			const auto geometrySignature = GeometrySignature(*mesh);
+			if (inserted || source.geometrySignature != geometrySignature) mesh->data.Validate();
+			if (source.mesh && (source.mesh != mesh || source.batched != batched)) ReleaseMesh(source.mesh);
+			else if (!batched && source.geometrySignature != geometrySignature) ReleaseMesh(mesh, true);
+			const auto boundsSignature = BoundsSignature(*mesh);
+			if (source.boundsSignature != boundsSignature) {
+				meshBounds.erase(mesh);
+				windAmplitudes.erase(mesh);
+				source.boundsSignature = boundsSignature;
+			}
+			source.geometrySignature = geometrySignature;
+			source.spatialSignature = spatialSignature;
+			source.shadowSignature = shadowSignature;
+			source.mesh = mesh;
+			source.signature = signature;
+			source.drawReady = false;
+			source.batched = batched;
+			source.staticCaster = object.renderStatic && mesh->castShadows && !mesh->windAnimated && !mesh->data.vertices.empty() && !mesh->data.indices.empty();
+			if (source.staticCaster) {
+				source.shadowBounds = TransformBounds(Culling::GetBounds(mesh), Model(object.transform));
+				if (shadowChanged) shadowChanges.push_back(source.shadowBounds);
+			}
+			if (spatialChanged || rebuildAll || !batched) {
+				source.cells.clear();
+				source.triangleCells.clear();
+				source.preparedPositions.clear();
+			}
+			if (batched && !rebuildAll && !mesh->data.indices.empty() && source.triangleCells.empty()) {
+				PrepareSourceCells(source, object, cellSize);
+				dirtyCells.insert(source.cells.begin(), source.cells.end());
+			}
+			return &source;
+		}
+
+		void InvalidateShadows(bool rebuildAll) {
+			if (!rebuildAll && shadowChanges.empty()) return;
+			fallbackShadowReady = false;
+			for (auto& [key, map] : staticShadowMaps) {
+				if (rebuildAll || !map.data.valid) map.ready = false;
+				else {
+					for (const auto& bounds : shadowChanges) {
+						const Bounds projected = TransformBounds(bounds, map.data.mvp);
+						if (projected.maximum.x < -1.0f || projected.minimum.x > 1.0f || projected.maximum.y < -1.0f || projected.minimum.y > 1.0f) continue;
+						map.ready = false;
+						break;
+					}
+				}
+			}
+			for (auto& state : pointShadowStates) {
+				if (rebuildAll || std::any_of(shadowChanges.begin(), shadowChanges.end(), [&](const Bounds& bounds) { return IntersectsSphere(bounds, state.position, state.range); })) state.staticReady = false;
+			}
+		}
+
 		void UpdateSceneResources(Scene& scene) {
-			const bool rebuildAll = batchChunkSize != scene.chunkSize;
+			const bool rebuildAll = batchCellSize != scene.cellSize;
 			shadowChanges.clear();
 			dirtyCells.clear();
 			sceneTriangleCount = 0;
 			for (auto& [object, source] : meshSources) source.seen = false;
+			meshEntries.clear();
+			lightEntries.clear();
 			for (auto& object : scene.Objects()) {
-				Mesh* mesh = object->GetComponent<Mesh>();
-				if (!mesh) continue;
-				sceneTriangleCount += mesh->data.indices.size() / 3;
-				auto [entry, inserted] = meshSources.try_emplace(object.get());
-				auto& source = entry->second;
-				source.seen = true;
-				const auto signature = MeshSignature(*object, *mesh);
-				if (!inserted && source.signature == signature && (!rebuildAll || !source.batched)) continue;
-				dirtyCells.insert(source.cells.begin(), source.cells.end());
-				if (source.staticCaster) shadowChanges.push_back(source.shadowBounds);
-				const bool batched = object->renderStatic && !mesh->material.transparent && mesh->material.displacementTexturePath.empty();
-				const auto geometrySignature = GeometrySignature(*mesh);
-				if (source.mesh && (source.mesh != mesh || source.batched != batched)) ReleaseMesh(source.mesh);
-				else if (!batched && source.geometrySignature != geometrySignature) ReleaseMesh(mesh, true);
-				meshBounds.erase(mesh);
-				source.geometrySignature = geometrySignature;
-				source.mesh = mesh;
-				source.signature = signature;
-				source.drawReady = false;
-				source.batched = batched;
-				source.staticCaster = object->renderStatic && mesh->castShadows && !mesh->windAnimated && !mesh->data.vertices.empty() && !mesh->data.indices.empty();
-				if (source.staticCaster) {
-					source.shadowBounds = TransformBounds(Culling::GetBounds(mesh), Model(object->transform));
-					shadowChanges.push_back(source.shadowBounds);
-				}
-				source.cells.clear();
-				if (batched && !rebuildAll) {
-					const Matrix4 model = Model(object->transform);
-					for (std::size_t index = 0; index + 2 < mesh->data.indices.size(); index += 3) {
-						Vector3 center{};
-						for (int corner = 0; corner < 3; ++corner) center += TransformPoint(model, mesh->data.vertices[mesh->data.indices[index + corner]].position);
-						center = center * (1.0f / 3.0f);
-						source.cells.emplace(scene.chunkSize > 0 ? static_cast<int>(std::floor(center.x / scene.chunkSize)) : 0, scene.chunkSize > 0 ? static_cast<int>(std::floor(center.y / scene.chunkSize)) : 0, scene.chunkSize > 0 ? static_cast<int>(std::floor(center.z / scene.chunkSize)) : 0);
-					}
-					dirtyCells.insert(source.cells.begin(), source.cells.end());
-				}
+				if (auto* source = UpdateMeshSource(*object, scene.cellSize, rebuildAll)) meshEntries.push_back({object.get(), source});
+				if (auto* light = object->GetComponent<Light>()) lightEntries.push_back({object.get(), light});
 			}
 			for (auto entry = meshSources.begin(); entry != meshSources.end();) {
 				if (!entry->second.seen) {
@@ -1295,34 +1622,13 @@ namespace Sapphire::Graphics {
 				else ++entry;
 			}
 			if (rebuildAll || !dirtyCells.empty()) BuildStaticBatches(scene, rebuildAll);
-			batchChunkSize = scene.chunkSize;
-			if (rebuildAll || !shadowChanges.empty()) {
-				fallbackShadowReady = false;
-				for (auto& [key, map] : staticShadowMaps) {
-					if (rebuildAll || !map.data.valid) map.ready = false;
-					else {
-						for (const auto& bounds : shadowChanges) {
-							const Bounds projected = TransformBounds(bounds, map.data.mvp);
-							if (projected.maximum.x < -1.0f || projected.minimum.x > 1.0f || projected.maximum.y < -1.0f || projected.minimum.y > 1.0f) continue;
-							map.ready = false;
-							break;
-						}
-					}
-				}
-				for (auto& state : pointShadowStates) {
-					if (rebuildAll || std::any_of(shadowChanges.begin(), shadowChanges.end(), [&](const Bounds& bounds) { return IntersectsSphere(bounds, state.position, state.range); })) state.staticReady = false;
-				}
-			}
+			batchCellSize = scene.cellSize;
+			InvalidateShadows(rebuildAll);
 		}
 
-		void MaterialUv(const Material& material, float (&uv)[4]) {
-			uv[0] = material.uvScale[0];
-			uv[1] = material.uvScale[1];
-			uv[2] = material.uvOffset[0];
-			uv[3] = material.uvOffset[1];
-		}
-
-		void RenderShadowMap(SDL_GPUCommandBuffer* commandBuffer, SDL_GPUTexture* texture, const ShadowMapData& shadowMap, const std::vector<RenderItem>& items, float time, Uint8 layer = 0, bool cullBackfaces = true) {
+		void RenderShadowMap(SDL_GPUCommandBuffer* commandBuffer, SDL_GPUTexture* texture, const ShadowMapData& shadowMap, const std::vector<const RenderItem*>& items, float time, Uint8 layer = 0, bool cullBackfaces = true) {
+			for (const auto* item : items) item->gpu = &GetMesh(item->mesh);
+			FlushUploads();
 			SDL_GPUDepthStencilTargetInfo depthInfo{};
 			depthInfo.texture = texture;
 			depthInfo.layer = layer;
@@ -1337,7 +1643,10 @@ namespace Sapphire::Graphics {
 				return;
 			}
 			SDL_GPUGraphicsPipeline* activePipeline = nullptr;
-			for (const RenderItem& item : items) {
+			GpuMaterial* activeMaterial = nullptr;
+			BufferBindings buffers;
+			for (const RenderItem* itemPointer : items) {
+				const RenderItem& item = *itemPointer;
 				Mesh* mesh = item.mesh;
 				if (!mesh->castShadows || !item.gpu || !item.gpu->indexCount) continue;
 				GpuMesh& gpuMesh = *item.gpu;
@@ -1355,39 +1664,38 @@ namespace Sapphire::Graphics {
 				const Matrix4 mvp = Multiply(shadowMap.mvp, item.model);
 				std::memcpy(uniforms.mvp, mvp.values, sizeof(uniforms.mvp));
 				std::memcpy(uniforms.model, item.model.values, sizeof(uniforms.model));
-				uniforms.displacementParameters[0] = (gpuMesh.material->flags & 8u) ? mesh->material.displacementScale : 0.0f;
-				MaterialUv(mesh->material, uniforms.uvTransform);
+				uniforms.displacementParameters[0] = gpuMesh.displacementScale;
+				std::memcpy(uniforms.uvTransform, gpuMesh.uv, sizeof(uniforms.uvTransform));
 				uniforms.displacementParameters[1] = mesh->windAnimated ? 1.0f : 0.0f;
 				uniforms.displacementParameters[2] = time;
 				uniforms.displacementParameters[3] = 0.08f;
 				SDL_PushGPUVertexUniformData(commandBuffer, 0, &uniforms, sizeof(uniforms));
-				SDL_GPUBufferBinding vertexBinding{};
-				vertexBinding.buffer = gpuMesh.vertexBuffer;
-				SDL_BindGPUVertexBuffers(shadowPass, 0, &vertexBinding, 1);
-				SDL_GPUBufferBinding indexBinding{};
-				indexBinding.buffer = gpuMesh.indexBuffer;
-				SDL_BindGPUIndexBuffer(shadowPass, &indexBinding, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+				buffers.Bind(shadowPass, gpuMesh);
 				SDL_GPUTextureSamplerBinding textureBinding{};
 				textureBinding.texture = gpuMesh.material->textures[0];
 				textureBinding.sampler = sampler;
-				if (gpuMesh.material->masked) SDL_BindGPUFragmentSamplers(shadowPass, 0, &textureBinding, 1);
+				if (activeMaterial != gpuMesh.material && gpuMesh.material->masked) SDL_BindGPUFragmentSamplers(shadowPass, 0, &textureBinding, 1);
 				SDL_GPUTextureSamplerBinding vertexTextureBindings[2]{};
 				vertexTextureBindings[0].texture = gpuMesh.material->textures[4];
 				vertexTextureBindings[0].sampler = sampler;
 				vertexTextureBindings[1].texture = gpuMesh.material->textures[5];
 				vertexTextureBindings[1].sampler = sampler;
-				SDL_BindGPUVertexSamplers(shadowPass, 0, vertexTextureBindings, 2);
+				if (activeMaterial != gpuMesh.material) SDL_BindGPUVertexSamplers(shadowPass, 0, vertexTextureBindings, 2);
+				activeMaterial = gpuMesh.material;
 				SDL_DrawGPUIndexedPrimitives(shadowPass, gpuMesh.indexCount, 1, 0, 0, 0);
 				++drawCallCount;
+				++shadowDrawCount;
+				shadowTriangleCount += gpuMesh.indexCount / 3;
 			}
 			SDL_EndGPURenderPass(shadowPass);
 		}
 
-		void RenderPointShadowMap(SDL_GPUCommandBuffer* commandBuffer, int slot, const PointLightData& light, const std::vector<RenderItem>& casters, float time) {
+		void RenderPointShadowMap(SDL_GPUCommandBuffer* commandBuffer, int slot, const PointLightData& light, const std::vector<const RenderItem*>& casters, float time) {
 			for (int face = 0; face < 6; ++face) {
 				faceCasters.clear();
-				const Culling::Frustum frustum{light.position, Cross(pointUps[face], pointDirections[face]), pointUps[face], pointDirections[face], 1.0f, 1.0f, light.range};
-				for (const auto& item : casters) if (Culling::IsVisible(item.bounds, frustum)) faceCasters.push_back(item);
+				Culling::Frustum frustum{light.position, Cross(pointUps[face], pointDirections[face]), pointUps[face], pointDirections[face], 1.0f, 1.0f, light.range};
+				Culling::PrepareFrustum(frustum);
+				for (const auto* item : casters) if (Culling::IsVisible(item->bounds, frustum)) faceCasters.push_back(item);
 				RenderShadowMap(commandBuffer, pointShadowTexture, BuildPointShadowMap(light.position, light.range, face), faceCasters, time, static_cast<Uint8>(slot * 6 + face), false);
 			}
 		}
@@ -1396,12 +1704,11 @@ namespace Sapphire::Graphics {
 			auto activeLight = [&](const Light* source) {
 				return std::find_if(pointLights.begin(), pointLights.end(), [&](const PointLightData& light) { return scene.shadowsEnabled && light.castShadows && light.source == source; });
 			};
-			const auto previousSlotCount = pointShadowSlots.size();
+			const auto previousSlots = pointShadowSlots;
 			pointShadowSlots.erase(std::remove_if(pointShadowSlots.begin(), pointShadowSlots.end(), [&](const auto& slot) {
 				const auto light = activeLight(slot.first);
 				return light == pointLights.end() || (!slot.second && !light->renderStatic);
 			}), pointShadowSlots.end());
-			bool layoutChanged = previousSlotCount != pointShadowSlots.size();
 			pointShadowStates.erase(std::remove_if(pointShadowStates.begin(), pointShadowStates.end(), [&](const PointShadowState& state) { return activeLight(state.source) == pointLights.end(); }), pointShadowStates.end());
 			for (auto& light : pointLights) {
 				if (!scene.shadowsEnabled || !light.castShadows) continue;
@@ -1418,7 +1725,7 @@ namespace Sapphire::Graphics {
 					state->staticReady = false;
 					state->staticValid = false;
 				}
-				state->relevant = std::any_of(visibleItems.begin(), visibleItems.end(), [&](const RenderItem& item) { return (item.lightMask & (1u << static_cast<Uint32>(&light - pointLights.data()))) != 0; });
+				state->relevant = std::any_of(visibleItems.begin(), visibleItems.end(), [&](const RenderItem* item) { return !item->mesh->material.unlit && (item->lightMask & (1u << static_cast<Uint32>(&light - pointLights.data()))) != 0; });
 				state->dynamicValid = false;
 				state->dynamicCasters.clear();
 				if (!state->relevant) continue;
@@ -1433,11 +1740,15 @@ namespace Sapphire::Graphics {
 					const std::pair<const Light*, bool> key{light.source, dynamic};
 					if (std::find(pointShadowSlots.begin(), pointShadowSlots.end(), key) == pointShadowSlots.end()) {
 						pointShadowSlots.push_back(key);
-						layoutChanged = true;
 					}
 				}
 			}
-			EnsurePointShadowTexture(layoutChanged);
+			pointShadowSlots.erase(std::remove_if(pointShadowSlots.begin(), pointShadowSlots.end(), [&](const auto& slot) {
+				const auto state = std::find_if(pointShadowStates.begin(), pointShadowStates.end(), [&](const PointShadowState& value) { return value.source == slot.first; });
+				return state == pointShadowStates.end() || !state->relevant || (slot.second ? !state->dynamicValid : !state->staticValid);
+			}), pointShadowSlots.end());
+			const bool layoutChanged = previousSlots != pointShadowSlots;
+			EnsurePointShadowTexture(layoutChanged, commandBuffer, previousSlots);
 			for (auto& light : pointLights) {
 				if (!scene.shadowsEnabled || !light.castShadows) continue;
 				auto state = std::find_if(pointShadowStates.begin(), pointShadowStates.end(), [&](const PointShadowState& value) { return value.source == light.source; });
@@ -1475,8 +1786,8 @@ namespace Sapphire::Graphics {
 		return SDL_CreateGPUShader(gpuDevice, &shaderInfo);
 	}
 
-	SDL_GPUTexture* UploadTexture(SDL_GPUDevice* gpuDevice, int width, int height, const void* pixels, SDL_GPUTextureFormat format, Uint32 stride, Uint32 rowPitch, bool mipmaps, bool masked) {
-		const bool generateOnGpu = mipmaps && !masked;
+	SDL_GPUTexture* UploadTexture(SDL_GPUDevice* gpuDevice, int width, int height, const void* pixels, SDL_GPUTextureFormat format, Uint32 stride, Uint32 rowPitch, bool mipmaps, bool masked, bool blended) {
+		const bool generateOnGpu = mipmaps && !masked && !blended;
 		SDL_GPUTextureCreateInfo textureInfo{};
 		textureInfo.type = SDL_GPU_TEXTURETYPE_2D;
 		textureInfo.format = format;
@@ -1488,7 +1799,7 @@ namespace Sapphire::Graphics {
 		if (mipmaps) for (int size = std::max(width, height); size > 1; size /= 2) ++textureInfo.num_levels;
 		textureInfo.sample_count = SDL_GPU_SAMPLECOUNT_1;
 		const Uint32 uploadLevels = generateOnGpu ? 1 : textureInfo.num_levels;
-		SDL_GPUTexture* texture = SDL_CreateGPUTexture(gpuDevice, &textureInfo);
+		SDL_GPUTexture* texture = CreateTextureResource(gpuDevice, textureInfo);
 		const Uint32 rowBytes = static_cast<Uint32>(width) * stride;
 		if (!rowPitch) rowPitch = rowBytes;
 		Uint32 totalBytes = 0;
@@ -1496,6 +1807,10 @@ namespace Sapphire::Graphics {
 			totalBytes = (totalBytes + 255u) & ~255u;
 			totalBytes += std::max(1, width >> level) * std::max(1, height >> level) * stride;
 		}
+		if (uploadBytes + totalBytes > 32 * 1024 * 1024) FlushUploads();
+		uploadBytes += totalBytes;
+		RecordUpload(totalBytes);
+		peakUploadBytes = std::max(peakUploadBytes, uploadBytes);
 		SDL_GPUTransferBuffer* transferBuffer = CreateTransferBuffer(gpuDevice, totalBytes);
 		auto* mappedPixels = static_cast<std::uint8_t*>(SDL_MapGPUTransferBuffer(gpuDevice, transferBuffer, false));
 		for (int row = 0; row < height; ++row) std::memcpy(mappedPixels + row * rowBytes, static_cast<const std::uint8_t*>(pixels) + row * rowPitch, rowBytes);
@@ -1607,13 +1922,19 @@ namespace Sapphire::Graphics {
 		return UploadTexture(gpuDevice, width, height, pixels, srgb ? SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, 4);
 	}
 
+	std::filesystem::path ResourcePath(std::string_view fileName) {
+		return (std::filesystem::path(SDL_GetBasePath()) / ".." / "resources" / std::string(fileName)).lexically_normal();
+	}
+
 	SDL_GPUTexture* LoadTexture(std::string_view fileName) { return LoadTexture(fileName, false); }
 
 	SDL_GPUTexture* LoadTexture(std::string_view fileName, bool srgb) { return LoadTexture(fileName, srgb, srgb); }
 
-	SDL_GPUTexture* LoadTexture(std::string_view fileName, bool srgb, bool mipmaps) {
-		const std::string path = (std::filesystem::path(SDL_GetBasePath()) / ".." / "resources" / std::string(fileName)).lexically_normal().string();
-		const std::string key = std::string(srgb ? "color:" : "data:") + (mipmaps ? "mips:" : "single:") + path;
+	SDL_GPUTexture* LoadTexture(std::string_view fileName, bool srgb, bool mipmaps) { return LoadTexture(fileName, srgb, mipmaps, false); }
+
+	SDL_GPUTexture* LoadTexture(std::string_view fileName, bool srgb, bool mipmaps, bool blended) {
+		const std::string path = ResourcePath(fileName).string();
+		const std::string key = std::string(srgb ? "color:" : "data:") + (mipmaps ? "mips:" : "single:") + (blended ? "blended:" : "masked:") + path;
 		if (auto found = textures.find(key); found != textures.end()) {
 			++textureReferences[found->second];
 			return found->second;
@@ -1632,7 +1953,7 @@ namespace Sapphire::Graphics {
 				break;
 			}
 		}
-		SDL_GPUTexture* texture = UploadTexture(gpuDevice, rgbaSurface->w, rgbaSurface->h, rgbaSurface->pixels, srgb ? SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, 4, static_cast<Uint32>(rgbaSurface->pitch), mipmaps, srgb && masked);
+		SDL_GPUTexture* texture = UploadTexture(gpuDevice, rgbaSurface->w, rgbaSurface->h, rgbaSurface->pixels, srgb ? SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, 4, static_cast<Uint32>(rgbaSurface->pitch), mipmaps, srgb && masked && !blended, srgb && blended);
 		SDL_DestroySurface(rgbaSurface);
 		if (texture) {
 			textures[key] = texture;
@@ -1655,11 +1976,13 @@ namespace Sapphire::Graphics {
 			}
 		}
 		maskedTextures.erase(texture);
+		ReleaseAllocation(texture);
 		SDL_ReleaseGPUTexture(device, texture);
 	}
 
 	void ReleaseBuffer(SDL_GPUDevice* device, SDL_GPUBuffer* buffer) {
 		if (!buffer) return;
+		ReleaseAllocation(buffer);
 		SDL_ReleaseGPUBuffer(device, buffer);
 	}
 
@@ -1676,6 +1999,8 @@ namespace Sapphire::Graphics {
 		SDL_ReleaseGPUTransferBuffer(device, buffer);
 	}
 
+	void RecordUpload(Uint32 size) { uploadedBytes += size; }
+
 	void FlushUploads() {
 		if (!uploadCommandBuffer) return;
 		if (uploadPass) SDL_EndGPUCopyPass(uploadPass);
@@ -1684,6 +2009,7 @@ namespace Sapphire::Graphics {
 		uploadPass = nullptr;
 		for (auto* buffer : uploadTransfers) ReleaseTransferBuffer(gpuDevice, buffer);
 		uploadTransfers.clear();
+		uploadBytes = 0;
 	}
 
 	SDL_GPUBuffer* CreateBuffer(SDL_GPUDevice* gpuDevice, SDL_GPUBufferUsageFlags usage, Uint32 size) {
@@ -1691,6 +2017,7 @@ namespace Sapphire::Graphics {
 		bufferInfo.usage = usage;
 		bufferInfo.size = size;
 		SDL_GPUBuffer* buffer = SDL_CreateGPUBuffer(gpuDevice, &bufferInfo);
+		TrackAllocation(buffer, size, false);
 		return buffer;
 	}
 
@@ -1702,9 +2029,10 @@ namespace Sapphire::Graphics {
 		return SDL_CreateGPUGraphicsPipeline(gpuDevice, &pipelineInfo);
 	}
 
-	void Initialize(SDL_GPUDevice* device, SDL_Window* window) {
+	bool Initialize(SDL_GPUDevice* device, SDL_Window* window) {
 		Loading::Timer loading("Graphics shaders and pipelines");
 		gpuDevice = device;
+		linearOutput = window && SDL_WindowSupportsGPUSwapchainComposition(device, window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR) && SDL_SetGPUSwapchainParameters(device, window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR, SDL_GPU_PRESENTMODE_VSYNC);
 		SDL_GPUShader* vertexShader = CreateShader(gpuDevice, vertexShaderSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
 		SDL_GPUShader* fragmentShaders[2]{};
 		SDL_GPUShader* shadowVertexShader = CreateShader(gpuDevice, shadowVertexShaderSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
@@ -1715,6 +2043,16 @@ namespace Sapphire::Graphics {
 			const std::string shadowSource = define + shadowFragmentShaderSource;
 			fragmentShaders[masked] = CreateShader(gpuDevice, source.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 8, 2);
 			shadowFragmentShaders[masked] = CreateShader(gpuDevice, shadowSource.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, masked ? 1 : 0);
+		}
+		const auto releaseShaders = [&]() {
+			if (vertexShader) SDL_ReleaseGPUShader(gpuDevice, vertexShader);
+			if (shadowVertexShader) SDL_ReleaseGPUShader(gpuDevice, shadowVertexShader);
+			for (auto* shader : fragmentShaders) if (shader) SDL_ReleaseGPUShader(gpuDevice, shader);
+			for (auto* shader : shadowFragmentShaders) if (shader) SDL_ReleaseGPUShader(gpuDevice, shader);
+		};
+		if (!vertexShader || !shadowVertexShader || !fragmentShaders[0] || !fragmentShaders[1] || !shadowFragmentShaders[0] || !shadowFragmentShaders[1]) {
+			releaseShaders();
+			return false;
 		}
 		SDL_GPUVertexBufferDescription vertexBufferDescription{};
 		vertexBufferDescription.slot = 0;
@@ -1818,22 +2156,26 @@ namespace Sapphire::Graphics {
 				shadowPipelines[masked][cull] = CreatePipeline(gpuDevice, pipelineInfo);
 			}
 		}
-		SDL_ReleaseGPUShader(gpuDevice, vertexShader);
-		for (auto* shader : fragmentShaders) SDL_ReleaseGPUShader(gpuDevice, shader);
-		SDL_ReleaseGPUShader(gpuDevice, shadowVertexShader);
-		for (auto* shader : shadowFragmentShaders) SDL_ReleaseGPUShader(gpuDevice, shader);
+		releaseShaders();
+		if (!whiteTexture || !sampler || !shadowSampler || !emptyShadowTexture) return false;
+		for (int masked = 0; masked < 2; ++masked) for (int cull = 0; cull < 2; ++cull) if (!pipelines[masked][cull] || !shadowPipelines[masked][cull]) return false;
+		return transparentPipelines[0] && transparentPipelines[1];
 	}
 
 	static void ReleaseSceneResources() {
 		while (!gpuMeshes.empty()) ReleaseMesh(gpuMeshes.begin()->first);
 		meshBounds.clear();
+		windAmplitudes.clear();
 		meshSources.clear();
+		meshEntries.clear();
+		lightEntries.clear();
 		sceneTriangleCount = 0;
 		dirtyCells.clear();
 		shadowChanges.clear();
 		staticBatches.clear();
 		staticDraws.clear();
 		staticBatchCells.clear();
+		staticBatchOwners.clear();
 		renderItems.clear();
 		staticItems.clear();
 		dynamicItems.clear();
@@ -1842,7 +2184,7 @@ namespace Sapphire::Graphics {
 		faceCasters.clear();
 		pointLights.clear();
 		visibleCells.clear();
-		batchChunkSize = -1;
+		batchCellSize = -1;
 		for (auto& [key, shadowMap] : staticShadowMaps) if (shadowMap.texture) ReleaseTexture(gpuDevice, shadowMap.texture);
 		staticShadowMaps.clear();
 	}
@@ -1865,6 +2207,35 @@ namespace Sapphire::Graphics {
 		FlushUploads();
 	}
 
+	static void RecordFrameStatistics() {
+		frameSamples[frameSampleIndex] = Time::deltaTime * 1000.0f;
+		frameSampleIndex = (frameSampleIndex + 1) % frameSamples.size();
+		frameSampleCount = std::min(frameSampleCount + 1, frameSamples.size());
+		fpsElapsed += Time::deltaTime;
+		++fpsFrames;
+		if (fpsElapsed < 0.5f) return;
+		fpsString = std::to_string(static_cast<int>(fpsFrames / fpsElapsed));
+		fpsElapsed = 0.0f;
+		fpsFrames = 0;
+		auto sorted = frameSamples;
+		std::sort(sorted.begin(), sorted.begin() + frameSampleCount);
+		medianFrameTime = (sorted[(frameSampleCount - 1) / 2] + sorted[frameSampleCount / 2]) * 0.5f;
+		slowFrameTime = sorted[frameSampleCount - 1];
+	}
+
+	static void SortDraws() {
+		const auto transparent = std::partition(visibleItems.begin(), visibleItems.end(), [](const RenderItem* item) { return !item->mesh->material.transparent; });
+		std::sort(visibleItems.begin(), transparent, [](const RenderItem* left, const RenderItem* right) {
+			if (left->depthBucket != right->depthBucket) return left->depthBucket < right->depthBucket;
+			const int leftPipeline = (left->gpu->material->masked ? 2 : 0) + (left->mesh->cullBackfaces ? 1 : 0);
+			const int rightPipeline = (right->gpu->material->masked ? 2 : 0) + (right->mesh->cullBackfaces ? 1 : 0);
+			if (leftPipeline != rightPipeline) return leftPipeline < rightPipeline;
+			if (left->gpu->material != right->gpu->material) return std::less<const GpuMaterial*>{}(left->gpu->material, right->gpu->material);
+			return left->viewDepth < right->viewDepth;
+		});
+		std::sort(transparent, visibleItems.end(), [](const RenderItem* left, const RenderItem* right) { return left->viewDepth > right->viewDepth; });
+	}
+
 	void Render(Scene& scene, SDL_GPUCommandBuffer* commandBuffer, SDL_GPUTexture* colorTarget, Uint32 width, Uint32 height) {
 		if (!colorTarget || !width || !height) return;
 		const bool logLoading = loadingFrame;
@@ -1876,22 +2247,16 @@ namespace Sapphire::Graphics {
 		const float frameTime = static_cast<float>(renderStart / 1000000000ull) + static_cast<float>(renderStart % 1000000000ull) / 1000000000.0f;
 		cullingTimeNanoseconds = 0;
 		drawCallCount = 0;
-		fpsElapsed += Time::deltaTime;
-		++fpsFrames;
-		if (fpsElapsed >= 0.5f) {
-			fpsString = std::to_string(static_cast<int>(fpsFrames / fpsElapsed));
-			fpsElapsed = 0.0f;
-			fpsFrames = 0;
-		}
-		std::uint64_t totalTriangles = 0;
+		shadowDrawCount = 0;
+		shadowTriangleCount = 0;
+		RecordFrameStatistics();
 		std::uint64_t visibleTriangles = 0;
-		const LightData lightData = CollectLights(scene);
+		const LightData lightData = CollectLights();
 		const LightData* light = lightData.source ? &lightData : nullptr;
 		const bool directionalShadowsActive = scene.shadowsEnabled && light && light->castShadows;
 		const bool pointShadowsActive = scene.shadowsEnabled && std::any_of(pointLights.begin(), pointLights.end(), [](const PointLightData& pointLight) { return pointLight.castShadows; });
 		const bool shadowsActive = directionalShadowsActive || pointShadowsActive;
 		EnsureDirectionalShadowTextures(directionalShadowsActive, directionalShadowsActive && light->renderStatic);
-		totalTriangles = sceneTriangleCount;
 		if (depthWidth != width || depthHeight != height) {
 			if (depthTexture) ReleaseTexture(gpuDevice, depthTexture);
 			depthTexture = CreateDepthTexture(width, height);
@@ -1905,45 +2270,55 @@ namespace Sapphire::Graphics {
 		Transform cameraTransform{};
 		const float aspectRatio = static_cast<float>(width) / height;
 		ShadowMapData dynamicMap{};
+		Culling::Frustum frustum{};
 		if (scene.activeCamera && scene.activeCamera->owner) {
 			cameraTransform = CameraWorldTransform(*scene.activeCamera);
 			for (const auto& item : staticDraws) {
-				renderItems.push_back(item);
+				renderItems.push_back(&item);
 				if (shadowsActive) {
-					if (item.mesh->windAnimated) dynamicItems.push_back(item);
-					else staticItems.push_back(item);
+					if (item.mesh->windAnimated) dynamicItems.push_back(&item);
+					else staticItems.push_back(&item);
 				}
 			}
-			for (auto& object : scene.Objects()) {
-				Mesh* mesh = object->GetComponent<Mesh>();
+			for (const auto& entry : meshEntries) {
+				const Object* object = entry.object;
+				auto& source = *entry.source;
+				Mesh* mesh = source.mesh;
 				if (!mesh || mesh->data.vertices.empty() || mesh->data.indices.empty() || (object->renderStatic && !mesh->material.transparent && mesh->material.displacementTexturePath.empty())) continue;
 				Transform transform = object->transform;
-				if (auto* body = object->GetComponent<PhysicsBody>()) {
+				if (auto* body = source.body) {
 					const float alpha = Time::interpolationAlpha;
 					transform.position = {body->previousPosition.x + (transform.position.x - body->previousPosition.x) * alpha, body->previousPosition.y + (transform.position.y - body->previousPosition.y) * alpha, body->previousPosition.z + (transform.position.z - body->previousPosition.z) * alpha};
 				}
-				auto& source = meshSources.at(object.get());
 				if (!object->renderStatic || !source.drawReady) {
-					const ChunkKey cell{scene.chunkSize > 0 ? static_cast<int>(std::floor(transform.position.x / scene.chunkSize)) : 0, scene.chunkSize > 0 ? static_cast<int>(std::floor(transform.position.y / scene.chunkSize)) : 0, scene.chunkSize > 0 ? static_cast<int>(std::floor(transform.position.z / scene.chunkSize)) : 0};
+					const CellKey cell{scene.cellSize > 0 ? static_cast<int>(std::floor(transform.position.x / scene.cellSize)) : 0, scene.cellSize > 0 ? static_cast<int>(std::floor(transform.position.y / scene.cellSize)) : 0, scene.cellSize > 0 ? static_cast<int>(std::floor(transform.position.z / scene.cellSize)) : 0};
 					source.draw = PrepareDraw(mesh, transform, cell);
 					source.drawReady = true;
 				}
 				const RenderItem& item = source.draw;
-				renderItems.push_back(item);
+				renderItems.push_back(&item);
 				if (shadowsActive) {
-					if (object->renderStatic && !mesh->windAnimated) staticItems.push_back(item);
-					else dynamicItems.push_back(item);
+					if (object->renderStatic && !mesh->windAnimated) staticItems.push_back(&item);
+					else dynamicItems.push_back(&item);
 				}
 			}
 			FlushUploads();
-			const auto frustum = Culling::FromCamera(*scene.activeCamera, aspectRatio);
+			frustum = Culling::FromCamera(*scene.activeCamera, cameraTransform, aspectRatio);
 			const Uint64 cullingStart = SDL_GetTicksNS();
-			for (auto item : renderItems) {
+			for (const auto* itemPointer : renderItems) {
+				const RenderItem& item = *itemPointer;
+				item.lightMask = 0;
 				if (!Culling::IsVisible(item.bounds, frustum)) continue;
 				for (std::size_t index = 0; index < pointLights.size(); ++index) if (IntersectsSphere(item.bounds, pointLights[index].position, pointLights[index].range)) item.lightMask |= 1u << index;
-				visibleItems.push_back(item);
+				const Vector3 center = Scale(Add(item.bounds.minimum, item.bounds.maximum), 0.5f);
+				item.viewDepth = Dot(Subtract(center, frustum.position), frustum.forward);
+				const float nearDepth = ProjectBounds(item.bounds, frustum.forward).first - Dot(frustum.position, frustum.forward);
+				item.depthBucket = std::floor(nearDepth / std::max(scene.cellSize, 1));
+				visibleItems.push_back(&item);
 			}
 			cullingTimeNanoseconds = SDL_GetTicksNS() - cullingStart;
+			for (const auto* item : visibleItems) item->gpu = &GetMesh(item->mesh);
+			FlushUploads();
 			if (directionalShadowsActive) {
 				Loading::Timer shadowLoading("Initial directional shadow preparation and command recording", logLoading);
 				if (light->renderStatic) {
@@ -1961,7 +2336,7 @@ namespace Sapphire::Graphics {
 						fallbackShadowReady = true;
 					}
 					visibleCells.clear();
-					for (const auto& item : visibleItems) visibleCells.emplace_back(item.cellX, item.cellY, item.cellZ);
+					for (const auto* item : visibleItems) visibleCells.emplace_back(item->cellX, item->cellY, item->cellZ);
 					std::sort(visibleCells.begin(), visibleCells.end());
 					visibleCells.erase(std::unique(visibleCells.begin(), visibleCells.end()), visibleCells.end());
 					for (auto map = staticShadowMaps.begin(); map != staticShadowMaps.end();) {
@@ -1974,7 +2349,7 @@ namespace Sapphire::Graphics {
 					for (const auto& key : visibleCells) {
 						auto& map = staticShadowMaps[key];
 						if (map.ready) continue;
-						map.data = BuildStaticShadowMap(direction, std::get<0>(key), std::get<1>(key), std::get<2>(key), scene.chunkSize, staticItems, casters);
+						map.data = BuildStaticShadowMap(direction, std::get<0>(key), std::get<1>(key), std::get<2>(key), scene.cellSize, staticItems, casters);
 						if (map.data.valid) {
 							if (!map.texture) map.texture = CreateShadowTexture(shadowMapResolution);
 							RenderShadowMap(commandBuffer, map.texture, map.data, casters, frameTime);
@@ -1983,7 +2358,7 @@ namespace Sapphire::Graphics {
 					}
 				}
 				const auto& casters = light->renderStatic ? dynamicItems : renderItems;
-				dynamicMap = BuildDynamicShadowMap(*scene.activeCamera, aspectRatio, scene.shadowFar, *light, casters, shadowCasters);
+				dynamicMap = BuildDynamicShadowMap(*scene.activeCamera, frustum, scene.shadowFar, *light, casters, shadowCasters);
 				RenderShadowMap(commandBuffer, dynamicShadowTexture, dynamicMap, shadowCasters, frameTime);
 			}
 		}
@@ -1997,9 +2372,13 @@ namespace Sapphire::Graphics {
 		frame.fogColor[0] = scene.fogColor.x;
 		frame.fogColor[1] = scene.fogColor.y;
 		frame.fogColor[2] = scene.fogColor.z;
-		frame.fogParameters[0] = scene.fogNear;
-		frame.fogParameters[1] = scene.fogFar;
+		const float farClip = scene.activeCamera ? std::max(scene.activeCamera->farClip, 0.01f) : 1000.0f;
+		frame.fogParameters[1] = farClip;
 		frame.fogParameters[2] = scene.fogEnabled ? 1.0f : 0.0f;
+		frame.fogHeightParameters[0] = 0.35f / farClip;
+		frame.fogHeightParameters[1] = 0.1f;
+		frame.fogHeightParameters[2] = 10.0f;
+		frame.fogHeightParameters[3] = linearOutput ? 1.0f : 0.0f;
 		frame.ambientLight[0] = scene.ambientLightColor.x;
 		frame.ambientLight[1] = scene.ambientLightColor.y;
 		frame.ambientLight[2] = scene.ambientLightColor.z;
@@ -2031,7 +2410,12 @@ namespace Sapphire::Graphics {
 		SDL_PushGPUFragmentUniformData(commandBuffer, 1, &frame, sizeof(frame));
 		SDL_GPUColorTargetInfo colorInfo{};
 		colorInfo.texture = colorTarget;
-		colorInfo.clear_color = {0.0f, 0.0f, 0.0f, 1.0f};
+		Vector3 background = scene.backgroundColor;
+		if (!linearOutput) {
+			auto encode = [](float value) { return value <= 0.0031308f ? value * 12.92f : 1.055f * std::pow(value, 1.0f / 2.4f) - 0.055f; };
+			background = {encode(std::max(background.x, 0.0f)), encode(std::max(background.y, 0.0f)), encode(std::max(background.z, 0.0f))};
+		}
+		colorInfo.clear_color = {background.x, background.y, background.z, 1.0f};
 		colorInfo.load_op = SDL_GPU_LOADOP_CLEAR;
 		colorInfo.store_op = SDL_GPU_STOREOP_STORE;
 		SDL_GPUDepthStencilTargetInfo depthInfo{};
@@ -2042,18 +2426,16 @@ namespace Sapphire::Graphics {
 		depthInfo.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
 		depthInfo.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
 		SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(commandBuffer, &colorInfo, 1, &depthInfo);
-		const Matrix4 view = View(cameraTransform);
+		const Matrix4 view = scene.activeCamera ? ViewDirection(frustum.position, frustum.forward, frustum.up) : Identity();
 		const Matrix4 projection = scene.activeCamera ? Perspective(scene.activeCamera->fieldOfView, aspectRatio, scene.activeCamera->nearClip, scene.activeCamera->farClip) : Identity();
 		const Matrix4 viewProjection = Multiply(projection, view);
-		const auto transparentBegin = std::stable_partition(visibleItems.begin(), visibleItems.end(), [](const RenderItem& item) { return !item.mesh->material.transparent; });
-		const Vector3 cameraForward = cameraTransform.Forward();
-		std::sort(transparentBegin, visibleItems.end(), [&](const RenderItem& left, const RenderItem& right) {
-			const Vector3 leftCenter = Add(left.bounds.minimum, left.bounds.maximum) * 0.5f;
-			const Vector3 rightCenter = Add(right.bounds.minimum, right.bounds.maximum) * 0.5f;
-			return Dot(Subtract(leftCenter, cameraTransform.position), cameraForward) > Dot(Subtract(rightCenter, cameraTransform.position), cameraForward);
-		});
+		SortDraws();
 		SDL_GPUGraphicsPipeline* activePipeline = nullptr;
-		for (const auto& item : visibleItems) {
+		std::array<SDL_GPUTexture*, 8> activeTextures{};
+		GpuMaterial* activeMaterial = nullptr;
+		BufferBindings buffers;
+		for (const auto* itemPointer : visibleItems) {
+			const RenderItem& item = *itemPointer;
 			Mesh* mesh = item.mesh;
 			const auto selected = shadowsActive ? staticShadowMaps.find({item.cellX, item.cellY, item.cellZ}) : staticShadowMaps.end();
 			const StaticShadowMap* detail = selected != staticShadowMaps.end() ? &selected->second : nullptr;
@@ -2072,12 +2454,12 @@ namespace Sapphire::Graphics {
 			std::memcpy(vertex.mvp, mvp.values, sizeof(vertex.mvp));
 			std::memcpy(vertex.model, item.model.values, sizeof(vertex.model));
 			std::memcpy(vertex.normal, item.normal.values, sizeof(vertex.normal));
-			vertex.displacementParameters[0] = (gpuMesh.material->flags & 8u) ? mesh->material.displacementScale : 0.0f;
-			MaterialUv(mesh->material, vertex.uvTransform);
+			vertex.displacementParameters[0] = gpuMesh.displacementScale;
+			std::memcpy(vertex.uvTransform, gpuMesh.uv, sizeof(vertex.uvTransform));
 			vertex.displacementParameters[1] = mesh->windAnimated ? 1.0f : 0.0f;
 			vertex.displacementParameters[2] = frameTime;
 			vertex.displacementParameters[3] = 0.08f;
-			FragmentUniforms fragment{};
+			FragmentUniforms fragment = gpuMesh.fragment;
 			Uint32 lightCount = 0;
 			for (Uint32 index = 0; index < pointLights.size(); ++index) {
 				if (!(item.lightMask & (1u << index))) continue;
@@ -2092,30 +2474,12 @@ namespace Sapphire::Graphics {
 				fragment.shadowParameters[index][2] = 1.0f / shadowMapResolution;
 			}
 			fragment.shadowParameters[1][3] = 1.0f;
-			const Material& material = mesh->material;
-			Uint32 materialFlags = gpuMesh.material->flags;
-			if (material.normalScale <= 0.0f) materialFlags &= ~1u;
-			if (material.aoStrength <= 0.0f) materialFlags &= ~4u;
-			if (material.displacementScale == 0.0f) materialFlags &= ~8u;
-			if (material.unlit) materialFlags |= 16u;
-			fragment.lightingParameters[0] = static_cast<float>(materialFlags);
-			fragment.lightingParameters[1] = std::clamp(material.opacity, 0.0f, 1.0f);
-			fragment.baseColor[0] = material.baseColor.x;
-			fragment.baseColor[1] = material.baseColor.y;
-			fragment.baseColor[2] = material.baseColor.z;
-			fragment.baseColor[3] = std::clamp(material.metallic, 0.0f, 1.0f);
-			fragment.surfaceParameters[0] = std::clamp(material.roughness, 0.0f, 1.0f);
-			fragment.surfaceParameters[1] = std::max(material.normalScale, 0.0f);
-			fragment.surfaceParameters[2] = std::clamp(material.aoStrength, 0.0f, 1.0f);
-			fragment.surfaceParameters[3] = material.flipNormalY ? -1.0f : 1.0f;
+
 			fragment.lightingParameters[2] = shadowsActive ? 1.0f : 0.0f;
 			vertex.shadowState[0] = directionalShadowsActive ? 1.0f : 0.0f;
 			SDL_PushGPUVertexUniformData(commandBuffer, 0, &vertex, sizeof(vertex));
 			SDL_PushGPUFragmentUniformData(commandBuffer, 0, &fragment, sizeof(fragment));
-			SDL_GPUBufferBinding vertexBinding{gpuMesh.vertexBuffer, 0};
-			SDL_GPUBufferBinding indexBinding{gpuMesh.indexBuffer, 0};
-			SDL_BindGPUVertexBuffers(pass, 0, &vertexBinding, 1);
-			SDL_BindGPUIndexBuffer(pass, &indexBinding, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+			buffers.Bind(pass, gpuMesh);
 			SDL_GPUTextureSamplerBinding bindings[8]{};
 			bindings[0] = {gpuMesh.material->textures[0], sampler};
 			bindings[1] = {enabled[0] ? detail->texture : emptyShadowTexture, shadowSampler};
@@ -2125,14 +2489,20 @@ namespace Sapphire::Graphics {
 			bindings[5] = {gpuMesh.material->textures[1], sampler};
 			bindings[6] = {gpuMesh.material->textures[2], sampler};
 			bindings[7] = {gpuMesh.material->textures[3], sampler};
-			SDL_BindGPUFragmentSamplers(pass, 0, bindings, 8);
+			bool texturesChanged = false;
+			for (std::size_t index = 0; index < activeTextures.size(); ++index) {
+				texturesChanged = texturesChanged || activeTextures[index] != bindings[index].texture;
+				activeTextures[index] = bindings[index].texture;
+			}
+			if (texturesChanged) SDL_BindGPUFragmentSamplers(pass, 0, bindings, 8);
 			SDL_GPUTextureSamplerBinding vertexBindings[2] = {{gpuMesh.material->textures[4], sampler}, {gpuMesh.material->textures[5], sampler}};
-			SDL_BindGPUVertexSamplers(pass, 0, vertexBindings, 2);
+			if (activeMaterial != gpuMesh.material) SDL_BindGPUVertexSamplers(pass, 0, vertexBindings, 2);
+			activeMaterial = gpuMesh.material;
 			SDL_DrawGPUIndexedPrimitives(pass, gpuMesh.indexCount, 1, 0, 0, 0);
 			++drawCallCount;
 		}
 		SDL_EndGPURenderPass(pass);
-		triangleCountString = std::to_string(visibleTriangles) + "/" + std::to_string(totalTriangles);
+		triangleCountString = std::to_string(visibleTriangles) + "/" + std::to_string(sceneTriangleCount);
 		renderTimeNanoseconds = SDL_GetTicksNS() - renderStart;
 	}
 
@@ -2144,9 +2514,21 @@ namespace Sapphire::Graphics {
 	std::string GPUCompletionTime() { return hasGpuCompletionLatency ? Milliseconds(gpuCompletionLatencyNanoseconds / 1000000.0) : "pending"; }
 	std::string DrawCalls() { return std::to_string(drawCallCount); }
 	std::string TriangleCount() { return triangleCountString; }
+	std::string ShadowDrawCalls() { return std::to_string(shadowDrawCount); }
+	std::string ShadowTriangles() { return std::to_string(shadowTriangleCount); }
+	std::string UploadBytes() { return std::to_string(frameUploadedBytes); }
+	std::string PeakUploadBytes() { return std::to_string(peakUploadBytes); }
+	std::string TextureBytes() { return std::to_string(textureBytes); }
+	std::string BufferBytes() { return std::to_string(bufferBytes); }
+	std::string PeakResourceBytes() { return std::to_string(peakResourceBytes); }
+	std::string BatchRebuilds() { return std::to_string(meshRebuildCount); }
+	std::string MedianFrameTime() { return Milliseconds(medianFrameTime); }
+	std::string SlowFrameTime() { return Milliseconds(slowFrameTime); }
 
 	void Submit(SDL_GPUCommandBuffer* commandBuffer) {
 		FlushUploads();
+		frameUploadedBytes = uploadedBytes - previousUploadedBytes;
+		previousUploadedBytes = uploadedBytes;
 		UpdateGpuCompletionLatency();
 		const Uint64 submitStart = SDL_GetTicksNS();
 		SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(commandBuffer);
@@ -2198,12 +2580,27 @@ namespace Sapphire::Graphics {
 		fallbackShadowMap = {};
 		shadowLight = nullptr;
 		shadowMapResolution = 2048;
-		batchChunkSize = -1;
+		batchCellSize = -1;
 		depthWidth = 0;
 		depthHeight = 0;
 		fpsElapsed = 0.0f;
 		fpsFrames = 0;
 		hasGpuCompletionLatency = false;
+		shadowDrawCount = 0;
+		shadowTriangleCount = 0;
+		meshRebuildCount = 0;
+		uploadedBytes = 0;
+		previousUploadedBytes = 0;
+		frameUploadedBytes = 0;
+		peakUploadBytes = 0;
+		allocations.clear();
+		textureBytes = 0;
+		bufferBytes = 0;
+		peakResourceBytes = 0;
+		frameSampleCount = 0;
+		frameSampleIndex = 0;
+		medianFrameTime = 0.0f;
+		slowFrameTime = 0.0f;
 		whiteTexture = nullptr;
 		sampler = nullptr;
 		shadowSampler = nullptr;
