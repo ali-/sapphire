@@ -37,8 +37,8 @@ namespace Sapphire::Input {
 	}
 
 	void ProcessEvent(const SDL_Event& event) {
-		if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) pressed[event.key.scancode] = true;
-		else if (event.type == SDL_EVENT_KEY_UP) released[event.key.scancode] = true;
+		if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.scancode > SDL_SCANCODE_UNKNOWN && event.key.scancode < SDL_SCANCODE_COUNT) pressed[event.key.scancode] = true;
+		else if (event.type == SDL_EVENT_KEY_UP && event.key.scancode > SDL_SCANCODE_UNKNOWN && event.key.scancode < SDL_SCANCODE_COUNT) released[event.key.scancode] = true;
 		else if (event.type == SDL_EVENT_MOUSE_MOTION) {
 			mouseDeltaX += event.motion.xrel;
 			mouseDeltaY += event.motion.yrel;
@@ -75,15 +75,15 @@ namespace Sapphire::Input {
 
 
 	bool GetKey(SDL_Scancode code) {
-		if (code == SDL_SCANCODE_UNKNOWN) return false;
+		if (code <= SDL_SCANCODE_UNKNOWN || code >= SDL_SCANCODE_COUNT) return false;
 		return SDL_GetKeyboardState(nullptr)[code] || (code == SDL_SCANCODE_ESCAPE && gamepad && SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_START)) || (code == SDL_SCANCODE_SPACE && gamepad && SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_SOUTH));
 	}
 
 	bool GetKey(const char* key) { return GetKey(ToScancode(key)); }
 
-	bool GetKeyDown(SDL_Scancode code) { return code != SDL_SCANCODE_UNKNOWN && pressed[code]; }
+	bool GetKeyDown(SDL_Scancode code) { return code > SDL_SCANCODE_UNKNOWN && code < SDL_SCANCODE_COUNT && pressed[code]; }
 
-	bool GetKeyUp(SDL_Scancode code) { return code != SDL_SCANCODE_UNKNOWN && released[code]; }
+	bool GetKeyUp(SDL_Scancode code) { return code > SDL_SCANCODE_UNKNOWN && code < SDL_SCANCODE_COUNT && released[code]; }
 
 	bool GetKeyDown(const char* key) {
 		return GetKeyDown(ToScancode(key));

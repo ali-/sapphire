@@ -5,6 +5,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <iomanip>
 #include <memory>
 #include <map>
@@ -134,9 +135,7 @@ namespace Sapphire {
 			return result;
 		}
 
-		Matrix4 Model(const Transform& transform) {
-			Vector3 axes[3];
-			GetAxes(transform, axes);
+		Matrix4 Model(const Transform& transform, const Vector3* axes) {
 			Matrix4 matrix = Identity();
 			const float scale[3] = {transform.scale.x, transform.scale.y, transform.scale.z};
 			for (int axis = 0; axis < 3; ++axis) {
@@ -150,7 +149,13 @@ namespace Sapphire {
 			return matrix;
 		}
 
-		Matrix4 NormalMatrix(const Transform& transform) {
+		Matrix4 Model(const Transform& transform) {
+			Vector3 axes[3];
+			GetAxes(transform, axes);
+			return Model(transform, axes);
+		}
+
+		Matrix4 NormalMatrix(const Transform& transform, const Vector3* axes) {
 			Transform normalTransform = transform;
 			normalTransform.position = {};
 			normalTransform.scale = {
@@ -158,7 +163,13 @@ namespace Sapphire {
 				std::abs(transform.scale.y) > 0.0001f ? 1.0f / transform.scale.y : 0.0f,
 				std::abs(transform.scale.z) > 0.0001f ? 1.0f / transform.scale.z : 0.0f
 			};
-			return Model(normalTransform);
+			return Model(normalTransform, axes);
+		}
+
+		Matrix4 NormalMatrix(const Transform& transform) {
+			Vector3 axes[3];
+			GetAxes(transform, axes);
+			return NormalMatrix(transform, axes);
 		}
 
 		Vector3 TransformNormal(const Matrix4& normal, const Vector3& value) {
@@ -285,6 +296,7 @@ namespace Sapphire {
 		std::string aoTexturePath;
 		std::string displacementTexturePath;
 		std::string displacementMaskTexturePath;
+		std::string vertexModifierSource;
 		float roughness = 1.0f;
 		float metallic = 0.0f;
 		float normalScale = 1.0f;
@@ -298,7 +310,7 @@ namespace Sapphire {
 		float opacity = 1.0f;
 
 		auto Key() const {
-			return std::tie(baseTexturePath, normalTexturePath, roughnessTexturePath, aoTexturePath, displacementTexturePath, displacementMaskTexturePath, baseColor.x, baseColor.y, baseColor.z, roughness, metallic, normalScale, aoStrength, displacementScale, uvScale[0], uvScale[1], uvOffset[0], uvOffset[1], flipNormalY, transparent, unlit, opacity);
+			return std::tie(baseTexturePath, normalTexturePath, roughnessTexturePath, aoTexturePath, displacementTexturePath, displacementMaskTexturePath, vertexModifierSource, baseColor.x, baseColor.y, baseColor.z, roughness, metallic, normalScale, aoStrength, displacementScale, uvScale[0], uvScale[1], uvOffset[0], uvOffset[1], flipNormalY, transparent, unlit, opacity);
 		}
 
 		bool operator<(const Material& other) const { return Key() < other.Key(); }
@@ -309,7 +321,7 @@ namespace Sapphire {
 		Vector3 position;
 		Vector3 rotation;
 		Vector3 scale{1.0f, 1.0f, 1.0f};
-		float variation = 0.0f;
+		float customData = 0.0f;
 	};
 
 	class Mesh : public Component {
@@ -320,9 +332,12 @@ namespace Sapphire {
 			Material material;
 			bool cullBackfaces = true;
 			bool castShadows = true;
-			bool windAnimated = false;
+			Vector3 vertexBoundsPadding{};
+			bool vertexAnimated = false;
 			std::uint64_t revision = 0;
+			std::uint64_t instanceRevision = 0;
 			void MarkDirty() { ++revision; }
+			void MarkInstancesDirty() { ++instanceRevision; }
 			static MeshData Cube();
 			static MeshData Plane(int subdivisions = 1);
 	};
@@ -347,6 +362,7 @@ namespace Sapphire {
 			bool spatiallyLoaded = true;
 			bool worldPartitionedMesh = false;
 			bool worldPartitionCell = false;
+			bool initializedForApp = true;
 			Object* worldPartitionSourceObject = nullptr;
 			explicit Object(std::string name) : name(std::move(name)) {}
 			virtual void Initialize() {}
@@ -403,10 +419,25 @@ namespace Sapphire {
 		std::vector<Object*> residentRenderObjects;
 		std::vector<CellKey> residentCells;
 		std::set<CellKey> residentCellKeys;
-		std::vector<CellKey> pendingCellLoads;
-		std::vector<CellKey> pendingCellUnloads;
+		std::deque<CellKey> pendingCellLoads;
+		std::deque<CellKey> pendingCellUnloads;
 		std::set<Object*> residentDynamicObjects;
 		std::vector<std::unique_ptr<Object>> cellsData;
+		struct SourceSnapshot {
+			Object* object;
+			Transform transform;
+			Mesh* mesh;
+			MeshRevision revision;
+			Material material;
+			bool renderStatic;
+			bool spatiallyLoaded;
+			bool instanced;
+			bool cullBackfaces;
+			bool castShadows;
+			Vector3 padding;
+			bool animated;
+		};
+		std::vector<SourceSnapshot> sources;
 		int partitionSize = 0;
 		float loadingRange = 0.0f;
 		CellKey sourceCell{};
@@ -414,6 +445,7 @@ namespace Sapphire {
 		bool dirty = true;
 		bool hasCellSelection = false;
 		bool initialCellLoadComplete = false;
+		bool streamLoadNext = true;
 		std::chrono::steady_clock::time_point nextCellStreamTime{};
 
 		static CellKey Key(const Vector3& position, int size) {
@@ -423,15 +455,12 @@ namespace Sapphire {
 		static void IncludeBounds(std::map<CellKey, Math::Bounds>& boundsByCell, const CellKey& key, const Vector3& point) {
 			auto [entry, inserted] = boundsByCell.try_emplace(key, Math::Bounds{point, point});
 			if (inserted) return;
-			entry->second.minimum.x = std::min(entry->second.minimum.x, point.x);
-			entry->second.minimum.y = std::min(entry->second.minimum.y, point.y);
-			entry->second.minimum.z = std::min(entry->second.minimum.z, point.z);
-			entry->second.maximum.x = std::max(entry->second.maximum.x, point.x);
-			entry->second.maximum.y = std::max(entry->second.maximum.y, point.y);
-			entry->second.maximum.z = std::max(entry->second.maximum.z, point.z);
+			Math::Include(entry->second, point);
 		}
 
 		void Rebuild(const std::vector<std::unique_ptr<Object>>& objects, int size) {
+			const auto previousResidentCells = residentCells;
+			const bool hadSelection = hasCellSelection;
 			cells.clear();
 			cellBounds.clear();
 			alwaysResidentObjects.clear();
@@ -444,10 +473,15 @@ namespace Sapphire {
 			pendingCellUnloads.clear();
 			residentDynamicObjects.clear();
 			cellsData.clear();
+			sources.clear();
 			partitionSize = size;
 			for (const auto& object : objects) {
+				if (!object->initializedForApp) continue;
 				object->worldPartitionedMesh = false;
 				Mesh* mesh = object->GetComponent<Mesh>();
+				SourceSnapshot snapshot{object.get(), object->transform, mesh, {}, mesh ? mesh->material : Material{}, object->renderStatic, object->spatiallyLoaded, mesh && mesh->instanced, mesh && mesh->cullBackfaces, mesh && mesh->castShadows, mesh ? mesh->vertexBoundsPadding : Vector3{}, mesh && mesh->vertexAnimated};
+				if (mesh) snapshot.revision.Set(*mesh);
+				sources.push_back(std::move(snapshot));
 				if (!object->spatiallyLoaded) {
 					alwaysResidentObjects.push_back(object.get());
 					continue;
@@ -504,7 +538,8 @@ namespace Sapphire {
 					cellMesh.material = mesh->material;
 					cellMesh.cullBackfaces = mesh->cullBackfaces;
 					cellMesh.castShadows = mesh->castShadows;
-					cellMesh.windAnimated = mesh->windAnimated;
+					cellMesh.vertexBoundsPadding = mesh->vertexBoundsPadding;
+					cellMesh.vertexAnimated = mesh->vertexAnimated;
 					cells[key].push_back(object.get());
 					cells[key].push_back(cellObject.get());
 					const Math::Bounds cellMeshBoundsValue = cellMeshBounds.at(key);
@@ -513,6 +548,11 @@ namespace Sapphire {
 					cellsData.push_back(std::move(cellObject));
 				}
 			}
+			for (const auto& key : previousResidentCells) {
+				if (cells.count(key) && residentCellKeys.insert(key).second) residentCells.push_back(key);
+			}
+			hasCellSelection = false;
+			if (!hadSelection) initialCellLoadComplete = false;
 			initialized = true;
 			dirty = false;
 		}
@@ -536,8 +576,10 @@ namespace Sapphire {
 				cellsData.clear();
 				hasCellSelection = false;
 				initialCellLoadComplete = false;
+				nextCellStreamTime = {};
 				for (const auto& object : objects) object->worldPartitionedMesh = false;
 				for (const auto& object : objects) {
+					if (!object->initializedForApp) continue;
 					residentObjects.push_back(object.get());
 					residentRenderObjects.push_back(object.get());
 				}
@@ -553,6 +595,32 @@ namespace Sapphire {
 			sourcePosition += Math::Scale(axes[1], camera->localPosition.y);
 			sourcePosition += Math::Scale(axes[2], camera->localPosition.z);
 			const CellKey nextSource = Key(sourcePosition, size);
+			std::size_t sourceIndex = 0;
+			bool materialChanged = false;
+			for (const auto& object : objects) {
+				if (!object->initializedForApp) continue;
+				if (sourceIndex >= sources.size() || sources[sourceIndex].object != object.get()) { dirty = true; break; }
+				auto& source = sources[sourceIndex++];
+				Mesh* mesh = object->GetComponent<Mesh>();
+				const auto& a = source.transform;
+				const auto& b = object->transform;
+				const bool transformChanged = source.renderStatic && source.spatiallyLoaded && !object->GetComponent<Camera>() && std::tie(a.position.x, a.position.y, a.position.z, a.rotation.x, a.rotation.y, a.rotation.z, a.scale.x, a.scale.y, a.scale.z) != std::tie(b.position.x, b.position.y, b.position.z, b.rotation.x, b.rotation.y, b.rotation.z, b.scale.x, b.scale.y, b.scale.z);
+				if (source.renderStatic != object->renderStatic || source.spatiallyLoaded != object->spatiallyLoaded || source.mesh != mesh || transformChanged || (mesh && (!source.revision.Matches(*mesh) || source.instanced != mesh->instanced))) { dirty = true; break; }
+				if (mesh && (source.material.Key() != mesh->material.Key() || source.cullBackfaces != mesh->cullBackfaces || source.castShadows != mesh->castShadows || source.animated != mesh->vertexAnimated || std::tie(source.padding.x, source.padding.y, source.padding.z) != std::tie(mesh->vertexBoundsPadding.x, mesh->vertexBoundsPadding.y, mesh->vertexBoundsPadding.z))) materialChanged = true;
+			}
+			if (sourceIndex != sources.size()) dirty = true;
+			if (materialChanged && !dirty) {
+				for (auto& cell : cellsData) {
+					Mesh* sourceMesh = cell->worldPartitionSourceObject->GetComponent<Mesh>();
+					Mesh* cellMesh = cell->GetComponent<Mesh>();
+					cellMesh->material = sourceMesh->material;
+					cellMesh->cullBackfaces = sourceMesh->cullBackfaces;
+					cellMesh->castShadows = sourceMesh->castShadows;
+					cellMesh->vertexBoundsPadding = sourceMesh->vertexBoundsPadding;
+					cellMesh->vertexAnimated = sourceMesh->vertexAnimated;
+				}
+				for (auto& source : sources) if (source.mesh) { source.material = source.mesh->material; source.cullBackfaces = source.mesh->cullBackfaces; source.castShadows = source.mesh->castShadows; source.padding = source.mesh->vertexBoundsPadding; source.animated = source.mesh->vertexAnimated; }
+			}
 			if (!initialized || dirty || partitionSize != size) Rebuild(objects, size);
 			const float loadRange = std::max(range, 0.0f);
 			const float unloadRange = loadRange + size;
@@ -590,13 +658,10 @@ namespace Sapphire {
 					return Math::Dot(leftDelta, leftDelta) > Math::Dot(rightDelta, rightDelta);
 				});
 				if (!initialCellLoadComplete) {
-					for (const auto& key : pendingCellLoads) {
-						if (residentCellKeys.insert(key).second) {
-							residentCells.push_back(key);
-						}
-					}
-					pendingCellLoads.clear();
+					if (cells.count(nextSource) && residentCellKeys.insert(nextSource).second) residentCells.push_back(nextSource);
+					pendingCellLoads.erase(std::remove(pendingCellLoads.begin(), pendingCellLoads.end(), nextSource), pendingCellLoads.end());
 					initialCellLoadComplete = true;
+					nextCellStreamTime = std::chrono::steady_clock::now() + std::chrono::milliseconds(8);
 				}
 				sourceCell = nextSource;
 				loadingRange = range;
@@ -604,29 +669,33 @@ namespace Sapphire {
 			}
 			const auto now = std::chrono::steady_clock::now();
 			if (now >= nextCellStreamTime) {
-				if (!pendingCellLoads.empty()) {
+				const bool canLoad = !pendingCellLoads.empty();
+				const bool canUnload = !pendingCellUnloads.empty();
+				if (canLoad && (!canUnload || streamLoadNext)) {
 					const CellKey key = pendingCellLoads.front();
-					pendingCellLoads.erase(pendingCellLoads.begin());
+					pendingCellLoads.pop_front();
 					if (residentCellKeys.insert(key).second) {
 						residentCells.push_back(key);
 					}
+					streamLoadNext = false;
 					nextCellStreamTime = now + std::chrono::milliseconds(8);
 				}
-				else if (!pendingCellUnloads.empty()) {
+				else if (canUnload) {
 					const CellKey key = pendingCellUnloads.front();
-					pendingCellUnloads.erase(pendingCellUnloads.begin());
+					pendingCellUnloads.pop_front();
 					residentCellKeys.erase(key);
 					residentCells.erase(std::remove(residentCells.begin(), residentCells.end(), key), residentCells.end());
+					streamLoadNext = true;
 					nextCellStreamTime = now + std::chrono::milliseconds(8);
 				}
 			}
 			residentObjects.clear();
 			residentRenderObjects.clear();
 			std::unordered_set<Object*> residentSet;
-			std::unordered_set<Object*> renderSet;
 			auto addResident = [&](Object* object) {
-				if (residentSet.insert(object).second) residentObjects.push_back(object);
-				if ((!object->worldPartitionedMesh || object->worldPartitionCell) && renderSet.insert(object).second) residentRenderObjects.push_back(object);
+				if (!residentSet.insert(object).second) return;
+				residentObjects.push_back(object);
+				if (!object->worldPartitionedMesh || object->worldPartitionCell) residentRenderObjects.push_back(object);
 			};
 			for (const auto& key : residentCells) {
 				for (auto* object : cells.at(key)) addResident(object);
@@ -670,6 +739,7 @@ namespace Sapphire {
 			T& CreateObject(std::string name) {
 				objects.push_back(std::make_unique<T>(std::move(name)));
 				objects.back()->scene = this;
+				if (appActive) objects.back()->initializedForApp = false;
 				worldPartitioner.MarkDirty();
 				return static_cast<T&>(*objects.back());
 			}
@@ -678,6 +748,7 @@ namespace Sapphire {
 			void AddObject(std::unique_ptr<T> object) {
 				objects.push_back(std::move(object));
 				objects.back()->scene = this;
+				if (appActive) objects.back()->initializedForApp = false;
 				worldPartitioner.MarkDirty();
 			}
 
@@ -700,8 +771,14 @@ namespace Sapphire {
 			}
 
 			void UpdateWorldPartition() {
-				const float range = partitionLoadingRange >= 0.0f ? partitionLoadingRange : activeCamera ? activeCamera->farClip + std::max(partitionSize, 0) : 0.0f;
+				const float range = partitionLoadingRange >= 0.0f ? partitionLoadingRange : activeCamera ? activeCamera->farClip : 0.0f;
 				worldPartitioner.Update(objects, activeCamera, partitionSize, range);
+			}
+
+			void SetAppActive(bool active) {
+				appActive = active;
+				if (!active) for (auto& object : objects) object->initializedForApp = true;
+				worldPartitioner.MarkDirty();
 			}
 
 			const std::vector<Object*>& ResidentObjects() const { return worldPartitioner.Objects(); }
@@ -713,6 +790,7 @@ namespace Sapphire {
 
 		private:
 			std::vector<std::unique_ptr<Object>> objects;
+			bool appActive = false;
 			WorldPartitioner worldPartitioner;
 	};
 
