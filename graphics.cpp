@@ -782,9 +782,11 @@ namespace Sapphire::Graphics {
 			Transform transform = camera.owner->transform;
 			Vector3 axes[3];
 			GetAxes(transform, axes);
-			transform.position += Add(Scale(axes[0], camera.localPosition.x), Add(Scale(axes[1], camera.localPosition.y), Scale(axes[2], camera.localPosition.z)));
-			transform.rotation += camera.localRotation;
+			transform.position += Add(Scale(axes[0], transform.localPosition.x), Add(Scale(axes[1], transform.localPosition.y), Scale(axes[2], transform.localPosition.z)));
+			transform.rotation += transform.localRotation;
 			transform.scale = {1.0f, 1.0f, 1.0f};
+			transform.localPosition = {};
+			transform.localRotation = {};
 			return transform;
 		}
 
@@ -882,7 +884,7 @@ namespace Sapphire::Graphics {
 					{sinYaw * cosPitch, -sinPitch, cosYaw * cosPitch},
 					std::tan(camera.fieldOfView * Math::degreesToRadians * 0.5f),
 					aspectRatio,
-					camera.farClip
+					camera.far
 				};
 				PrepareFrustum(frustum);
 				return frustum;
@@ -1104,8 +1106,8 @@ namespace Sapphire::Graphics {
 		ShadowMapData BuildDynamicShadowMap(const Camera& camera, const Culling::Frustum& frustum, float shadowFar, const LightData& light, const std::vector<const RenderItem*>& items, std::vector<const RenderItem*>& casters) {
 			ShadowMapData map{};
 			casters.clear();
-			const float near = std::max(camera.nearClip, 0.01f);
-			const auto corners = FrustumCorners(frustum, near, std::max(near + 0.1f, std::min(camera.farClip, shadowFar)));
+			const float near = std::max(camera.near, 0.01f);
+			const auto corners = FrustumCorners(frustum, near, std::max(near + 0.1f, std::min(camera.far, shadowFar)));
 			const auto& basis = GetShadowBasis(light.direction);
 			const Vector3& direction = basis.direction;
 			const Vector3& right = basis.right;
@@ -2720,7 +2722,7 @@ namespace Sapphire::Graphics {
 		frame.fogColor[0] = scene.fogColor.x;
 		frame.fogColor[1] = scene.fogColor.y;
 		frame.fogColor[2] = scene.fogColor.z;
-		const float farClip = scene.activeCamera ? std::max(scene.activeCamera->farClip, 0.01f) : 1000.0f;
+		const float farClip = scene.activeCamera ? std::max(scene.activeCamera->far, 0.01f) : 1000.0f;
 		frame.fogParameters[1] = farClip;
 		frame.fogParameters[2] = scene.fogEnabled ? 1.0f : 0.0f;
 		frame.fogHeightParameters[0] = 0.35f / farClip;
@@ -2776,7 +2778,7 @@ namespace Sapphire::Graphics {
 		SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(commandBuffer, &colorInfo, 1, &depthInfo);
 		if (!pass) throw std::runtime_error(std::string("Begin main render pass: ") + SDL_GetError());
 		const Matrix4 view = scene.activeCamera ? ViewDirection(frustum.position, frustum.forward, frustum.up) : Identity();
-		const Matrix4 projection = scene.activeCamera ? Perspective(scene.activeCamera->fieldOfView, aspectRatio, scene.activeCamera->nearClip, scene.activeCamera->farClip) : Identity();
+		const Matrix4 projection = scene.activeCamera ? Perspective(scene.activeCamera->fieldOfView, aspectRatio, scene.activeCamera->near, scene.activeCamera->far) : Identity();
 		const Matrix4 viewProjection = Multiply(projection, view);
 		SortDraws();
 		SDL_GPUGraphicsPipeline* activePipeline = nullptr;

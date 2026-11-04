@@ -65,6 +65,8 @@ namespace Sapphire {
 		Vector3 position;
 		Vector3 rotation;
 		Vector3 scale{1.0f, 1.0f, 1.0f};
+		Vector3 localPosition;
+		Vector3 localRotation;
 
 		Vector3 Forward() const {
 			const float yaw = rotation.y * Math::degreesToRadians;
@@ -249,11 +251,9 @@ namespace Sapphire {
 
 	class Camera : public Component {
 		public:
-			Vector3 localPosition;
-			Vector3 localRotation;
 			float fieldOfView = 60.0f;
-			float nearClip = 0.1f;
-			float farClip = 1000.0f;
+			float near = 0.1f;
+			float far = 1000.0f;
 	};
 
 	class Light : public Component {
@@ -441,6 +441,7 @@ namespace Sapphire {
 		int partitionSize = 0;
 		float loadingRange = 0.0f;
 		CellKey sourceCell{};
+		Vector3 sourceForward{};
 		bool initialized = false;
 		bool dirty = true;
 		bool hasCellSelection = false;
@@ -591,9 +592,12 @@ namespace Sapphire {
 			Vector3 sourcePosition = camera->owner->transform.position;
 			Vector3 axes[3];
 			Math::GetAxes(camera->owner->transform, axes);
-			sourcePosition += Math::Scale(axes[0], camera->localPosition.x);
-			sourcePosition += Math::Scale(axes[1], camera->localPosition.y);
-			sourcePosition += Math::Scale(axes[2], camera->localPosition.z);
+			sourcePosition += Math::Scale(axes[0], camera->owner->transform.localPosition.x);
+			sourcePosition += Math::Scale(axes[1], camera->owner->transform.localPosition.y);
+			sourcePosition += Math::Scale(axes[2], camera->owner->transform.localPosition.z);
+			Transform cameraTransform = camera->owner->transform;
+			cameraTransform.rotation += cameraTransform.localRotation;
+			const Vector3 forward = cameraTransform.Forward();
 			const CellKey nextSource = Key(sourcePosition, size);
 			std::size_t sourceIndex = 0;
 			bool materialChanged = false;
@@ -626,24 +630,35 @@ namespace Sapphire {
 			const float unloadRange = loadRange + size;
 			const float loadRangeSquared = loadRange * loadRange;
 			const float unloadRangeSquared = unloadRange * unloadRange;
-			const bool refreshCells = !hasCellSelection || sourceCell != nextSource || loadingRange != range;
+			const float priorityAngle = std::min(camera->fieldOfView * 0.5f + 15.0f, 89.0f) * Math::degreesToRadians;
+			const float forwardThreshold = std::cos(priorityAngle);
+			const bool directionChanged = !pendingCellLoads.empty() && Math::Dot(sourceForward, forward) < 0.9659258f;
+			const bool refreshCells = !hasCellSelection || sourceCell != nextSource || loadingRange != range || directionChanged;
 			if (refreshCells) {
-				std::vector<std::pair<float, CellKey>> ordered;
+				std::vector<std::tuple<int, float, CellKey>> ordered;
 				for (const auto& [key, members] : cells) {
 					const auto& bounds = cellBounds.at(key);
 					const Vector3 closest{std::clamp(sourcePosition.x, bounds.minimum.x, bounds.maximum.x), std::clamp(sourcePosition.y, bounds.minimum.y, bounds.maximum.y), std::clamp(sourcePosition.z, bounds.minimum.z, bounds.maximum.z)};
 					const Vector3 difference{closest.x - sourcePosition.x, closest.y - sourcePosition.y, closest.z - sourcePosition.z};
 					const float distanceSquared = Math::Dot(difference, difference);
-					if (key == nextSource || distanceSquared <= loadRangeSquared || (residentCellKeys.count(key) && distanceSquared <= unloadRangeSquared)) ordered.emplace_back(distanceSquared, key);
+					if (key == nextSource || distanceSquared <= loadRangeSquared || (residentCellKeys.count(key) && distanceSquared <= unloadRangeSquared)) {
+						const float distance = std::sqrt(distanceSquared);
+						const float alignment = distance > 0.0001f ? Math::Dot(Math::Scale(difference, 1.0f / distance), forward) : 1.0f;
+						const int priority = key == nextSource ? -1 : alignment >= forwardThreshold ? 0 : 1;
+						ordered.emplace_back(priority, distanceSquared, key);
+					}
 				}
 				std::sort(ordered.begin(), ordered.end(), [](const auto& left, const auto& right) {
-					if (left.first != right.first) return left.first < right.first;
-					return left.second < right.second;
+					if (std::get<0>(left) != std::get<0>(right)) return std::get<0>(left) < std::get<0>(right);
+					if (std::get<1>(left) != std::get<1>(right)) return std::get<1>(left) < std::get<1>(right);
+					return std::get<2>(left) < std::get<2>(right);
 				});
 				pendingCellLoads.clear();
 				pendingCellUnloads.clear();
 				std::set<CellKey> desiredCells;
-				for (const auto& [distance, key] : ordered) {
+				for (const auto& entry : ordered) {
+					const float distance = std::get<1>(entry);
+					const CellKey& key = std::get<2>(entry);
 					desiredCells.insert(key);
 					if ((key == nextSource || distance <= loadRangeSquared) && !residentCellKeys.count(key)) pendingCellLoads.push_back(key);
 				}
@@ -664,6 +679,7 @@ namespace Sapphire {
 					nextCellStreamTime = std::chrono::steady_clock::now() + std::chrono::milliseconds(8);
 				}
 				sourceCell = nextSource;
+				sourceForward = forward;
 				loadingRange = range;
 				hasCellSelection = true;
 			}
@@ -725,7 +741,7 @@ namespace Sapphire {
 			Vector3 gravity{0.0f, -9.81f, 0.0f};
 			int cellSize = 20;
 			int partitionSize = 200;
-			float partitionLoadingRange = -1.0f;
+			float partitionBuffer = 1.50f;
 			bool shadowsEnabled = true;
 			float shadowFar = 10.0f;
 			int shadowResolution = 2048;
@@ -771,7 +787,7 @@ namespace Sapphire {
 			}
 
 			void UpdateWorldPartition() {
-				const float range = partitionLoadingRange >= 0.0f ? partitionLoadingRange : activeCamera ? activeCamera->farClip : 0.0f;
+				const float range = activeCamera ? activeCamera->far * std::max(partitionBuffer, 0.0f) : 0.0f;
 				worldPartitioner.Update(objects, activeCamera, partitionSize, range);
 			}
 
