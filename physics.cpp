@@ -218,15 +218,25 @@ namespace Sapphire {
 			}
 
 			void SyncColliders(Scene& scene) {
+				scene.UpdateWorldPartition();
 				++cacheGeneration;
 				colliderRecords.clear();
 				bodyRecords.clear();
-				for (auto& object : scene.Objects()) {
-					auto* collider = object->GetComponent<Collider>();
+				for (auto* object : scene.ResidentObjects()) {
+					Collider* collider = object->GetComponent<Collider>();
+					if (object->worldPartitionCell && object->worldPartitionSourceObject) {
+						if (auto* sourceCollider = object->worldPartitionSourceObject->GetComponent<Collider>(); sourceCollider && sourceCollider->isMesh) {
+							if (!collider) collider = &object->AddComponent<Collider>();
+							collider->center = sourceCollider->center;
+							collider->size = sourceCollider->size;
+							collider->isMesh = true;
+						}
+					}
+					if (object->worldPartitionedMesh && collider && collider->isMesh) collider = nullptr;
 					auto* body = object->GetComponent<PhysicsBody>();
-					if (body) bodyRecords.push_back({object.get(), body, collider});
+					if (body) bodyRecords.push_back({object, body, collider});
 					if (!collider) continue;
-					ColliderRecord record{object.get(), collider, body, {}, {}, {}};
+					ColliderRecord record{object, collider, body, {}, {}, {}};
 					if (collider->isCapsule) {
 						record.capsule = WorldCapsule(*object, *collider);
 						record.bounds = CapsuleBounds(record.capsule);
@@ -1321,7 +1331,7 @@ namespace Sapphire {
 				}
 				if (found) {
 					closest = distance;
-					hit = {object, collider, Add(origin, Scale(ray, distance)), normal, distance};
+					hit = {object->worldPartitionSourceObject ? object->worldPartitionSourceObject : object, collider, Add(origin, Scale(ray, distance)), normal, distance};
 				}
 			}
 			return hit.collider != nullptr;
