@@ -3,13 +3,17 @@
 #include <any>
 #include <limits>
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <iomanip>
 #include <memory>
+#include <map>
 #include <string>
 #include <sstream>
+#include <set>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <utility>
 #include <stdexcept>
@@ -60,8 +64,6 @@ namespace Sapphire {
 		Vector3 position;
 		Vector3 rotation;
 		Vector3 scale{1.0f, 1.0f, 1.0f};
-		Vector3 localPosition;
-		Vector3 localRotation;
 
 		Vector3 Forward() const {
 			const float yaw = rotation.y * Math::degreesToRadians;
@@ -303,9 +305,18 @@ namespace Sapphire {
 
 	};
 
+	struct MeshInstance {
+		Vector3 position;
+		Vector3 rotation;
+		Vector3 scale{1.0f, 1.0f, 1.0f};
+		float variation = 0.0f;
+	};
+
 	class Mesh : public Component {
 		public:
 			MeshData data;
+			std::vector<MeshInstance> instances;
+			bool instanced = false;
 			Material material;
 			bool cullBackfaces = true;
 			bool castShadows = true;
@@ -333,6 +344,10 @@ namespace Sapphire {
 			Scene* scene = nullptr;
 			Transform transform;
 			bool renderStatic = true;
+			bool spatiallyLoaded = true;
+			bool worldPartitionedMesh = false;
+			bool worldPartitionCell = false;
+			Object* worldPartitionSourceObject = nullptr;
 			explicit Object(std::string name) : name(std::move(name)) {}
 			virtual void Initialize() {}
 			virtual void Update() {}
@@ -378,11 +393,270 @@ namespace Sapphire {
 			std::unordered_map<std::string, std::any> properties;
 	};
 
+	class WorldPartitioner {
+		using CellKey = std::tuple<int, int, int>;
+		std::map<CellKey, std::vector<Object*>> cells;
+		std::map<CellKey, Math::Bounds> cellBounds;
+		std::vector<Object*> alwaysResidentObjects;
+		std::vector<Object*> dynamicObjects;
+		std::vector<Object*> residentObjects;
+		std::vector<Object*> residentRenderObjects;
+		std::vector<CellKey> residentCells;
+		std::set<CellKey> residentCellKeys;
+		std::vector<CellKey> pendingCellLoads;
+		std::vector<CellKey> pendingCellUnloads;
+		std::set<Object*> residentDynamicObjects;
+		std::vector<std::unique_ptr<Object>> cellsData;
+		int partitionSize = 0;
+		float loadingRange = 0.0f;
+		CellKey sourceCell{};
+		bool initialized = false;
+		bool dirty = true;
+		bool hasCellSelection = false;
+		bool initialCellLoadComplete = false;
+		std::chrono::steady_clock::time_point nextCellStreamTime{};
+
+		static CellKey Key(const Vector3& position, int size) {
+			return {static_cast<int>(std::floor(position.x / size)), static_cast<int>(std::floor(position.y / size)), static_cast<int>(std::floor(position.z / size))};
+		}
+
+		static void IncludeBounds(std::map<CellKey, Math::Bounds>& boundsByCell, const CellKey& key, const Vector3& point) {
+			auto [entry, inserted] = boundsByCell.try_emplace(key, Math::Bounds{point, point});
+			if (inserted) return;
+			entry->second.minimum.x = std::min(entry->second.minimum.x, point.x);
+			entry->second.minimum.y = std::min(entry->second.minimum.y, point.y);
+			entry->second.minimum.z = std::min(entry->second.minimum.z, point.z);
+			entry->second.maximum.x = std::max(entry->second.maximum.x, point.x);
+			entry->second.maximum.y = std::max(entry->second.maximum.y, point.y);
+			entry->second.maximum.z = std::max(entry->second.maximum.z, point.z);
+		}
+
+		void Rebuild(const std::vector<std::unique_ptr<Object>>& objects, int size) {
+			cells.clear();
+			cellBounds.clear();
+			alwaysResidentObjects.clear();
+			dynamicObjects.clear();
+			residentObjects.clear();
+			residentRenderObjects.clear();
+			residentCells.clear();
+			residentCellKeys.clear();
+			pendingCellLoads.clear();
+			pendingCellUnloads.clear();
+			residentDynamicObjects.clear();
+			cellsData.clear();
+			partitionSize = size;
+			for (const auto& object : objects) {
+				object->worldPartitionedMesh = false;
+				Mesh* mesh = object->GetComponent<Mesh>();
+				if (!object->spatiallyLoaded) {
+					alwaysResidentObjects.push_back(object.get());
+					continue;
+				}
+				if (!object->renderStatic) {
+					dynamicObjects.push_back(object.get());
+					continue;
+				}
+				if (!mesh || mesh->instanced || mesh->data.indices.size() < 3 || mesh->data.vertices.empty()) {
+					const CellKey key = Key(object->transform.position, size);
+					cells[key].push_back(object.get());
+					IncludeBounds(cellBounds, key, object->transform.position);
+					continue;
+				}
+				using VertexMap = std::unordered_map<std::uint32_t, std::uint32_t>;
+				std::map<CellKey, MeshData> cellMeshes;
+				std::map<CellKey, VertexMap> cellVertices;
+				std::map<CellKey, Math::Bounds> cellMeshBounds;
+				const Math::Matrix4 model = Math::Model(object->transform);
+				for (std::size_t index = 0; index + 2 < mesh->data.indices.size(); index += 3) {
+					const std::uint32_t sourceIndices[3] = {mesh->data.indices[index], mesh->data.indices[index + 1], mesh->data.indices[index + 2]};
+					if (sourceIndices[0] >= mesh->data.vertices.size() || sourceIndices[1] >= mesh->data.vertices.size() || sourceIndices[2] >= mesh->data.vertices.size()) continue;
+					const Vector3 a = Math::TransformPoint(model, mesh->data.vertices[sourceIndices[0]].position);
+					const Vector3 b = Math::TransformPoint(model, mesh->data.vertices[sourceIndices[1]].position);
+					const Vector3 c = Math::TransformPoint(model, mesh->data.vertices[sourceIndices[2]].position);
+					const CellKey key = Key(Math::Scale(Math::Add(Math::Add(a, b), c), 1.0f / 3.0f), size);
+					IncludeBounds(cellMeshBounds, key, a);
+					IncludeBounds(cellMeshBounds, key, b);
+					IncludeBounds(cellMeshBounds, key, c);
+					MeshData& cellMesh = cellMeshes[key];
+					VertexMap& vertices = cellVertices[key];
+					for (const auto sourceIndex : sourceIndices) {
+						auto [entry, inserted] = vertices.try_emplace(sourceIndex, static_cast<std::uint32_t>(cellMesh.vertices.size()));
+						if (inserted) cellMesh.vertices.push_back(mesh->data.vertices[sourceIndex]);
+						cellMesh.indices.push_back(entry->second);
+					}
+				}
+				if (cellMeshes.empty()) {
+					const CellKey key = Key(object->transform.position, size);
+					cells[key].push_back(object.get());
+					IncludeBounds(cellBounds, key, object->transform.position);
+					continue;
+				}
+				object->worldPartitionedMesh = true;
+				for (auto& [key, data] : cellMeshes) {
+					auto cellObject = std::make_unique<Object>(object->name);
+					cellObject->scene = object->scene;
+					cellObject->transform = object->transform;
+					cellObject->renderStatic = true;
+					cellObject->worldPartitionCell = true;
+					cellObject->worldPartitionSourceObject = object.get();
+					Mesh& cellMesh = cellObject->AddComponent<Mesh>();
+					cellMesh.data = std::move(data);
+					cellMesh.material = mesh->material;
+					cellMesh.cullBackfaces = mesh->cullBackfaces;
+					cellMesh.castShadows = mesh->castShadows;
+					cellMesh.windAnimated = mesh->windAnimated;
+					cells[key].push_back(object.get());
+					cells[key].push_back(cellObject.get());
+					const Math::Bounds cellMeshBoundsValue = cellMeshBounds.at(key);
+					IncludeBounds(cellBounds, key, cellMeshBoundsValue.minimum);
+					IncludeBounds(cellBounds, key, cellMeshBoundsValue.maximum);
+					cellsData.push_back(std::move(cellObject));
+				}
+			}
+			initialized = true;
+			dirty = false;
+		}
+
+	public:
+		void MarkDirty() { dirty = true; }
+
+		void Update(const std::vector<std::unique_ptr<Object>>& objects, const Camera* camera, int size, float range) {
+			if (!camera || !camera->owner || size <= 0) {
+				cells.clear();
+				cellBounds.clear();
+				alwaysResidentObjects.clear();
+				dynamicObjects.clear();
+				residentObjects.clear();
+				residentRenderObjects.clear();
+				residentCells.clear();
+				residentCellKeys.clear();
+				pendingCellLoads.clear();
+				pendingCellUnloads.clear();
+				residentDynamicObjects.clear();
+				cellsData.clear();
+				hasCellSelection = false;
+				initialCellLoadComplete = false;
+				for (const auto& object : objects) object->worldPartitionedMesh = false;
+				for (const auto& object : objects) {
+					residentObjects.push_back(object.get());
+					residentRenderObjects.push_back(object.get());
+				}
+				partitionSize = size;
+				initialized = false;
+				dirty = true;
+				return;
+			}
+			Vector3 sourcePosition = camera->owner->transform.position;
+			Vector3 axes[3];
+			Math::GetAxes(camera->owner->transform, axes);
+			sourcePosition += Math::Scale(axes[0], camera->localPosition.x);
+			sourcePosition += Math::Scale(axes[1], camera->localPosition.y);
+			sourcePosition += Math::Scale(axes[2], camera->localPosition.z);
+			const CellKey nextSource = Key(sourcePosition, size);
+			if (!initialized || dirty || partitionSize != size) Rebuild(objects, size);
+			const float loadRange = std::max(range, 0.0f);
+			const float unloadRange = loadRange + size;
+			const float loadRangeSquared = loadRange * loadRange;
+			const float unloadRangeSquared = unloadRange * unloadRange;
+			const bool refreshCells = !hasCellSelection || sourceCell != nextSource || loadingRange != range;
+			if (refreshCells) {
+				std::vector<std::pair<float, CellKey>> ordered;
+				for (const auto& [key, members] : cells) {
+					const auto& bounds = cellBounds.at(key);
+					const Vector3 closest{std::clamp(sourcePosition.x, bounds.minimum.x, bounds.maximum.x), std::clamp(sourcePosition.y, bounds.minimum.y, bounds.maximum.y), std::clamp(sourcePosition.z, bounds.minimum.z, bounds.maximum.z)};
+					const Vector3 difference{closest.x - sourcePosition.x, closest.y - sourcePosition.y, closest.z - sourcePosition.z};
+					const float distanceSquared = Math::Dot(difference, difference);
+					if (key == nextSource || distanceSquared <= loadRangeSquared || (residentCellKeys.count(key) && distanceSquared <= unloadRangeSquared)) ordered.emplace_back(distanceSquared, key);
+				}
+				std::sort(ordered.begin(), ordered.end(), [](const auto& left, const auto& right) {
+					if (left.first != right.first) return left.first < right.first;
+					return left.second < right.second;
+				});
+				pendingCellLoads.clear();
+				pendingCellUnloads.clear();
+				std::set<CellKey> desiredCells;
+				for (const auto& [distance, key] : ordered) {
+					desiredCells.insert(key);
+					if ((key == nextSource || distance <= loadRangeSquared) && !residentCellKeys.count(key)) pendingCellLoads.push_back(key);
+				}
+				for (const auto& key : residentCellKeys) if (!desiredCells.count(key)) pendingCellUnloads.push_back(key);
+				std::sort(pendingCellUnloads.begin(), pendingCellUnloads.end(), [&](const CellKey& left, const CellKey& right) {
+					const auto& leftBounds = cellBounds.at(left);
+					const auto& rightBounds = cellBounds.at(right);
+					const Vector3 leftPoint{std::clamp(sourcePosition.x, leftBounds.minimum.x, leftBounds.maximum.x), std::clamp(sourcePosition.y, leftBounds.minimum.y, leftBounds.maximum.y), std::clamp(sourcePosition.z, leftBounds.minimum.z, leftBounds.maximum.z)};
+					const Vector3 rightPoint{std::clamp(sourcePosition.x, rightBounds.minimum.x, rightBounds.maximum.x), std::clamp(sourcePosition.y, rightBounds.minimum.y, rightBounds.maximum.y), std::clamp(sourcePosition.z, rightBounds.minimum.z, rightBounds.maximum.z)};
+					const Vector3 leftDelta{leftPoint.x - sourcePosition.x, leftPoint.y - sourcePosition.y, leftPoint.z - sourcePosition.z};
+					const Vector3 rightDelta{rightPoint.x - sourcePosition.x, rightPoint.y - sourcePosition.y, rightPoint.z - sourcePosition.z};
+					return Math::Dot(leftDelta, leftDelta) > Math::Dot(rightDelta, rightDelta);
+				});
+				if (!initialCellLoadComplete) {
+					for (const auto& key : pendingCellLoads) {
+						if (residentCellKeys.insert(key).second) {
+							residentCells.push_back(key);
+						}
+					}
+					pendingCellLoads.clear();
+					initialCellLoadComplete = true;
+				}
+				sourceCell = nextSource;
+				loadingRange = range;
+				hasCellSelection = true;
+			}
+			const auto now = std::chrono::steady_clock::now();
+			if (now >= nextCellStreamTime) {
+				if (!pendingCellLoads.empty()) {
+					const CellKey key = pendingCellLoads.front();
+					pendingCellLoads.erase(pendingCellLoads.begin());
+					if (residentCellKeys.insert(key).second) {
+						residentCells.push_back(key);
+					}
+					nextCellStreamTime = now + std::chrono::milliseconds(8);
+				}
+				else if (!pendingCellUnloads.empty()) {
+					const CellKey key = pendingCellUnloads.front();
+					pendingCellUnloads.erase(pendingCellUnloads.begin());
+					residentCellKeys.erase(key);
+					residentCells.erase(std::remove(residentCells.begin(), residentCells.end(), key), residentCells.end());
+					nextCellStreamTime = now + std::chrono::milliseconds(8);
+				}
+			}
+			residentObjects.clear();
+			residentRenderObjects.clear();
+			std::unordered_set<Object*> residentSet;
+			std::unordered_set<Object*> renderSet;
+			auto addResident = [&](Object* object) {
+				if (residentSet.insert(object).second) residentObjects.push_back(object);
+				if ((!object->worldPartitionedMesh || object->worldPartitionCell) && renderSet.insert(object).second) residentRenderObjects.push_back(object);
+			};
+			for (const auto& key : residentCells) {
+				for (auto* object : cells.at(key)) addResident(object);
+			}
+			std::set<Object*> nextDynamicObjects;
+			for (auto* object : dynamicObjects) {
+				const Vector3 difference{object->transform.position.x - sourcePosition.x, object->transform.position.y - sourcePosition.y, object->transform.position.z - sourcePosition.z};
+				const float distanceSquared = Math::Dot(difference, difference);
+				if (distanceSquared <= loadRangeSquared || (residentDynamicObjects.count(object) && distanceSquared <= unloadRangeSquared)) {
+					nextDynamicObjects.insert(object);
+					addResident(object);
+				}
+			}
+			residentDynamicObjects.swap(nextDynamicObjects);
+			if (camera->owner->parent) addResident(camera->owner->parent);
+			addResident(camera->owner);
+			for (auto* object : alwaysResidentObjects) addResident(object);
+		}
+
+		const std::vector<Object*>& Objects() const { return residentObjects; }
+		const std::vector<Object*>& RenderObjects() const { return residentRenderObjects; }
+	};
+
 	class Scene {
 		public:
 			Camera* activeCamera = nullptr;
 			Vector3 gravity{0.0f, -9.81f, 0.0f};
 			int cellSize = 20;
+			int partitionSize = 200;
+			float partitionLoadingRange = -1.0f;
 			bool shadowsEnabled = true;
 			float shadowFar = 10.0f;
 			int shadowResolution = 2048;
@@ -396,6 +670,7 @@ namespace Sapphire {
 			T& CreateObject(std::string name) {
 				objects.push_back(std::make_unique<T>(std::move(name)));
 				objects.back()->scene = this;
+				worldPartitioner.MarkDirty();
 				return static_cast<T&>(*objects.back());
 			}
 
@@ -403,6 +678,7 @@ namespace Sapphire {
 			void AddObject(std::unique_ptr<T> object) {
 				objects.push_back(std::move(object));
 				objects.back()->scene = this;
+				worldPartitioner.MarkDirty();
 			}
 
 			Object& Find(const std::string& name) {
@@ -417,10 +693,19 @@ namespace Sapphire {
 				for (auto& object : objects) {
 					if (auto* camera = object->GetComponent<Camera>()) {
 						activeCamera = camera;
-						return;
+						break;
 					}
 				}
+				UpdateWorldPartition();
 			}
+
+			void UpdateWorldPartition() {
+				const float range = partitionLoadingRange >= 0.0f ? partitionLoadingRange : activeCamera ? activeCamera->farClip + std::max(partitionSize, 0) : 0.0f;
+				worldPartitioner.Update(objects, activeCamera, partitionSize, range);
+			}
+
+			const std::vector<Object*>& ResidentObjects() const { return worldPartitioner.Objects(); }
+			const std::vector<Object*>& ResidentRenderObjects() const { return worldPartitioner.RenderObjects(); }
 
 			std::vector<std::unique_ptr<Object>>& Objects() {
 				return objects;
@@ -428,6 +713,7 @@ namespace Sapphire {
 
 		private:
 			std::vector<std::unique_ptr<Object>> objects;
+			WorldPartitioner worldPartitioner;
 	};
 
 }

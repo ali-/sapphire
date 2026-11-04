@@ -162,10 +162,12 @@ namespace Sapphire::Graphics {
 		struct GpuMesh {
 			SDL_GPUBuffer* vertexBuffer = nullptr;
 			SDL_GPUBuffer* indexBuffer = nullptr;
+			SDL_GPUBuffer* instanceBuffer = nullptr;
 			GpuMaterial* material = nullptr;
 			Uint32 indexCount = 0;
 			Uint32 vertexCapacity = 0;
 			Uint32 indexCapacity = 0;
+			Uint32 instanceCapacity = 0;
 			bool geometryDirty = false;
 			Material cachedMaterial;
 			FragmentUniforms fragment{};
@@ -199,8 +201,11 @@ namespace Sapphire::Graphics {
 
 		SDL_GPUDevice* gpuDevice = nullptr;
 		SDL_GPUGraphicsPipeline* pipelines[2][2]{};
+		SDL_GPUGraphicsPipeline* instancePipelines[2][2]{};
 		SDL_GPUGraphicsPipeline* transparentPipelines[2]{};
+		SDL_GPUGraphicsPipeline* instanceTransparentPipelines[2]{};
 		SDL_GPUGraphicsPipeline* shadowPipelines[2][2]{};
+		SDL_GPUGraphicsPipeline* instanceShadowPipelines[2][2]{};
 		SDL_GPUTexture* depthTexture = nullptr;
 		SDL_GPUTexture* emptyShadowTexture = nullptr;
 		SDL_GPUTexture* dynamicShadowTexture = nullptr;
@@ -374,6 +379,7 @@ namespace Sapphire::Graphics {
 			}
 			AddHash(hash, &mesh);
 			AddHash(hash, mesh.revision);
+			AddHash(hash, mesh.instanced);
 			AddHash(hash, mesh.windAnimated);
 			AddHash(hash, mesh.castShadows);
 			AddHash(hash, mesh.cullBackfaces);
@@ -437,6 +443,15 @@ namespace Sapphire::Graphics {
 		const std::string deformationShaderSource = R"(
 			#include <metal_stdlib>
 			using namespace metal;
+			float3 InstanceRotate(float3 point, float3 degrees) {
+				float3 angle = degrees * 0.01745329252;
+				float3 cosine = cos(angle);
+				float3 sine = sin(angle);
+				float3 axisX = float3(cosine.z * cosine.y, sine.z * cosine.y, -sine.y);
+				float3 axisY = float3(cosine.z * sine.y * sine.x - sine.z * cosine.x, sine.z * sine.y * sine.x + cosine.z * cosine.x, cosine.y * sine.x);
+				float3 axisZ = float3(cosine.z * sine.y * cosine.x + sine.z * sine.x, sine.z * sine.y * cosine.x - cosine.z * sine.x, cosine.y * cosine.x);
+				return axisX * point.x + axisY * point.y + axisZ * point.z;
+			}
 			float3 Deform(float3 position, float3 normal, float2 uv, float4 color, float4x4 model, float4 parameters, texture2d<float> heightMap, sampler heightSampler, texture2d<float> maskMap, sampler maskSampler) {
 				if (parameters.x != 0.0) position += normal * ((heightMap.sample(heightSampler, uv, level(0.0)).r - 0.5) * maskMap.sample(maskSampler, uv, level(0.0)).r * parameters.x);
 				if (parameters.y > 0.5) position.x += color.r * length(model[1].xyz) / max(length(model[0].xyz), 0.0001) * sin(parameters.z * 1.5 + color.a * 6.2831853) * parameters.w;
@@ -445,18 +460,30 @@ namespace Sapphire::Graphics {
 		)";
 
 		const std::string vertexShaderSource = deformationShaderSource + R"(
-			struct VertexInput { float3 position [[attribute(0)]]; float3 normal [[attribute(1)]]; float2 uv [[attribute(2)]]; float4 color [[attribute(3)]]; };
+			struct VertexInput { float3 position [[attribute(0)]]; float3 normal [[attribute(1)]]; float2 uv [[attribute(2)]]; float4 color [[attribute(3)]];
+			#if INSTANCED
+			float3 instancePosition [[attribute(4)]]; float3 instanceRotation [[attribute(5)]]; float3 instanceScale [[attribute(6)]]; float instanceVariation [[attribute(7)]];
+			#endif
+			};
 			struct VertexOutput { float4 position [[position]]; float2 uv; float4 color; float3 worldPosition; float3 worldNormal; float4 shadowPosition0; float4 shadowPosition1; float4 shadowPosition2; };
 			struct ObjectUniforms { float4x4 mvp; float4x4 model; float4x4 normal; float4 displacementParameters; float4 uvTransform; float4x4 shadowMvp[3]; float4 shadowState; };
 			vertex VertexOutput main0(VertexInput input [[stage_in]], constant ObjectUniforms& uniforms [[buffer(0)]], texture2d<float> heightMap [[texture(0)]], sampler heightSampler [[sampler(0)]], texture2d<float> maskMap [[texture(1)]], sampler maskSampler [[sampler(1)]]) {
 				VertexOutput output;
 				float2 uv = input.uv * uniforms.uvTransform.xy + uniforms.uvTransform.zw;
-				float3 position = Deform(input.position, input.normal, uv, input.color, uniforms.model, uniforms.displacementParameters, heightMap, heightSampler, maskMap, maskSampler);
+				float3 localPosition = input.position;
+				float3 localNormal = input.normal;
+				float4 color = input.color;
+				#if INSTANCED
+				localPosition = input.instancePosition + InstanceRotate(localPosition * input.instanceScale, input.instanceRotation);
+				localNormal = normalize(InstanceRotate(localNormal / max(abs(input.instanceScale), float3(0.0001)), input.instanceRotation));
+				color.a += input.instanceVariation;
+				#endif
+				float3 position = Deform(localPosition, localNormal, uv, color, uniforms.model, uniforms.displacementParameters, heightMap, heightSampler, maskMap, maskSampler);
 				output.position = uniforms.mvp * float4(position, 1.0);
 				output.uv = uv;
 				output.color = uniforms.displacementParameters.y > 0.5 ? float4(1.0) : input.color;
 				output.worldPosition = (uniforms.model * float4(position, 1.0)).xyz;
-				output.worldNormal = normalize((uniforms.normal * float4(input.normal, 0.0)).xyz);
+				output.worldNormal = normalize((uniforms.normal * float4(localNormal, 0.0)).xyz);
 				output.shadowPosition0 = output.shadowPosition1 = output.shadowPosition2 = float4(0.0);
 				if (uniforms.shadowState.x > 0.5) {
 					output.shadowPosition0 = uniforms.shadowMvp[0] * float4(output.worldPosition, 1.0);
@@ -667,13 +694,25 @@ namespace Sapphire::Graphics {
 		)";
 
 		const std::string shadowVertexShaderSource = deformationShaderSource + R"(
-			struct VertexInput { float3 position [[attribute(0)]]; float3 normal [[attribute(1)]]; float2 uv [[attribute(2)]]; float4 color [[attribute(3)]]; };
+			struct VertexInput { float3 position [[attribute(0)]]; float3 normal [[attribute(1)]]; float2 uv [[attribute(2)]]; float4 color [[attribute(3)]];
+			#if INSTANCED
+			float3 instancePosition [[attribute(4)]]; float3 instanceRotation [[attribute(5)]]; float3 instanceScale [[attribute(6)]]; float instanceVariation [[attribute(7)]];
+			#endif
+			};
 			struct VertexOutput { float4 position [[position]]; float2 uv; };
 			struct ShadowUniforms { float4x4 mvp; float4x4 model; float4 displacementParameters; float4 uvTransform; };
 			vertex VertexOutput main0(VertexInput input [[stage_in]], constant ShadowUniforms& uniforms [[buffer(0)]], texture2d<float> heightMap [[texture(0)]], sampler heightSampler [[sampler(0)]], texture2d<float> maskMap [[texture(1)]], sampler maskSampler [[sampler(1)]]) {
 				VertexOutput output;
 				float2 uv = input.uv * uniforms.uvTransform.xy + uniforms.uvTransform.zw;
-				float3 position = Deform(input.position, input.normal, uv, input.color, uniforms.model, uniforms.displacementParameters, heightMap, heightSampler, maskMap, maskSampler);
+				float3 localPosition = input.position;
+				float3 localNormal = input.normal;
+				float4 color = input.color;
+				#if INSTANCED
+				localPosition = input.instancePosition + InstanceRotate(localPosition * input.instanceScale, input.instanceRotation);
+				localNormal = normalize(InstanceRotate(localNormal / max(abs(input.instanceScale), float3(0.0001)), input.instanceRotation));
+				color.a += input.instanceVariation;
+				#endif
+				float3 position = Deform(localPosition, localNormal, uv, color, uniforms.model, uniforms.displacementParameters, heightMap, heightSampler, maskMap, maskSampler);
 				output.position = uniforms.mvp * float4(position, 1.0);
 				output.uv = uv;
 				return output;
@@ -813,6 +852,24 @@ namespace Sapphire::Graphics {
 						Include(entry->second, vertex.position);
 						if (mesh->windAnimated) windPadding = std::max(windPadding, std::abs(vertex.color[0]) * 0.08f);
 					}
+				if (mesh->instanced) {
+					float radius = 0.0f;
+					for (const auto& vertex : mesh->data.vertices) radius = std::max(radius, std::sqrt(Dot(vertex.position, vertex.position)));
+					bool first = true;
+					for (const auto& instance : mesh->instances) {
+						const float extent = radius * std::max({std::abs(instance.scale.x), std::abs(instance.scale.y), std::abs(instance.scale.z)});
+						const Vector3 minimum = Subtract(instance.position, {extent, extent, extent});
+						const Vector3 maximum = Add(instance.position, {extent, extent, extent});
+						if (first) {
+							entry->second = {minimum, maximum};
+							first = false;
+						}
+						else {
+							Include(entry->second, minimum);
+							Include(entry->second, maximum);
+						}
+					}
+				}
 					windAmplitudes[mesh] = windPadding;
 					if (mesh->windAnimated) {
 						entry->second.minimum.x -= windPadding;
@@ -1119,6 +1176,7 @@ namespace Sapphire::Graphics {
 			}
 			ReleaseBuffer(gpuDevice, gpuMesh.vertexBuffer);
 			ReleaseBuffer(gpuDevice, gpuMesh.indexBuffer);
+			ReleaseBuffer(gpuDevice, gpuMesh.instanceBuffer);
 			gpuMesh.vertexBuffer = nullptr;
 			gpuMesh.indexBuffer = nullptr;
 			gpuMesh.indexCount = 0;
@@ -1176,13 +1234,14 @@ namespace Sapphire::Graphics {
 			std::map<BatchKey, MeshData> batchData;
 			std::map<BatchKey, const Object*> batchOwners;
 			std::vector<Vector3> positions;
-			for (auto& object : scene.Objects()) {
+			for (auto* object : scene.ResidentRenderObjects()) {
 				if (!object->renderStatic) continue;
 				Mesh* mesh = object->GetComponent<Mesh>();
+				if (mesh && mesh->instanced) continue;
 				if (mesh && (mesh->material.transparent || !mesh->material.displacementTexturePath.empty())) continue;
 				if (!mesh || mesh->data.vertices.empty() || mesh->data.indices.empty()) continue;
 				if (!rebuildAll) {
-					const auto& cells = meshSources.at(object.get()).cells;
+					const auto& cells = meshSources.at(object).cells;
 					if (std::none_of(cells.begin(), cells.end(), [&](const CellKey& cell) { return dirtyCells.count(cell); })) continue;
 				}
 				const Matrix4 model = Model(object->transform);
@@ -1190,7 +1249,7 @@ namespace Sapphire::Graphics {
 				const GroupKey group{mesh->material, mesh->cullBackfaces, mesh->castShadows, mesh->windAnimated};
 				const auto [groupEntry, groupInserted] = groups.try_emplace(group, groupData.size());
 				if (groupInserted) groupData.push_back(group);
-				auto& source = meshSources.at(object.get());
+				auto& source = meshSources.at(object);
 				positions.clear();
 				if (!source.preparedPositions.empty()) positions.swap(source.preparedPositions);
 				else {
@@ -1220,8 +1279,8 @@ namespace Sapphire::Graphics {
 					if (!rebuildAll && !dirtyCells.count(cellKey)) continue;
 					if (!previousOutput || previousCell != cellKey) {
 						const BatchKey key{cellX, cellY, cellZ, groupEntry->second};
-						auto [owner, insertedOwner] = batchOwners.try_emplace(key, object.get());
-						if (!insertedOwner && owner->second != object.get()) owner->second = nullptr;
+						auto [owner, insertedOwner] = batchOwners.try_emplace(key, object);
+						if (!insertedOwner && owner->second != object) owner->second = nullptr;
 						previousOutput = &batchData[key];
 						previousVertices = &vertexMaps[cellKey];
 						previousCell = cellKey;
@@ -1488,7 +1547,8 @@ namespace Sapphire::Graphics {
 
 		GpuMesh& GetMesh(Mesh* mesh) {
 			GpuMesh& gpuMesh = gpuMeshes.try_emplace(mesh).first->second;
-			if ((!gpuMesh.vertexBuffer || gpuMesh.geometryDirty) && !mesh->data.vertices.empty() && !mesh->data.indices.empty()) {
+			const bool uploadGeometry = !gpuMesh.vertexBuffer || gpuMesh.geometryDirty;
+			if (uploadGeometry && !mesh->data.vertices.empty() && !mesh->data.indices.empty()) {
 				auto uploaded = UploadMesh(mesh->data, gpuMesh);
 				gpuMesh.vertexCapacity = uploaded.vertexCapacity;
 				gpuMesh.indexCapacity = uploaded.indexCapacity;
@@ -1496,6 +1556,15 @@ namespace Sapphire::Graphics {
 				gpuMesh.vertexBuffer = uploaded.vertexBuffer;
 				gpuMesh.indexBuffer = uploaded.indexBuffer;
 				gpuMesh.indexCount = uploaded.indexCount;
+			}
+			if (mesh->instanced && !mesh->instances.empty() && (uploadGeometry || !gpuMesh.instanceBuffer)) {
+				const Uint32 size = static_cast<Uint32>(mesh->instances.size() * sizeof(MeshInstance));
+				if (gpuMesh.instanceCapacity < size) {
+					ReleaseBuffer(gpuDevice, gpuMesh.instanceBuffer);
+					gpuMesh.instanceBuffer = nullptr;
+				}
+				gpuMesh.instanceBuffer = UploadBuffer(SDL_GPU_BUFFERUSAGE_VERTEX, mesh->instances.data(), size, gpuMesh.instanceBuffer);
+				gpuMesh.instanceCapacity = std::max(gpuMesh.instanceCapacity, size);
 			}
 			const auto paths = MaterialPaths(mesh->material);
 			bool changed = !gpuMesh.material || (*gpuMesh.material->source)[6] != (mesh->material.transparent ? "blended" : "masked");
@@ -1529,7 +1598,7 @@ namespace Sapphire::Graphics {
 		MeshSource* UpdateMeshSource(Object& object, int cellSize, bool rebuildAll) {
 			Mesh* mesh = object.GetComponent<Mesh>();
 			if (!mesh) return nullptr;
-			sceneTriangleCount += mesh->data.indices.size() / 3;
+			sceneTriangleCount += mesh->data.indices.size() / 3 * (mesh->instanced ? mesh->instances.size() : 1);
 			auto [entry, inserted] = meshSources.try_emplace(&object);
 			auto& source = entry->second;
 			source.body = object.GetComponent<PhysicsBody>();
@@ -1546,7 +1615,7 @@ namespace Sapphire::Graphics {
 			}
 			dirtyCells.insert(source.cells.begin(), source.cells.end());
 			if (shadowChanged && source.staticCaster) shadowChanges.push_back(source.shadowBounds);
-			const bool batched = object.renderStatic && !mesh->material.transparent && mesh->material.displacementTexturePath.empty();
+			const bool batched = object.renderStatic && !mesh->instanced && !mesh->material.transparent && mesh->material.displacementTexturePath.empty();
 			const auto geometrySignature = GeometrySignature(*mesh);
 			if (inserted || source.geometrySignature != geometrySignature) mesh->data.Validate();
 			if (source.mesh && (source.mesh != mesh || source.batched != batched)) ReleaseMesh(source.mesh);
@@ -1601,6 +1670,7 @@ namespace Sapphire::Graphics {
 		}
 
 		void UpdateSceneResources(Scene& scene) {
+			scene.UpdateWorldPartition();
 			const bool rebuildAll = batchCellSize != scene.cellSize;
 			shadowChanges.clear();
 			dirtyCells.clear();
@@ -1608,10 +1678,10 @@ namespace Sapphire::Graphics {
 			for (auto& [object, source] : meshSources) source.seen = false;
 			meshEntries.clear();
 			lightEntries.clear();
-			for (auto& object : scene.Objects()) {
-				if (auto* source = UpdateMeshSource(*object, scene.cellSize, rebuildAll)) meshEntries.push_back({object.get(), source});
-				if (auto* light = object->GetComponent<Light>()) lightEntries.push_back({object.get(), light});
+			for (auto* object : scene.ResidentRenderObjects()) {
+				if (auto* source = UpdateMeshSource(*object, scene.cellSize, rebuildAll)) meshEntries.push_back({object, source});
 			}
+			for (auto* object : scene.ResidentObjects()) if (auto* light = object->GetComponent<Light>()) lightEntries.push_back({object, light});
 			for (auto entry = meshSources.begin(); entry != meshSources.end();) {
 				if (!entry->second.seen) {
 					dirtyCells.insert(entry->second.cells.begin(), entry->second.cells.end());
@@ -1648,9 +1718,9 @@ namespace Sapphire::Graphics {
 			for (const RenderItem* itemPointer : items) {
 				const RenderItem& item = *itemPointer;
 				Mesh* mesh = item.mesh;
-				if (!mesh->castShadows || !item.gpu || !item.gpu->indexCount) continue;
+				if (!mesh->castShadows || !item.gpu || !item.gpu->indexCount || (mesh->instanced && mesh->instances.empty())) continue;
 				GpuMesh& gpuMesh = *item.gpu;
-				SDL_GPUGraphicsPipeline* meshPipeline = shadowPipelines[gpuMesh.material->masked ? 1 : 0][cullBackfaces && mesh->cullBackfaces ? 1 : 0];
+				SDL_GPUGraphicsPipeline* meshPipeline = (mesh->instanced ? instanceShadowPipelines : shadowPipelines)[gpuMesh.material->masked ? 1 : 0][cullBackfaces && mesh->cullBackfaces ? 1 : 0];
 				if (meshPipeline != activePipeline) {
 					SDL_BindGPUGraphicsPipeline(shadowPass, meshPipeline);
 					activePipeline = meshPipeline;
@@ -1671,6 +1741,10 @@ namespace Sapphire::Graphics {
 				uniforms.displacementParameters[3] = 0.08f;
 				SDL_PushGPUVertexUniformData(commandBuffer, 0, &uniforms, sizeof(uniforms));
 				buffers.Bind(shadowPass, gpuMesh);
+				if (mesh->instanced) {
+					SDL_GPUBufferBinding instanceBinding{gpuMesh.instanceBuffer, 0};
+					SDL_BindGPUVertexBuffers(shadowPass, 1, &instanceBinding, 1);
+				}
 				SDL_GPUTextureSamplerBinding textureBinding{};
 				textureBinding.texture = gpuMesh.material->textures[0];
 				textureBinding.sampler = sampler;
@@ -1682,10 +1756,10 @@ namespace Sapphire::Graphics {
 				vertexTextureBindings[1].sampler = sampler;
 				if (activeMaterial != gpuMesh.material) SDL_BindGPUVertexSamplers(shadowPass, 0, vertexTextureBindings, 2);
 				activeMaterial = gpuMesh.material;
-				SDL_DrawGPUIndexedPrimitives(shadowPass, gpuMesh.indexCount, 1, 0, 0, 0);
+				SDL_DrawGPUIndexedPrimitives(shadowPass, gpuMesh.indexCount, mesh->instanced ? static_cast<Uint32>(mesh->instances.size()) : 1, 0, 0, 0);
 				++drawCallCount;
 				++shadowDrawCount;
-				shadowTriangleCount += gpuMesh.indexCount / 3;
+				shadowTriangleCount += gpuMesh.indexCount / 3 * (mesh->instanced ? mesh->instances.size() : 1);
 			}
 			SDL_EndGPURenderPass(shadowPass);
 		}
@@ -2034,8 +2108,12 @@ namespace Sapphire::Graphics {
 		gpuDevice = device;
 		linearOutput = window && SDL_WindowSupportsGPUSwapchainComposition(device, window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR) && SDL_SetGPUSwapchainParameters(device, window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR, SDL_GPU_PRESENTMODE_VSYNC);
 		SDL_GPUShader* vertexShader = CreateShader(gpuDevice, vertexShaderSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
+		const std::string instanceVertexSource = "#define INSTANCED 1\n" + vertexShaderSource;
+		SDL_GPUShader* instanceVertexShader = CreateShader(gpuDevice, instanceVertexSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
 		SDL_GPUShader* fragmentShaders[2]{};
 		SDL_GPUShader* shadowVertexShader = CreateShader(gpuDevice, shadowVertexShaderSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
+		const std::string instanceShadowSource = "#define INSTANCED 1\n" + shadowVertexShaderSource;
+		SDL_GPUShader* instanceShadowShader = CreateShader(gpuDevice, instanceShadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
 		SDL_GPUShader* shadowFragmentShaders[2]{};
 		for (int masked = 0; masked < 2; ++masked) {
 			const std::string define = masked ? "#define ALPHA_MASKED 1\n" : "#define ALPHA_MASKED 0\n";
@@ -2046,11 +2124,13 @@ namespace Sapphire::Graphics {
 		}
 		const auto releaseShaders = [&]() {
 			if (vertexShader) SDL_ReleaseGPUShader(gpuDevice, vertexShader);
+			if (instanceVertexShader) SDL_ReleaseGPUShader(gpuDevice, instanceVertexShader);
 			if (shadowVertexShader) SDL_ReleaseGPUShader(gpuDevice, shadowVertexShader);
+			if (instanceShadowShader) SDL_ReleaseGPUShader(gpuDevice, instanceShadowShader);
 			for (auto* shader : fragmentShaders) if (shader) SDL_ReleaseGPUShader(gpuDevice, shader);
 			for (auto* shader : shadowFragmentShaders) if (shader) SDL_ReleaseGPUShader(gpuDevice, shader);
 		};
-		if (!vertexShader || !shadowVertexShader || !fragmentShaders[0] || !fragmentShaders[1] || !shadowFragmentShaders[0] || !shadowFragmentShaders[1]) {
+		if (!vertexShader || !instanceVertexShader || !shadowVertexShader || !instanceShadowShader || !fragmentShaders[0] || !fragmentShaders[1] || !shadowFragmentShaders[0] || !shadowFragmentShaders[1]) {
 			releaseShaders();
 			return false;
 		}
@@ -2075,6 +2155,16 @@ namespace Sapphire::Graphics {
 		vertexAttributes[3].buffer_slot = 0;
 		vertexAttributes[3].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4;
 		vertexAttributes[3].offset = offsetof(MeshVertex, color);
+		SDL_GPUVertexBufferDescription instanceDescriptions[2]{vertexBufferDescription, {}};
+		instanceDescriptions[1].slot = 1;
+		instanceDescriptions[1].pitch = sizeof(MeshInstance);
+		instanceDescriptions[1].input_rate = SDL_GPU_VERTEXINPUTRATE_INSTANCE;
+		SDL_GPUVertexAttribute instanceAttributes[8]{};
+		std::copy_n(vertexAttributes, 4, instanceAttributes);
+		instanceAttributes[4] = {4, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(MeshInstance, position)};
+		instanceAttributes[5] = {5, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(MeshInstance, rotation)};
+		instanceAttributes[6] = {6, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(MeshInstance, scale)};
+		instanceAttributes[7] = {7, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT, offsetof(MeshInstance, variation)};
 		const std::uint8_t whitePixel[4] = {255, 255, 255, 255};
 		whiteTexture = CreateTexture(gpuDevice, 1, 1, whitePixel);
 		SDL_GPUSamplerCreateInfo samplerInfo{};
@@ -2118,11 +2208,18 @@ namespace Sapphire::Graphics {
 		pipelineInfo.target_info.color_target_descriptions = &colorTarget;
 		pipelineInfo.target_info.has_depth_stencil_target = true;
 		pipelineInfo.target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
-		for (int masked = 0; masked < 2; ++masked) {
-			pipelineInfo.fragment_shader = fragmentShaders[masked];
-			for (int cull = 0; cull < 2; ++cull) {
-				pipelineInfo.rasterizer_state.cull_mode = cull ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_NONE;
-				pipelines[masked][cull] = CreatePipeline(gpuDevice, pipelineInfo);
+		for (int instanced = 0; instanced < 2; ++instanced) {
+			pipelineInfo.vertex_shader = instanced ? instanceVertexShader : vertexShader;
+			pipelineInfo.vertex_input_state.num_vertex_buffers = instanced ? 2 : 1;
+			pipelineInfo.vertex_input_state.vertex_buffer_descriptions = instanced ? instanceDescriptions : &vertexBufferDescription;
+			pipelineInfo.vertex_input_state.num_vertex_attributes = instanced ? 8 : 4;
+			pipelineInfo.vertex_input_state.vertex_attributes = instanced ? instanceAttributes : vertexAttributes;
+			for (int masked = 0; masked < 2; ++masked) {
+				pipelineInfo.fragment_shader = fragmentShaders[masked];
+				for (int cull = 0; cull < 2; ++cull) {
+					pipelineInfo.rasterizer_state.cull_mode = cull ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_NONE;
+					(instanced ? instancePipelines : pipelines)[masked][cull] = CreatePipeline(gpuDevice, pipelineInfo);
+				}
 			}
 		}
 		pipelineInfo.fragment_shader = fragmentShaders[0];
@@ -2134,9 +2231,16 @@ namespace Sapphire::Graphics {
 		colorTarget.blend_state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
 		colorTarget.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
 		colorTarget.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
-		for (int cull = 0; cull < 2; ++cull) {
-			pipelineInfo.rasterizer_state.cull_mode = cull ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_NONE;
-			transparentPipelines[cull] = CreatePipeline(gpuDevice, pipelineInfo);
+		for (int instanced = 0; instanced < 2; ++instanced) {
+			pipelineInfo.vertex_shader = instanced ? instanceVertexShader : vertexShader;
+			pipelineInfo.vertex_input_state.num_vertex_buffers = instanced ? 2 : 1;
+			pipelineInfo.vertex_input_state.vertex_buffer_descriptions = instanced ? instanceDescriptions : &vertexBufferDescription;
+			pipelineInfo.vertex_input_state.num_vertex_attributes = instanced ? 8 : 4;
+			pipelineInfo.vertex_input_state.vertex_attributes = instanced ? instanceAttributes : vertexAttributes;
+			for (int cull = 0; cull < 2; ++cull) {
+				pipelineInfo.rasterizer_state.cull_mode = cull ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_NONE;
+				(instanced ? instanceTransparentPipelines : transparentPipelines)[cull] = CreatePipeline(gpuDevice, pipelineInfo);
+			}
 		}
 		pipelineInfo.depth_stencil_state.enable_depth_write = true;
 		pipelineInfo.vertex_shader = shadowVertexShader;
@@ -2149,17 +2253,24 @@ namespace Sapphire::Graphics {
 		pipelineInfo.target_info.color_target_descriptions = nullptr;
 		pipelineInfo.target_info.has_depth_stencil_target = true;
 		pipelineInfo.target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
-		for (int masked = 0; masked < 2; ++masked) {
-			pipelineInfo.fragment_shader = shadowFragmentShaders[masked];
-			for (int cull = 0; cull < 2; ++cull) {
-				pipelineInfo.rasterizer_state.cull_mode = cull ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_NONE;
-				shadowPipelines[masked][cull] = CreatePipeline(gpuDevice, pipelineInfo);
+		for (int instanced = 0; instanced < 2; ++instanced) {
+			pipelineInfo.vertex_shader = instanced ? instanceShadowShader : shadowVertexShader;
+			pipelineInfo.vertex_input_state.num_vertex_buffers = instanced ? 2 : 1;
+			pipelineInfo.vertex_input_state.vertex_buffer_descriptions = instanced ? instanceDescriptions : &vertexBufferDescription;
+			pipelineInfo.vertex_input_state.num_vertex_attributes = instanced ? 8 : 4;
+			pipelineInfo.vertex_input_state.vertex_attributes = instanced ? instanceAttributes : vertexAttributes;
+			for (int masked = 0; masked < 2; ++masked) {
+				pipelineInfo.fragment_shader = shadowFragmentShaders[masked];
+				for (int cull = 0; cull < 2; ++cull) {
+					pipelineInfo.rasterizer_state.cull_mode = cull ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_NONE;
+					(instanced ? instanceShadowPipelines : shadowPipelines)[masked][cull] = CreatePipeline(gpuDevice, pipelineInfo);
+				}
 			}
 		}
 		releaseShaders();
 		if (!whiteTexture || !sampler || !shadowSampler || !emptyShadowTexture) return false;
-		for (int masked = 0; masked < 2; ++masked) for (int cull = 0; cull < 2; ++cull) if (!pipelines[masked][cull] || !shadowPipelines[masked][cull]) return false;
-		return transparentPipelines[0] && transparentPipelines[1];
+		for (int masked = 0; masked < 2; ++masked) for (int cull = 0; cull < 2; ++cull) if (!pipelines[masked][cull] || !shadowPipelines[masked][cull] || !instancePipelines[masked][cull] || !instanceShadowPipelines[masked][cull]) return false;
+		return transparentPipelines[0] && transparentPipelines[1] && instanceTransparentPipelines[0] && instanceTransparentPipelines[1];
 	}
 
 	static void ReleaseSceneResources() {
@@ -2203,7 +2314,7 @@ namespace Sapphire::Graphics {
 		}
 		staticShadowDirection = {};
 		shadowLight = nullptr;
-		renderItems.reserve(staticBatches.size() + scene.Objects().size());
+		renderItems.reserve(staticBatches.size() + scene.ResidentRenderObjects().size());
 		FlushUploads();
 	}
 
@@ -2284,7 +2395,7 @@ namespace Sapphire::Graphics {
 				const Object* object = entry.object;
 				auto& source = *entry.source;
 				Mesh* mesh = source.mesh;
-				if (!mesh || mesh->data.vertices.empty() || mesh->data.indices.empty() || (object->renderStatic && !mesh->material.transparent && mesh->material.displacementTexturePath.empty())) continue;
+				if (!mesh || mesh->data.vertices.empty() || mesh->data.indices.empty() || (mesh->instanced && mesh->instances.empty()) || (object->renderStatic && !mesh->instanced && !mesh->material.transparent && mesh->material.displacementTexturePath.empty())) continue;
 				Transform transform = object->transform;
 				if (auto* body = source.body) {
 					const float alpha = Time::interpolationAlpha;
@@ -2443,12 +2554,12 @@ namespace Sapphire::Graphics {
 			const ShadowMapData maps[3] = {detail ? detail->data : ShadowMapData{}, fallbackShadowMap, dynamicMap};
 			const bool enabled[3] = {staticEnabled && detail && detail->data.valid, staticEnabled && fallbackShadowMap.valid, directionalShadowsActive && dynamicMap.valid};
 			GpuMesh& gpuMesh = *item.gpu;
-			SDL_GPUGraphicsPipeline* meshPipeline = mesh->material.transparent ? transparentPipelines[mesh->cullBackfaces ? 1 : 0] : pipelines[gpuMesh.material->masked ? 1 : 0][mesh->cullBackfaces ? 1 : 0];
+			SDL_GPUGraphicsPipeline* meshPipeline = mesh->material.transparent ? (mesh->instanced ? instanceTransparentPipelines : transparentPipelines)[mesh->cullBackfaces ? 1 : 0] : (mesh->instanced ? instancePipelines : pipelines)[gpuMesh.material->masked ? 1 : 0][mesh->cullBackfaces ? 1 : 0];
 			if (meshPipeline != activePipeline) {
 				SDL_BindGPUGraphicsPipeline(pass, meshPipeline);
 				activePipeline = meshPipeline;
 			}
-			visibleTriangles += gpuMesh.indexCount / 3;
+			visibleTriangles += gpuMesh.indexCount / 3 * (mesh->instanced ? mesh->instances.size() : 1);
 			ObjectUniforms vertex{};
 			const Matrix4 mvp = Multiply(viewProjection, item.model);
 			std::memcpy(vertex.mvp, mvp.values, sizeof(vertex.mvp));
@@ -2480,6 +2591,10 @@ namespace Sapphire::Graphics {
 			SDL_PushGPUVertexUniformData(commandBuffer, 0, &vertex, sizeof(vertex));
 			SDL_PushGPUFragmentUniformData(commandBuffer, 0, &fragment, sizeof(fragment));
 			buffers.Bind(pass, gpuMesh);
+			if (mesh->instanced) {
+				SDL_GPUBufferBinding instanceBinding{gpuMesh.instanceBuffer, 0};
+				SDL_BindGPUVertexBuffers(pass, 1, &instanceBinding, 1);
+			}
 			SDL_GPUTextureSamplerBinding bindings[8]{};
 			bindings[0] = {gpuMesh.material->textures[0], sampler};
 			bindings[1] = {enabled[0] ? detail->texture : emptyShadowTexture, shadowSampler};
@@ -2498,7 +2613,7 @@ namespace Sapphire::Graphics {
 			SDL_GPUTextureSamplerBinding vertexBindings[2] = {{gpuMesh.material->textures[4], sampler}, {gpuMesh.material->textures[5], sampler}};
 			if (activeMaterial != gpuMesh.material) SDL_BindGPUVertexSamplers(pass, 0, vertexBindings, 2);
 			activeMaterial = gpuMesh.material;
-			SDL_DrawGPUIndexedPrimitives(pass, gpuMesh.indexCount, 1, 0, 0, 0);
+			SDL_DrawGPUIndexedPrimitives(pass, gpuMesh.indexCount, mesh->instanced ? static_cast<Uint32>(mesh->instances.size()) : 1, 0, 0, 0);
 			++drawCallCount;
 		}
 		SDL_EndGPURenderPass(pass);
@@ -2548,7 +2663,7 @@ namespace Sapphire::Graphics {
 			ReleaseTexture(gpuDevice, texture);
 		}
 		staticShadowDirection = {};
-		for (auto& variants : {&pipelines, &shadowPipelines}) {
+		for (auto& variants : {&pipelines, &shadowPipelines, &instancePipelines, &instanceShadowPipelines}) {
 			for (auto& row : *variants) {
 				for (auto& pipeline : row) {
 					if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
@@ -2557,6 +2672,10 @@ namespace Sapphire::Graphics {
 			}
 		}
 		for (auto& pipeline : transparentPipelines) {
+			if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
+			pipeline = nullptr;
+		}
+		for (auto& pipeline : instanceTransparentPipelines) {
 			if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
 			pipeline = nullptr;
 		}
