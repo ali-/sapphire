@@ -61,6 +61,7 @@ namespace Sapphire {
 				for (std::size_t index = 0; index < scene.Objects().size(); ++index) {
 					Object* object = scene.Objects()[index].get();
 					if (object->initializedForApp) continue;
+					object->UpdateWorldTransform();
 					object->Initialize();
 					object->initializedForApp = true;
 					if (auto* body = object->GetComponent<PhysicsBody>()) body->previousPosition = object->transform.position;
@@ -104,9 +105,13 @@ namespace Sapphire {
 					const std::size_t phaseCount = scene.Objects().size();
 					for (std::size_t index = 0; index < phaseCount; ++index) {
 						Object* object = scene.Objects()[index].get();
-						if (object->initializedForApp) object->FixedUpdate();
+						if (object->initializedForApp) {
+							object->UpdateWorldTransform();
+							object->FixedUpdate();
+						}
 					}
 					Physics::Simulate(scene, fixedStep);
+					scene.UpdateTransforms();
 					accumulator -= fixedStepNs;
 				}
 				Time::interpolationAlpha = static_cast<float>(accumulator) / fixedStepNs;
@@ -115,9 +120,12 @@ namespace Sapphire {
 				for (std::size_t index = 0; index < updateCount; ++index) {
 					Object* object = scene.Objects()[index].get();
 					if (!object->initializedForApp) continue;
+					object->UpdateWorldTransform();
 					object->Update();
 					if (object->initializedForApp) object->GUI();
+					if (object->HasChildren()) object->UpdateWorldTransformSubtree();
 				}
+				scene.UpdateTransforms();
 
 				SDL_GPUCommandBuffer *commandBuffer = SDL_AcquireGPUCommandBuffer(gpuDevice);
 				if (!commandBuffer) throw std::runtime_error(std::string("Acquire frame command buffer: ") + SDL_GetError());

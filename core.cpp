@@ -67,11 +67,14 @@ namespace Sapphire {
 		Vector3 scale{1.0f, 1.0f, 1.0f};
 		Vector3 localPosition;
 		Vector3 localRotation;
+		Vector3 localScale{1.0f, 1.0f, 1.0f};
 
 		Vector3 Forward() const {
-			const float yaw = rotation.y * Math::degreesToRadians;
 			const float pitch = rotation.x * Math::degreesToRadians;
-			return {std::sin(yaw) * std::cos(pitch), -std::sin(pitch), std::cos(yaw) * std::cos(pitch)};
+			const float yaw = rotation.y * Math::degreesToRadians;
+			const float roll = rotation.z * Math::degreesToRadians;
+			const float cosinePitch = std::cos(pitch), sinePitch = std::sin(pitch), cosineYaw = std::cos(yaw), sineYaw = std::sin(yaw), cosineRoll = std::cos(roll), sineRoll = std::sin(roll);
+			return {cosineRoll * sineYaw * cosinePitch + sineRoll * sinePitch, sineRoll * sineYaw * cosinePitch - cosineRoll * sinePitch, cosineYaw * cosinePitch};
 		}
 	};
 
@@ -116,6 +119,42 @@ namespace Sapphire {
 			axes[0] = {cz * cy, sz * cy, -sy};
 			axes[1] = {cz * sy * sx - sz * cx, sz * sy * sx + cz * cx, cy * sx};
 			axes[2] = {cz * sy * cx + sz * sx, sz * sy * cx - cz * sx, cy * cx};
+		}
+
+		Vector3 ComposeRotation(const Vector3& parent, const Vector3& local) {
+			Vector3 parentAxes[3];
+			Vector3 localAxes[3];
+			Transform parentTransform;
+			Transform localTransform;
+			parentTransform.rotation = parent;
+			localTransform.rotation = local;
+			GetAxes(parentTransform, parentAxes);
+			GetAxes(localTransform, localAxes);
+			Vector3 axes[3];
+			for (int index = 0; index < 3; ++index) axes[index] = Add(Scale(parentAxes[0], localAxes[index].x), Add(Scale(parentAxes[1], localAxes[index].y), Scale(parentAxes[2], localAxes[index].z)));
+			const float yaw = std::asin(std::clamp(-axes[0].z, -1.0f, 1.0f));
+			const float cosineYaw = std::cos(yaw);
+			const float pitch = std::abs(cosineYaw) > 0.0001f ? std::atan2(axes[1].z, axes[2].z) : std::atan2(-axes[2].y, axes[1].y);
+			const float roll = std::abs(cosineYaw) > 0.0001f ? std::atan2(axes[0].y, axes[0].x) : 0.0f;
+			return {pitch / degreesToRadians, yaw / degreesToRadians, roll / degreesToRadians};
+		}
+
+		Vector3 RelativeRotation(const Vector3& parent, const Vector3& world) {
+			Vector3 parentAxes[3];
+			Vector3 worldAxes[3];
+			Transform parentTransform;
+			Transform worldTransform;
+			parentTransform.rotation = parent;
+			worldTransform.rotation = world;
+			GetAxes(parentTransform, parentAxes);
+			GetAxes(worldTransform, worldAxes);
+			Vector3 localAxes[3];
+			for (int index = 0; index < 3; ++index) localAxes[index] = {Dot(parentAxes[0], worldAxes[index]), Dot(parentAxes[1], worldAxes[index]), Dot(parentAxes[2], worldAxes[index])};
+			const float yaw = std::asin(std::clamp(-localAxes[0].z, -1.0f, 1.0f));
+			const float cosineYaw = std::cos(yaw);
+			const float pitch = std::abs(cosineYaw) > 0.0001f ? std::atan2(localAxes[1].z, localAxes[2].z) : std::atan2(-localAxes[2].y, localAxes[1].y);
+			const float roll = std::abs(cosineYaw) > 0.0001f ? std::atan2(localAxes[0].y, localAxes[0].x) : 0.0f;
+			return {pitch / degreesToRadians, yaw / degreesToRadians, roll / degreesToRadians};
 		}
 
 		Matrix4 Identity() {
@@ -317,6 +356,12 @@ namespace Sapphire {
 
 	};
 
+	struct MeshSection {
+		std::uint32_t firstIndex = 0;
+		std::uint32_t indexCount = 0;
+		std::uint32_t materialIndex = 0;
+	};
+
 	struct MeshInstance {
 		Vector3 position;
 		Vector3 rotation;
@@ -330,12 +375,38 @@ namespace Sapphire {
 			std::vector<MeshInstance> instances;
 			bool instanced = false;
 			Material material;
+			std::vector<Material> materials;
+			std::vector<MeshSection> sections;
 			bool cullBackfaces = true;
 			bool castShadows = true;
 			Vector3 vertexBoundsPadding{};
 			bool vertexAnimated = false;
 			std::uint64_t revision = 0;
 			std::uint64_t instanceRevision = 0;
+			std::size_t MaterialCount() const { return materials.empty() ? 1 : materials.size(); }
+			const Material& GetMaterial(std::size_t index) const { return materials.empty() ? material : materials.at(index); }
+			std::size_t SectionCount() const { return sections.empty() ? (data.indices.empty() ? 0 : 1) : sections.size(); }
+			MeshSection GetSection(std::size_t index) const { return sections.empty() ? MeshSection{0, static_cast<std::uint32_t>(data.indices.size()), 0} : sections.at(index); }
+			std::uint32_t MaterialIndexAt(std::size_t index) const {
+				if (sections.empty()) return 0;
+				auto section = std::upper_bound(sections.begin(), sections.end(), index, [](std::size_t position, const MeshSection& value) { return position < value.firstIndex; });
+				return section == sections.begin() ? 0 : (section - 1)->materialIndex;
+			}
+			void ValidateSections() const {
+				if (materials.size() > std::numeric_limits<std::uint32_t>::max()) throw std::length_error("Mesh material count exceeds supported range");
+				if (materials.size() > 1 && sections.empty()) throw std::invalid_argument("Meshes with multiple materials require sections");
+				std::size_t nextIndex = 0;
+				for (const auto& section : sections) {
+					if (section.firstIndex != nextIndex || section.indexCount == 0 || section.indexCount % 3 != 0 || static_cast<std::size_t>(section.firstIndex) + section.indexCount > data.indices.size()) throw std::invalid_argument("Mesh sections must cover contiguous triangle index ranges");
+					if (section.materialIndex >= MaterialCount()) throw std::out_of_range("Mesh section material index is invalid");
+					nextIndex += section.indexCount;
+				}
+				if (!sections.empty() && nextIndex != data.indices.size()) throw std::invalid_argument("Mesh sections must cover all mesh indices");
+			}
+			void Validate() const {
+				data.Validate();
+				ValidateSections();
+			}
 			void MarkDirty() { ++revision; }
 			void MarkInstancesDirty() { ++instanceRevision; }
 			static MeshData Cube();
@@ -364,12 +435,109 @@ namespace Sapphire {
 			bool worldPartitionCell = false;
 			bool initializedForApp = true;
 			Object* worldPartitionSourceObject = nullptr;
+			std::uint64_t transformGeneration = 0;
 			explicit Object(std::string name) : name(std::move(name)) {}
 			virtual void Initialize() {}
 			virtual void Update() {}
 			virtual void FixedUpdate() {}
 			virtual void GUI() {}
 			virtual ~Object() = default;
+
+			void UpdateWorldTransform() {
+				if (parent) parent->UpdateWorldTransform();
+				ApplyWorldTransform();
+			}
+
+			void UpdateWorldTransformSubtree() {
+				UpdateWorldTransform();
+				UpdateDescendantWorldTransforms();
+			}
+
+			bool HasChildren() const { return !children.empty(); }
+
+			void ApplyWorldTransform() {
+				if (!parent) {
+					transform.localPosition = transform.position;
+					transform.localRotation = transform.rotation;
+					transform.localScale = transform.scale;
+					return;
+				}
+				Vector3 axes[3];
+				Math::GetAxes(parent->transform, axes);
+				transform.position = Math::Add(parent->transform.position, Math::Add(Math::Scale(axes[0], transform.localPosition.x * parent->transform.scale.x), Math::Add(Math::Scale(axes[1], transform.localPosition.y * parent->transform.scale.y), Math::Scale(axes[2], transform.localPosition.z * parent->transform.scale.z))));
+				transform.rotation = Math::ComposeRotation(parent->transform.rotation, transform.localRotation);
+				transform.scale = {parent->transform.scale.x * transform.localScale.x, parent->transform.scale.y * transform.localScale.y, parent->transform.scale.z * transform.localScale.z};
+			}
+
+			void UpdateDescendantWorldTransforms() {
+				for (Object* child : children) {
+					child->ApplyWorldTransform();
+					child->UpdateDescendantWorldTransforms();
+				}
+			}
+
+			void UpdateWorldTransform(std::uint64_t generation) {
+				if (transformGeneration == generation) return;
+				if (parent) parent->UpdateWorldTransform(generation);
+				ApplyWorldTransform();
+				transformGeneration = generation;
+			}
+
+			void SetWorldPosition(const Vector3& position) {
+				transform.position = position;
+				if (!parent) {
+					UpdateDescendantWorldTransforms();
+					return;
+				}
+				parent->UpdateWorldTransform();
+				Vector3 axes[3];
+				Math::GetAxes(parent->transform, axes);
+				const Vector3 offset = Math::Subtract(position, parent->transform.position);
+				transform.localPosition = {std::abs(parent->transform.scale.x) > 0.0001f ? Math::Dot(offset, axes[0]) / parent->transform.scale.x : 0.0f, std::abs(parent->transform.scale.y) > 0.0001f ? Math::Dot(offset, axes[1]) / parent->transform.scale.y : 0.0f, std::abs(parent->transform.scale.z) > 0.0001f ? Math::Dot(offset, axes[2]) / parent->transform.scale.z : 0.0f};
+				UpdateDescendantWorldTransforms();
+			}
+
+			void SetWorldRotation(const Vector3& rotation) {
+				transform.rotation = rotation;
+				if (parent) parent->UpdateWorldTransform();
+				transform.localRotation = parent ? Math::RelativeRotation(parent->transform.rotation, rotation) : rotation;
+				UpdateDescendantWorldTransforms();
+			}
+
+			void SetWorldScale(const Vector3& scale) {
+				transform.scale = scale;
+				if (parent) parent->UpdateWorldTransform();
+				transform.localScale = parent ? Vector3{std::abs(parent->transform.scale.x) > 0.0001f ? scale.x / parent->transform.scale.x : 0.0f, std::abs(parent->transform.scale.y) > 0.0001f ? scale.y / parent->transform.scale.y : 0.0f, std::abs(parent->transform.scale.z) > 0.0001f ? scale.z / parent->transform.scale.z : 0.0f} : scale;
+				UpdateDescendantWorldTransforms();
+			}
+
+			void SetParent(Object* nextParent, bool worldPositionStays = true) {
+				if (parent == nextParent) return;
+				for (Object* ancestor = nextParent; ancestor; ancestor = ancestor->parent) if (ancestor == this) throw std::invalid_argument("Object cannot be parented to itself or a descendant");
+				const Vector3 worldPosition = transform.position;
+				const Vector3 worldRotation = transform.rotation;
+				const Vector3 worldScale = transform.scale;
+				if (parent) {
+					auto& siblings = parent->children;
+					siblings.erase(std::remove(siblings.begin(), siblings.end(), this), siblings.end());
+				}
+				parent = nextParent;
+				if (parent) parent->children.push_back(this);
+				if (worldPositionStays) {
+					SetWorldPosition(worldPosition);
+					SetWorldRotation(worldRotation);
+					SetWorldScale(worldScale);
+				}
+				else {
+					if (!parent) {
+						transform.position = transform.localPosition;
+						transform.rotation = transform.localRotation;
+						transform.scale = transform.localScale;
+					}
+					UpdateWorldTransform();
+					UpdateDescendantWorldTransforms();
+				}
+			}
 
 			template <typename T>
 			T& AddComponent() {
@@ -407,6 +575,7 @@ namespace Sapphire {
 			std::vector<std::unique_ptr<Component>> components;
 			std::vector<std::pair<const void*, Component*>> componentCache;
 			std::unordered_map<std::string, std::any> properties;
+			std::vector<Object*> children;
 	};
 
 	class WorldPartitioner {
@@ -429,6 +598,8 @@ namespace Sapphire {
 			Mesh* mesh;
 			MeshRevision revision;
 			Material material;
+			std::vector<Material> materials;
+			std::vector<MeshSection> sections;
 			bool renderStatic;
 			bool spatiallyLoaded;
 			bool instanced;
@@ -480,8 +651,11 @@ namespace Sapphire {
 				if (!object->initializedForApp) continue;
 				object->worldPartitionedMesh = false;
 				Mesh* mesh = object->GetComponent<Mesh>();
-				SourceSnapshot snapshot{object.get(), object->transform, mesh, {}, mesh ? mesh->material : Material{}, object->renderStatic, object->spatiallyLoaded, mesh && mesh->instanced, mesh && mesh->cullBackfaces, mesh && mesh->castShadows, mesh ? mesh->vertexBoundsPadding : Vector3{}, mesh && mesh->vertexAnimated};
-				if (mesh) snapshot.revision.Set(*mesh);
+				SourceSnapshot snapshot{object.get(), object->transform, mesh, {}, mesh ? mesh->material : Material{}, mesh ? mesh->materials : std::vector<Material>{}, mesh ? mesh->sections : std::vector<MeshSection>{}, object->renderStatic, object->spatiallyLoaded, mesh && mesh->instanced, mesh && mesh->cullBackfaces, mesh && mesh->castShadows, mesh ? mesh->vertexBoundsPadding : Vector3{}, mesh && mesh->vertexAnimated};
+				if (mesh) {
+					mesh->Validate();
+					snapshot.revision.Set(*mesh);
+				}
 				sources.push_back(std::move(snapshot));
 				if (!object->spatiallyLoaded) {
 					alwaysResidentObjects.push_back(object.get());
@@ -500,6 +674,7 @@ namespace Sapphire {
 				using VertexMap = std::unordered_map<std::uint32_t, std::uint32_t>;
 				std::map<CellKey, MeshData> cellMeshes;
 				std::map<CellKey, VertexMap> cellVertices;
+				std::map<CellKey, std::vector<MeshSection>> cellSections;
 				std::map<CellKey, Math::Bounds> cellMeshBounds;
 				const Math::Matrix4 model = Math::Model(object->transform);
 				for (std::size_t index = 0; index + 2 < mesh->data.indices.size(); index += 3) {
@@ -513,12 +688,16 @@ namespace Sapphire {
 					IncludeBounds(cellMeshBounds, key, b);
 					IncludeBounds(cellMeshBounds, key, c);
 					MeshData& cellMesh = cellMeshes[key];
+					const std::uint32_t materialIndex = mesh->MaterialIndexAt(index);
+					auto& sections = cellSections[key];
+					if (sections.empty() || sections.back().materialIndex != materialIndex) sections.push_back({static_cast<std::uint32_t>(cellMesh.indices.size()), 0, materialIndex});
 					VertexMap& vertices = cellVertices[key];
 					for (const auto sourceIndex : sourceIndices) {
 						auto [entry, inserted] = vertices.try_emplace(sourceIndex, static_cast<std::uint32_t>(cellMesh.vertices.size()));
 						if (inserted) cellMesh.vertices.push_back(mesh->data.vertices[sourceIndex]);
 						cellMesh.indices.push_back(entry->second);
 					}
+					sections.back().indexCount += 3;
 				}
 				if (cellMeshes.empty()) {
 					const CellKey key = Key(object->transform.position, size);
@@ -537,6 +716,8 @@ namespace Sapphire {
 					Mesh& cellMesh = cellObject->AddComponent<Mesh>();
 					cellMesh.data = std::move(data);
 					cellMesh.material = mesh->material;
+					cellMesh.materials = mesh->materials;
+					cellMesh.sections = std::move(cellSections.at(key));
 					cellMesh.cullBackfaces = mesh->cullBackfaces;
 					cellMesh.castShadows = mesh->castShadows;
 					cellMesh.vertexBoundsPadding = mesh->vertexBoundsPadding;
@@ -590,14 +771,7 @@ namespace Sapphire {
 				return;
 			}
 			Vector3 sourcePosition = camera->owner->transform.position;
-			Vector3 axes[3];
-			Math::GetAxes(camera->owner->transform, axes);
-			sourcePosition += Math::Scale(axes[0], camera->owner->transform.localPosition.x);
-			sourcePosition += Math::Scale(axes[1], camera->owner->transform.localPosition.y);
-			sourcePosition += Math::Scale(axes[2], camera->owner->transform.localPosition.z);
-			Transform cameraTransform = camera->owner->transform;
-			cameraTransform.rotation += cameraTransform.localRotation;
-			const Vector3 forward = cameraTransform.Forward();
+			const Vector3 forward = camera->owner->transform.Forward();
 			const CellKey nextSource = Key(sourcePosition, size);
 			std::size_t sourceIndex = 0;
 			bool materialChanged = false;
@@ -610,7 +784,14 @@ namespace Sapphire {
 				const auto& b = object->transform;
 				const bool transformChanged = source.renderStatic && source.spatiallyLoaded && !object->GetComponent<Camera>() && std::tie(a.position.x, a.position.y, a.position.z, a.rotation.x, a.rotation.y, a.rotation.z, a.scale.x, a.scale.y, a.scale.z) != std::tie(b.position.x, b.position.y, b.position.z, b.rotation.x, b.rotation.y, b.rotation.z, b.scale.x, b.scale.y, b.scale.z);
 				if (source.renderStatic != object->renderStatic || source.spatiallyLoaded != object->spatiallyLoaded || source.mesh != mesh || transformChanged || (mesh && (!source.revision.Matches(*mesh) || source.instanced != mesh->instanced))) { dirty = true; break; }
-				if (mesh && (source.material.Key() != mesh->material.Key() || source.cullBackfaces != mesh->cullBackfaces || source.castShadows != mesh->castShadows || source.animated != mesh->vertexAnimated || std::tie(source.padding.x, source.padding.y, source.padding.z) != std::tie(mesh->vertexBoundsPadding.x, mesh->vertexBoundsPadding.y, mesh->vertexBoundsPadding.z))) materialChanged = true;
+				if (mesh) {
+					bool sectionsChanged = source.sections.size() != mesh->sections.size();
+					for (std::size_t index = 0; !sectionsChanged && index < source.sections.size(); ++index) sectionsChanged = std::tie(source.sections[index].firstIndex, source.sections[index].indexCount, source.sections[index].materialIndex) != std::tie(mesh->sections[index].firstIndex, mesh->sections[index].indexCount, mesh->sections[index].materialIndex);
+					if (sectionsChanged) { dirty = true; break; }
+					bool materialsChanged = source.material.Key() != mesh->material.Key() || source.materials.size() != mesh->materials.size();
+					for (std::size_t index = 0; !materialsChanged && index < source.materials.size(); ++index) materialsChanged = source.materials[index].Key() != mesh->materials[index].Key();
+					if (materialsChanged || source.cullBackfaces != mesh->cullBackfaces || source.castShadows != mesh->castShadows || source.animated != mesh->vertexAnimated || std::tie(source.padding.x, source.padding.y, source.padding.z) != std::tie(mesh->vertexBoundsPadding.x, mesh->vertexBoundsPadding.y, mesh->vertexBoundsPadding.z)) materialChanged = true;
+				}
 			}
 			if (sourceIndex != sources.size()) dirty = true;
 			if (materialChanged && !dirty) {
@@ -618,12 +799,13 @@ namespace Sapphire {
 					Mesh* sourceMesh = cell->worldPartitionSourceObject->GetComponent<Mesh>();
 					Mesh* cellMesh = cell->GetComponent<Mesh>();
 					cellMesh->material = sourceMesh->material;
+					cellMesh->materials = sourceMesh->materials;
 					cellMesh->cullBackfaces = sourceMesh->cullBackfaces;
 					cellMesh->castShadows = sourceMesh->castShadows;
 					cellMesh->vertexBoundsPadding = sourceMesh->vertexBoundsPadding;
 					cellMesh->vertexAnimated = sourceMesh->vertexAnimated;
 				}
-				for (auto& source : sources) if (source.mesh) { source.material = source.mesh->material; source.cullBackfaces = source.mesh->cullBackfaces; source.castShadows = source.mesh->castShadows; source.padding = source.mesh->vertexBoundsPadding; source.animated = source.mesh->vertexAnimated; }
+				for (auto& source : sources) if (source.mesh) { source.material = source.mesh->material; source.materials = source.mesh->materials; source.cullBackfaces = source.mesh->cullBackfaces; source.castShadows = source.mesh->castShadows; source.padding = source.mesh->vertexBoundsPadding; source.animated = source.mesh->vertexAnimated; }
 			}
 			if (!initialized || dirty || partitionSize != size) Rebuild(objects, size);
 			const float loadRange = std::max(range, 0.0f);
@@ -787,8 +969,14 @@ namespace Sapphire {
 			}
 
 			void UpdateWorldPartition() {
+				UpdateTransforms();
 				const float range = activeCamera ? activeCamera->far * std::max(partitionBuffer, 0.0f) : 0.0f;
 				worldPartitioner.Update(objects, activeCamera, partitionSize, range);
+			}
+
+			void UpdateTransforms() {
+				++transformGeneration;
+				for (auto& object : objects) object->UpdateWorldTransform(transformGeneration);
 			}
 
 			void SetAppActive(bool active) {
@@ -807,6 +995,7 @@ namespace Sapphire {
 		private:
 			std::vector<std::unique_ptr<Object>> objects;
 			bool appActive = false;
+			std::uint64_t transformGeneration = 0;
 			WorldPartitioner worldPartitioner;
 	};
 
