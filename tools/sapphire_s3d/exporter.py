@@ -4,11 +4,6 @@ import os
 import struct
 from bpy.props import StringProperty
 from bpy_extras.io_utils import ExportHelper
-from mathutils import Matrix, Vector
-
-
-AXIS = Matrix(((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0)))
-BASIS = AXIS.to_4x4()
 
 
 def write_string(file, value):
@@ -21,15 +16,14 @@ def write_vec3(file, value):
     file.write(struct.pack("<3f", value[0], value[1], value[2]))
 
 
-def converted_transform(matrix):
-    converted = BASIS @ matrix @ BASIS.inverted()
-    location, rotation, scale = converted.decompose()
+def export_transform(matrix):
+    location, rotation, scale = matrix.decompose()
     euler = rotation.to_euler("XYZ")
     return (location.x, location.y, location.z), tuple(math.degrees(value) for value in (euler.x, euler.y, euler.z)), (scale.x, scale.y, scale.z)
 
 
 def object_transform(obj):
-    return converted_transform(obj.matrix_basis)
+    return export_transform(obj.matrix_basis)
 
 
 def material_image(material, socket_name):
@@ -126,7 +120,7 @@ def bone_records(obj, armature):
         local = bind_matrices[bone.name]
         if bone.parent:
             local = bind_matrices[bone.parent.name].inverted() @ local
-        position, rotation, scale = converted_transform(local)
+        position, rotation, scale = export_transform(local)
         records.append((bone.name, indices[bone.parent.name] if bone.parent else -1, position, rotation, scale))
     return records
 
@@ -178,8 +172,8 @@ def mesh_payload(obj, export_path):
             for loop_index in triangle.loops:
                 loop = mesh.loops[loop_index]
                 source = mesh.vertices[loop.vertex_index]
-                position = AXIS @ source.co
-                normal = AXIS @ mesh.corner_normals[loop_index].vector
+                position = source.co
+                normal = mesh.corner_normals[loop_index].vector
                 uv = uv_layer.data[loop_index].uv if uv_layer else (0.0, 0.0)
                 color = (1.0, 1.0, 1.0, 1.0)
                 if color_layer:
@@ -273,7 +267,8 @@ class ExportSapphireS3D(bpy.types.Operator, ExportHelper):
 
     def invoke(self, context, event):
         if not self.filepath:
-            self.filepath = "scene.s3d"
+            blend_path = context.blend_data.filepath
+            self.filepath = os.path.splitext(blend_path)[0] + self.filename_ext if blend_path else "untitled.s3d"
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
 

@@ -75,10 +75,10 @@ namespace Sapphire {
 
 		Vector3 Forward() const {
 			const float pitch = rotation.x * Math::degreesToRadians;
-			const float yaw = rotation.y * Math::degreesToRadians;
-			const float roll = rotation.z * Math::degreesToRadians;
-			const float cosinePitch = std::cos(pitch), sinePitch = std::sin(pitch), cosineYaw = std::cos(yaw), sineYaw = std::sin(yaw), cosineRoll = std::cos(roll), sineRoll = std::sin(roll);
-			return {cosineRoll * sineYaw * cosinePitch + sineRoll * sinePitch, sineRoll * sineYaw * cosinePitch - cosineRoll * sinePitch, cosineYaw * cosinePitch};
+			const float roll = rotation.y * Math::degreesToRadians;
+			const float yaw = rotation.z * Math::degreesToRadians;
+			const float cosinePitch = std::cos(pitch), sinePitch = std::sin(pitch), cosineRoll = std::cos(roll), sineRoll = std::sin(roll), cosineYaw = std::cos(yaw), sineYaw = std::sin(yaw);
+			return {sineYaw * cosinePitch - cosineYaw * sineRoll * sinePitch, -sineYaw * sineRoll * sinePitch - cosineYaw * cosinePitch, -cosineRoll * sinePitch};
 		}
 	};
 
@@ -136,11 +136,11 @@ namespace Sapphire {
 			GetAxes(localTransform, localAxes);
 			Vector3 axes[3];
 			for (int index = 0; index < 3; ++index) axes[index] = Add(Scale(parentAxes[0], localAxes[index].x), Add(Scale(parentAxes[1], localAxes[index].y), Scale(parentAxes[2], localAxes[index].z)));
-			const float yaw = std::asin(std::clamp(-axes[0].z, -1.0f, 1.0f));
-			const float cosineYaw = std::cos(yaw);
-			const float pitch = std::abs(cosineYaw) > 0.0001f ? std::atan2(axes[1].z, axes[2].z) : std::atan2(-axes[2].y, axes[1].y);
-			const float roll = std::abs(cosineYaw) > 0.0001f ? std::atan2(axes[0].y, axes[0].x) : 0.0f;
-			return {pitch / degreesToRadians, yaw / degreesToRadians, roll / degreesToRadians};
+			const float roll = std::asin(std::clamp(-axes[0].z, -1.0f, 1.0f));
+			const float cosineRoll = std::cos(roll);
+			const float pitch = std::abs(cosineRoll) > 0.0001f ? std::atan2(axes[1].z, axes[2].z) : std::atan2(-axes[2].y, axes[1].y);
+			const float yaw = std::abs(cosineRoll) > 0.0001f ? std::atan2(axes[0].y, axes[0].x) : 0.0f;
+			return {pitch / degreesToRadians, roll / degreesToRadians, yaw / degreesToRadians};
 		}
 
 		Vector3 RelativeRotation(const Vector3& parent, const Vector3& world) {
@@ -154,11 +154,11 @@ namespace Sapphire {
 			GetAxes(worldTransform, worldAxes);
 			Vector3 localAxes[3];
 			for (int index = 0; index < 3; ++index) localAxes[index] = {Dot(parentAxes[0], worldAxes[index]), Dot(parentAxes[1], worldAxes[index]), Dot(parentAxes[2], worldAxes[index])};
-			const float yaw = std::asin(std::clamp(-localAxes[0].z, -1.0f, 1.0f));
-			const float cosineYaw = std::cos(yaw);
-			const float pitch = std::abs(cosineYaw) > 0.0001f ? std::atan2(localAxes[1].z, localAxes[2].z) : std::atan2(-localAxes[2].y, localAxes[1].y);
-			const float roll = std::abs(cosineYaw) > 0.0001f ? std::atan2(localAxes[0].y, localAxes[0].x) : 0.0f;
-			return {pitch / degreesToRadians, yaw / degreesToRadians, roll / degreesToRadians};
+			const float roll = std::asin(std::clamp(-localAxes[0].z, -1.0f, 1.0f));
+			const float cosineRoll = std::cos(roll);
+			const float pitch = std::abs(cosineRoll) > 0.0001f ? std::atan2(localAxes[1].z, localAxes[2].z) : std::atan2(-localAxes[2].y, localAxes[1].y);
+			const float yaw = std::abs(cosineRoll) > 0.0001f ? std::atan2(localAxes[0].y, localAxes[0].x) : 0.0f;
+			return {pitch / degreesToRadians, roll / degreesToRadians, yaw / degreesToRadians};
 		}
 
 		Matrix4 Identity() {
@@ -1083,7 +1083,7 @@ namespace Sapphire {
 	class Scene {
 		public:
 			Camera* activeCamera = nullptr;
-			Vector3 gravity{0.0f, -9.81f, 0.0f};
+			Vector3 gravity{0.0f, 0.0f, -9.81f};
 			int cellSize = 20;
 			int partitionSize = 200;
 			float partitionBuffer = 1.50f;

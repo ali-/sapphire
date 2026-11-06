@@ -718,9 +718,9 @@ namespace Sapphire::Graphics {
 				float3 ray = position - frame.cameraPosition.xyz;
 				float rayLength = length(ray);
 				float endDistance = min(rayLength, frame.fogParameters.y);
-				float verticalDirection = ray.y / max(rayLength, 0.000001);
-				float startHeight = frame.cameraPosition.y;
-				float endHeight = frame.cameraPosition.y + verticalDirection * endDistance;
+				float verticalDirection = ray.z / max(rayLength, 0.000001);
+				float startHeight = frame.cameraPosition.z;
+				float endHeight = frame.cameraPosition.z + verticalDirection * endDistance;
 				float falloff = frame.fogHeightParameters.y;
 				float density = frame.fogHeightParameters.x * exp2(clamp(-falloff * (min(startHeight, endHeight) - frame.fogHeightParameters.z), -80.0, 80.0));
 				float heightChange = falloff * abs(endHeight - startHeight) * 0.69314718056;
@@ -922,7 +922,11 @@ namespace Sapphire::Graphics {
 				const Object* object = entry.object;
 				Light* light = entry.light;
 				if (!light || !light->enabled || light->intensity <= 0.0f) continue;
-				if (light->type == Light::Type::Directional && !directional.source) directional = {Normalize(object->transform.Forward()), light->color, light->intensity, light->castShadows, light->shadowBias, object->renderStatic, light};
+				if (light->type == Light::Type::Directional && !directional.source) {
+					Vector3 axes[3];
+					GetAxes(object->transform, axes);
+					directional = {Scale(axes[2], -1.0f), light->color, light->intensity, light->castShadows, light->shadowBias, object->renderStatic, light};
+				}
 				else if (light->type == Light::Type::Point && light->range > 0.0f && pointLights.size() < maxPointLights) {
 					PointLightData data{object->transform.position, light->color, light->intensity, light->range, light->shadowBias, light->castShadows, object->renderStatic};
 					data.source = light;
@@ -970,8 +974,8 @@ namespace Sapphire::Graphics {
 				Frustum frustum{
 					transform.position,
 					axes[0],
-					axes[1],
 					axes[2],
+					Scale(axes[1], -1.0f),
 					std::tan(camera.fieldOfView * Math::degreesToRadians * 0.5f),
 					aspectRatio,
 					camera.far
@@ -1102,7 +1106,7 @@ namespace Sapphire::Graphics {
 			if (!basis.ready || basis.source.x != direction.x || basis.source.y != direction.y || basis.source.z != direction.z) {
 				basis.source = direction;
 				basis.direction = Normalize(direction);
-				const Vector3 referenceUp = std::abs(basis.direction.y) > 0.99f ? Vector3{1.0f, 0.0f, 0.0f} : Vector3{0.0f, 1.0f, 0.0f};
+				const Vector3 referenceUp = std::abs(basis.direction.z) > 0.99f ? Vector3{1.0f, 0.0f, 0.0f} : Vector3{0.0f, 0.0f, 1.0f};
 				basis.right = Normalize(Cross(referenceUp, basis.direction));
 				basis.up = Normalize(Cross(basis.direction, basis.right));
 				basis.ready = true;
@@ -1532,18 +1536,18 @@ namespace Sapphire::Graphics {
 			const int rowSize = static_cast<int>(rowCount);
 			mesh.vertices.reserve(static_cast<std::size_t>(vertexCount));
 			mesh.indices.reserve(static_cast<std::size_t>(indexCount));
-			for (int z = 0; z <= subdivisions; ++z) {
+			for (int y = 0; y <= subdivisions; ++y) {
 				for (int x = 0; x <= subdivisions; ++x) {
 					const float u = static_cast<float>(x) / subdivisions;
-					const float v = static_cast<float>(z) / subdivisions;
-					mesh.vertices.push_back(MakeVertex({u - 0.5f, 0.0f, v - 0.5f}, {0.0f, 1.0f, 0.0f}, u, v));
+					const float v = static_cast<float>(y) / subdivisions;
+					mesh.vertices.push_back(MakeVertex({u - 0.5f, v - 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, u, v));
 				}
 			}
-			for (int z = 0; z < subdivisions; ++z) {
+			for (int y = 0; y < subdivisions; ++y) {
 				for (int x = 0; x < subdivisions; ++x) {
-					const std::uint32_t first = z * rowSize + x;
+					const std::uint32_t first = y * rowSize + x;
 					const std::uint32_t nextRow = first + rowSize;
-					mesh.indices.insert(mesh.indices.end(), {first, nextRow, nextRow + 1, first, nextRow + 1, first + 1});
+					mesh.indices.insert(mesh.indices.end(), {first, nextRow + 1, nextRow, first, first + 1, nextRow + 1});
 				}
 			}
 			return mesh;

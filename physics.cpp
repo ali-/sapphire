@@ -114,14 +114,14 @@ namespace Sapphire {
 			};
 
 			bool IsWalkable(const PhysicsBody& body, const Contact& contact) {
-				return contact.hit && contact.surfaceNormal.y >= body.SlopeCosine();
+				return contact.hit && contact.surfaceNormal.z >= body.SlopeCosine();
 			}
 
 			bool IsCapsuleFootContact(const Capsule& capsule, const Contact& contact) {
 				const float x = contact.point.x - capsule.start.x;
-				const float z = contact.point.z - capsule.start.z;
+				const float y = contact.point.y - capsule.start.y;
 				const float radius = std::max(0.0f, capsule.radius - skinWidth);
-				return contact.hit && contact.point.y <= capsule.start.y && x * x + z * z <= radius * radius;
+				return contact.hit && contact.point.z <= capsule.start.z && x * x + y * y <= radius * radius;
 			}
 
 			bool IsCapsuleSupport(const Capsule& capsule, const PhysicsBody& body, const Contact& contact) {
@@ -134,7 +134,7 @@ namespace Sapphire {
 					const bool candidateSupport = IsCapsuleSupport(capsule, *floorBody, candidate);
 					const bool currentSupport = IsCapsuleSupport(capsule, *floorBody, current);
 					if (candidateSupport != currentSupport) return candidateSupport;
-					if (candidateSupport) return candidate.surfaceNormal.y > current.surfaceNormal.y;
+					if (candidateSupport) return candidate.surfaceNormal.z > current.surfaceNormal.z;
 				}
 				return candidate.time < current.time;
 			}
@@ -199,9 +199,9 @@ namespace Sapphire {
 				GetAxes(transform, axes);
 				const Vector3 offset{collider.center.x * transform.scale.x, collider.center.y * transform.scale.y, collider.center.z * transform.scale.z};
 				const Vector3 center = Add(transform.position, Add(Add(Scale(axes[0], offset.x), Scale(axes[1], offset.y)), Scale(axes[2], offset.z)));
-				const float height = std::abs(collider.size.y * transform.scale.y);
-				const float radius = std::min(height * 0.5f, std::min(std::abs(collider.size.x * transform.scale.x), std::abs(collider.size.z * transform.scale.z)) * 0.5f);
-				const Vector3 segment = Scale(axes[1], std::max(0.0f, height * 0.5f - radius));
+				const float height = std::abs(collider.size.z * transform.scale.z);
+				const float radius = std::min(height * 0.5f, std::min(std::abs(collider.size.x * transform.scale.x), std::abs(collider.size.y * transform.scale.y)) * 0.5f);
+				const Vector3 segment = Scale(axes[2], std::max(0.0f, height * 0.5f - radius));
 				return {Subtract(center, segment), Add(center, segment), radius};
 			}
 
@@ -989,7 +989,7 @@ namespace Sapphire {
 				Capsule capsule = WorldCapsule(object, collider);
 				capsule.radius = std::max(axisEpsilon, capsule.radius - skinWidth);
 				const PhysicsBody& body = *object.GetComponent<PhysicsBody>();
-				const Vector3 displacement{0.0f, -distance, 0.0f};
+				const Vector3 displacement{0.0f, 0.0f, -distance};
 				Contact contact;
 				FindCapsuleHit( object, capsule, displacement, contact, &body);
 				if (IsCapsuleSupport(capsule, body, contact)) {
@@ -999,8 +999,8 @@ namespace Sapphire {
 				const bool blockingFloor = IsCapsuleFootContact(capsule, contact);
 				const float shrink = capsule.radius * 0.25f;
 				capsule.radius -= shrink;
-				capsule.start.y -= shrink;
-				capsule.end.y += shrink;
+				capsule.start.z -= shrink;
+				capsule.end.z += shrink;
 				Contact narrowContact;
 				FindCapsuleHit( object, capsule, displacement, narrowContact, &body);
 				if (!IsCapsuleSupport(capsule, body, narrowContact)) return false;
@@ -1038,19 +1038,19 @@ namespace Sapphire {
 					if (Dot(body.velocity, contact.surfaceNormal) <= axisEpsilon) body.grounded = true;
 					return;
 				}
-				const float horizontalLength = std::sqrt(contact.normal.x * contact.normal.x + contact.normal.z * contact.normal.z);
+				const float horizontalLength = std::sqrt(contact.normal.x * contact.normal.x + contact.normal.y * contact.normal.y);
 				if (horizontalLength > axisEpsilon) {
-					contact.normal = {contact.normal.x / horizontalLength, 0.0f, contact.normal.z / horizontalLength};
+					contact.normal = {contact.normal.x / horizontalLength, contact.normal.y / horizontalLength, 0.0f};
 					contact.penetration /= horizontalLength;
 				}
 			}
 
 			void ConstrainCapsuleContact(PhysicsBody& body, Contact& contact, bool allowSlope) {
 				if (allowSlope && IsWalkable(body, contact)) return;
-				if (contact.surfaceNormal.y >= 0.0f) {
-					const float horizontalLength = std::sqrt(contact.normal.x * contact.normal.x + contact.normal.z * contact.normal.z);
+				if (contact.surfaceNormal.z >= 0.0f) {
+					const float horizontalLength = std::sqrt(contact.normal.x * contact.normal.x + contact.normal.y * contact.normal.y);
 					if (horizontalLength > axisEpsilon) {
-						contact.normal = {contact.normal.x / horizontalLength, 0.0f, contact.normal.z / horizontalLength};
+						contact.normal = {contact.normal.x / horizontalLength, contact.normal.y / horizontalLength, 0.0f};
 						contact.penetration /= horizontalLength;
 					}
 				}
@@ -1123,21 +1123,21 @@ namespace Sapphire {
 					const float intoSurface = Dot(remaining, contact.normal);
 					if (intoSurface > 0.0f) remaining += Scale(contact.normal, -intoSurface);
 					RemoveIntoSurface(body, contact.normal);
-					if (body.grounded && body.velocity.y < 0.0f) body.velocity.y = 0.0f;
+					if (body.grounded && body.velocity.z < 0.0f) body.velocity.z = 0.0f;
 				}
 			}
 
 			bool TryCapsuleTransition(Scene& scene, Object& object, PhysicsBody& body, Collider& collider, const Vector3& remaining, const Contact& obstacle, const Contact& support, float riseLimit, bool allowFall) {
-				if (riseLimit <= 0.0f || obstacle.point.y > WorldCapsule(object, collider).end.y) return false;
-				const Vector3 forward{remaining.x, 0.0f, remaining.z};
+				if (riseLimit <= 0.0f || obstacle.point.z > WorldCapsule(object, collider).end.z) return false;
+				const Vector3 forward{remaining.x, remaining.y, 0.0f};
 				if (Length(forward) <= axisEpsilon) return false;
 				const Vector3 original = object.transform.position;
-				const Vector3 up{0.0f, riseLimit, 0.0f};
+				const Vector3 up{0.0f, 0.0f, riseLimit};
 				Contact ceiling;
 				float rise = riseLimit;
 				if (FindEarliestHit( object, collider, up, ceiling)) rise *= ceiling.time;
 				if (rise <= axisEpsilon) return false;
-				MoveObject(object, {0.0f, rise, 0.0f});
+				MoveObject(object, {0.0f, 0.0f, rise});
 				Contact ahead;
 				if (FindEarliestHit( object, collider, forward, ahead)) {
 					object.SetWorldPosition(original);
@@ -1154,8 +1154,8 @@ namespace Sapphire {
 					object.SetWorldPosition(original);
 					return false;
 				}
-				MoveObject(object, {0.0f, -std::max(0.0f, floor.time * drop - skinWidth), 0.0f});
-				if (object.transform.position.y - original.y > riseLimit + axisEpsilon || floor.point.y - support.point.y > riseLimit + axisEpsilon) {
+				MoveObject(object, {0.0f, 0.0f, -std::max(0.0f, floor.time * drop - skinWidth)});
+				if (object.transform.position.z - original.z > riseLimit + axisEpsilon || floor.point.z - support.point.z > riseLimit + axisEpsilon) {
 					object.SetWorldPosition(original);
 					return false;
 				}
@@ -1183,14 +1183,14 @@ namespace Sapphire {
 					MoveObject(object, Scale(remaining, contact.time));
 					remaining = Scale(remaining, 1.0f - contact.time);
 					const bool walkable = IsWalkable(body, contact);
-					if (walking && (!walkable || -contact.normal.y < body.SlopeCosine())) {
+					if (walking && (!walkable || -contact.normal.z < body.SlopeCosine())) {
 						const Capsule capsule = WorldCapsule(object, collider);
-						const bool footEdge = contact.point.y <= capsule.start.y && -contact.normal.y >= body.SlopeCosine() && std::abs(Dot(Subtract(contact.point, floor->point), floor->surfaceNormal)) <= skinWidth;
+						const bool footEdge = contact.point.z <= capsule.start.z && -contact.normal.z >= body.SlopeCosine() && std::abs(Dot(Subtract(contact.point, floor->point), floor->surfaceNormal)) <= skinWidth;
 						if (footEdge && TryCapsuleTransition(scene, object, body, collider, remaining, contact, *floor, skinWidth + axisEpsilon * 2.0f, true)) return;
 						if (TryCapsuleTransition(scene, object, body, collider, remaining, contact, *floor, body.stepHeight, false)) return;
 					}
-					const bool descending = remaining.y < 0.0f;
-					const bool followSurface = (walkable && (walking || descending)) || (!walkable && contact.surfaceNormal.y > axisEpsilon && descending);
+					const bool descending = remaining.z < 0.0f;
+					const bool followSurface = (walkable && (walking || descending)) || (!walkable && contact.surfaceNormal.z > axisEpsilon && descending);
 					Contact response = contact;
 					if (!followSurface) ConstrainCapsuleContact(body, response, false);
 					const float intoSurface = Dot(remaining, response.normal);
@@ -1202,34 +1202,34 @@ namespace Sapphire {
 					}
 					previousNormal = response.normal;
 					hasPreviousNormal = true;
-					if (!walkable && contact.surfaceNormal.y > axisEpsilon && remaining.y > 0.0f) remaining.y = 0.0f;
-					if (!followSurface || contact.surfaceNormal.y < 0.0f) RemoveIntoSurface(body, response.normal);
+					if (!walkable && contact.surfaceNormal.z > axisEpsilon && remaining.z > 0.0f) remaining.z = 0.0f;
+					if (!followSurface || contact.surfaceNormal.z < 0.0f) RemoveIntoSurface(body, response.normal);
 				}
 			}
 
 			void SimulateCapsule(Scene& scene, Object& object, PhysicsBody& body, Collider& collider, float deltaTime) {
 				ResolveOverlaps( object, body, collider);
 				Contact floor;
-				const bool walking = body.velocity.y <= 0.0f && FindCapsuleFloor(scene, object, collider, floorProbeDistance, floor);
+				const bool walking = body.velocity.z <= 0.0f && FindCapsuleFloor(scene, object, collider, floorProbeDistance, floor);
 				body.grounded = walking;
 				Vector3 displacement;
 				if (walking) {
-					if (body.velocity.y < 0.0f) body.velocity.y = 0.0f;
-					displacement = {body.velocity.x * deltaTime, 0.0f, body.velocity.z * deltaTime};
-					if (floor.surfaceNormal.y > axisEpsilon) displacement.y = -(floor.surfaceNormal.x * displacement.x + floor.surfaceNormal.z * displacement.z) / floor.surfaceNormal.y;
+					if (body.velocity.z < 0.0f) body.velocity.z = 0.0f;
+					displacement = {body.velocity.x * deltaTime, body.velocity.y * deltaTime, 0.0f};
+					if (floor.surfaceNormal.z > axisEpsilon) displacement.z = -(floor.surfaceNormal.x * displacement.x + floor.surfaceNormal.y * displacement.y) / floor.surfaceNormal.z;
 				}
 				else {
 					if (body.useGravity) body.velocity += scene.gravity * deltaTime;
 					displacement = Scale(body.velocity, deltaTime);
 				}
 				MoveCapsuleAndSlide(scene, object, body, collider, displacement, walking ? &floor : nullptr);
-				if (body.velocity.y <= 0.0f) {
+				if (body.velocity.z <= 0.0f) {
 					Contact nextFloor;
 					const float snapDistance = walking ? std::max(floorProbeDistance, body.stepHeight) : floorProbeDistance;
 					if (FindCapsuleFloor(scene, object, collider, snapDistance, nextFloor)) {
-						MoveObject(object, {0.0f, -std::max(0.0f, nextFloor.time * snapDistance - skinWidth), 0.0f});
+						MoveObject(object, {0.0f, 0.0f, -std::max(0.0f, nextFloor.time * snapDistance - skinWidth)});
 						body.grounded = true;
-						body.velocity.y = 0.0f;
+						body.velocity.z = 0.0f;
 					}
 					else body.grounded = false;
 				}
@@ -1385,7 +1385,7 @@ namespace Sapphire {
 					}
 					else MoveObject(object, body.velocity * deltaTime);
 				}
-				if (body.grounded && body.velocity.y < 0.0f) body.velocity.y = 0.0f;
+				if (body.grounded && body.velocity.z < 0.0f) body.velocity.z = 0.0f;
 			}
 			ResolveDynamicPairs();
 		}
