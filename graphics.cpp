@@ -1426,7 +1426,6 @@ namespace Sapphire::Graphics {
 			using CellKey = std::tuple<int, int, int>;
 			std::map<BatchKey, MeshData> batchData;
 			std::map<BatchKey, const Object*> batchOwners;
-			std::map<BatchKey, std::unordered_map<std::uint32_t, std::uint32_t>> vertexMaps;
 			std::vector<Vector3> positions;
 			for (auto* object : scene.ResidentRenderObjects()) {
 				if (!object->renderStatic) continue;
@@ -1434,6 +1433,7 @@ namespace Sapphire::Graphics {
 				if (mesh && mesh->instanced) continue;
 				if (mesh && !IsBatchable(*mesh)) continue;
 				if (!mesh || mesh->data.vertices.empty() || mesh->data.indices.empty()) continue;
+				std::map<BatchKey, std::unordered_map<std::uint32_t, std::uint32_t>> vertexMaps;
 				if (!rebuildAll) {
 					const auto& cells = meshSources.at(object).cells;
 					if (std::none_of(cells.begin(), cells.end(), [&](const CellKey& cell) { return dirtyCells.count(cell); })) continue;

@@ -5,7 +5,10 @@
 #include <cmath>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <memory>
 #include <map>
@@ -13,6 +16,7 @@
 #include <sstream>
 #include <set>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -595,6 +599,7 @@ namespace Sapphire {
 			virtual void FixedUpdate() {}
 			virtual void GUI() {}
 			virtual ~Object() = default;
+			bool LoadS3D(const std::string& fileName);
 
 			void UpdateWorldTransform() {
 				if (parent) parent->UpdateWorldTransform();
@@ -1157,4 +1162,227 @@ namespace Sapphire {
 			WorldPartitioner worldPartitioner;
 	};
 
+	namespace {
+		struct S3DRecord {
+			std::string name;
+			std::uint8_t type;
+			bool parent;
+			Transform transform;
+			MeshData data;
+			std::vector<Material> materials;
+			std::vector<MeshSection> sections;
+			std::vector<Bone> bones;
+			Light light;
+		};
+
+		class S3DReader {
+			std::vector<std::uint8_t> data;
+			std::size_t offset = 0;
+			std::filesystem::path path;
+
+		public:
+			explicit S3DReader(const std::string& fileName) {
+				path = fileName;
+				std::ifstream file(path, std::ios::binary | std::ios::ate);
+				if (!file && path.is_relative()) {
+					const char* base = SDL_GetBasePath();
+					if (base) {
+						path = std::filesystem::path(base) / ".." / "resources" / path;
+						file.clear();
+						file.open(path, std::ios::binary | std::ios::ate);
+					}
+				}
+				if (!file) throw std::runtime_error("Could not open S3D file");
+				const auto length = file.tellg();
+				if (length < 8 || static_cast<std::uint64_t>(length) > std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("Invalid S3D file size");
+				data.resize(static_cast<std::size_t>(length));
+				file.seekg(0);
+				file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
+				if (!file) throw std::runtime_error("Could not read S3D file");
+				path = std::filesystem::absolute(path);
+			}
+
+			template <typename T> T Read() {
+				if (sizeof(T) > data.size() - offset) throw std::runtime_error("Truncated S3D file");
+				if constexpr (std::is_floating_point_v<T>) {
+					static_assert(sizeof(T) == sizeof(std::uint32_t));
+					const std::uint32_t bits = Read<std::uint32_t>();
+					T value;
+					std::memcpy(&value, &bits, sizeof(value));
+					if (!std::isfinite(value)) throw std::runtime_error("Non-finite S3D value");
+					return value;
+				}
+				else {
+					using Unsigned = std::make_unsigned_t<T>;
+					Unsigned value = 0;
+					for (std::size_t index = 0; index < sizeof(T); ++index) value |= static_cast<Unsigned>(data[offset++]) << (index * 8);
+					return static_cast<T>(value);
+				}
+			}
+
+			std::uint32_t Count(std::size_t itemSize) {
+				const auto count = Read<std::uint32_t>();
+				if (itemSize && count > (data.size() - offset) / itemSize) throw std::runtime_error("Invalid S3D count");
+				return count;
+			}
+
+			std::string String() {
+				const auto size = Count(1);
+				std::string value(reinterpret_cast<const char*>(data.data() + offset), size);
+				offset += size;
+				return value;
+			}
+
+			Vector3 Vector() { return {Read<float>(), Read<float>(), Read<float>()}; }
+			Transform TransformValue() { return {Vector(), Vector(), Vector()}; }
+			const std::filesystem::path& FilePath() const { return path; }
+			bool Finished() const { return offset == data.size(); }
+		};
+
+		std::vector<S3DRecord> ReadS3D(const std::string& fileName, std::filesystem::path& filePath) {
+			S3DReader reader(fileName);
+			filePath = reader.FilePath();
+			if (reader.Read<std::uint8_t>() != 'S' || reader.Read<std::uint8_t>() != '3' || reader.Read<std::uint8_t>() != 'D' || reader.Read<std::uint8_t>() != 0) throw std::runtime_error("Invalid S3D signature");
+			const auto objectCount = reader.Count(1);
+			if (!objectCount) throw std::runtime_error("S3D contains no objects");
+			std::vector<S3DRecord> records;
+			records.reserve(objectCount);
+			std::size_t parentCount = 0;
+			for (std::uint32_t objectIndex = 0; objectIndex < objectCount; ++objectIndex) {
+				S3DRecord record{};
+				record.name = reader.String();
+				record.type = reader.Read<std::uint8_t>();
+				record.parent = reader.Read<std::uint8_t>() != 0;
+				parentCount += record.parent;
+				record.transform = reader.TransformValue();
+				if (record.type == 0) {
+					record.data.vertices.resize(reader.Count(48));
+					record.data.indices.resize(reader.Count(4));
+					record.sections.resize(reader.Count(12));
+					record.materials.resize(reader.Count(1));
+					record.bones.resize(reader.Count(1));
+					for (auto& vertex : record.data.vertices) {
+						vertex.position = reader.Vector();
+						vertex.normal = reader.Vector();
+						vertex.uv[0] = reader.Read<float>();
+						vertex.uv[1] = reader.Read<float>();
+						for (float& color : vertex.color) color = reader.Read<float>();
+					}
+					for (auto& index : record.data.indices) index = reader.Read<std::uint32_t>();
+					for (auto& section : record.sections) section = {reader.Read<std::uint32_t>(), reader.Read<std::uint32_t>(), reader.Read<std::uint32_t>()};
+					for (auto& material : record.materials) {
+						material.baseColor = reader.Vector();
+					material.roughness = reader.Read<float>(); material.metallic = reader.Read<float>(); material.normalScale = reader.Read<float>(); material.aoStrength = reader.Read<float>(); material.displacementScale = reader.Read<float>();
+						for (float& value : material.uvScale) value = reader.Read<float>();
+						for (float& value : material.uvOffset) value = reader.Read<float>();
+					material.flipNormalY = reader.Read<std::uint8_t>() != 0; material.transparent = reader.Read<std::uint8_t>() != 0; material.unlit = reader.Read<std::uint8_t>() != 0;
+						material.opacity = reader.Read<float>();
+					std::string* paths[] = {&material.baseTexturePath, &material.normalTexturePath, &material.roughnessTexturePath, &material.aoTexturePath, &material.displacementTexturePath, &material.displacementMaskTexturePath};
+					for (auto* path : paths) *path = reader.String();
+						material.vertexModifierSource = reader.String();
+					}
+					for (auto& bone : record.bones) {
+						bone.name = reader.String();
+					bone.parentIndex = reader.Read<std::int32_t>(); bone.bindTransform = reader.TransformValue();
+					}
+					record.data.skinWeights.resize(reader.Count(16));
+					for (auto& skin : record.data.skinWeights) {
+						for (auto& index : skin.boneIndices) index = reader.Read<std::uint16_t>();
+						for (auto& weight : skin.weights) weight = reader.Read<std::uint16_t>();
+					}
+					record.data.Validate();
+					Mesh validation;
+					validation.data = std::move(record.data);
+					validation.materials = std::move(record.materials);
+					validation.sections = std::move(record.sections);
+					validation.ValidateSections();
+					record.data = std::move(validation.data);
+					record.materials = std::move(validation.materials);
+					record.sections = std::move(validation.sections);
+					if (!record.bones.empty()) {
+						Skeleton skeleton;
+						skeleton.bones = std::move(record.bones);
+						skeleton.Validate();
+						if (!record.data.skinWeights.empty()) record.data.ValidateSkeleton(skeleton);
+						record.bones = std::move(skeleton.bones);
+					}
+					else if (!record.data.skinWeights.empty()) throw std::runtime_error("Skinned mesh has no skeleton");
+				}
+				else if (record.type == 1) {
+					const auto type = reader.Read<std::uint8_t>();
+					if (type > 2) throw std::runtime_error("Invalid S3D light type");
+					record.light.type = static_cast<Light::Type>(type);
+					record.light.color = reader.Vector();
+					record.light.intensity = reader.Read<float>(); record.light.range = reader.Read<float>(); record.light.innerSpotAngle = reader.Read<float>(); record.light.outerSpotAngle = reader.Read<float>();
+					record.light.castShadows = reader.Read<std::uint8_t>() != 0; record.light.shadowBias = reader.Read<float>();
+				}
+				else throw std::runtime_error("Invalid S3D object type");
+				records.push_back(std::move(record));
+			}
+			if (parentCount > 1 || !reader.Finished()) throw std::runtime_error("Invalid S3D structure");
+			return records;
+		}
+	}
+
+	namespace Physics { void EnsureMeshCollider(Object& object); }
+
+	bool Object::LoadS3D(const std::string& fileName) {
+		std::filesystem::path sourcePath;
+		std::vector<S3DRecord> records;
+		try {
+			records = ReadS3D(fileName, sourcePath);
+			for (auto& record : records) for (auto& material : record.materials) {
+				std::string* paths[] = {&material.baseTexturePath, &material.normalTexturePath, &material.roughnessTexturePath, &material.aoTexturePath, &material.displacementTexturePath, &material.displacementMaskTexturePath};
+				for (auto* path : paths) if (!path->empty() && std::filesystem::path(*path).is_relative()) *path = (sourcePath.parent_path() / *path).lexically_normal().string();
+			}
+		}
+		catch (const std::exception&) { return false; }
+		const auto root = std::find_if(records.begin(), records.end(), [](const S3DRecord& record) { return record.parent; });
+		const bool hasParent = root != records.end();
+		const std::size_t rootIndex = hasParent ? static_cast<std::size_t>(root - records.begin()) : 0;
+		if (records.size() > 1 && !scene) return false;
+		std::vector<Object*> objects(records.size());
+		objects[rootIndex] = this;
+		for (std::size_t index = 0; index < records.size(); ++index) {
+			auto& record = records[index];
+			Object* object = objects[index];
+			if (!object) object = &scene->CreateObject<>(record.name);
+			object->name = record.name;
+			object->SetParent(index == rootIndex || !hasParent ? nullptr : objects[rootIndex], false);
+			object->transform.position = record.transform.position;
+			object->transform.rotation = record.transform.rotation;
+			object->transform.scale = record.transform.scale;
+			if (index != rootIndex && hasParent) {
+				object->transform.localPosition = record.transform.position;
+				object->transform.localRotation = record.transform.rotation;
+				object->transform.localScale = record.transform.scale;
+			}
+			if (record.type == 0) {
+				Mesh* mesh = object->GetComponent<Mesh>();
+				if (!mesh) mesh = &object->AddComponent<Mesh>();
+				mesh->data = std::move(record.data);
+				mesh->material = Material{};
+				mesh->materials = std::move(record.materials);
+				mesh->sections = std::move(record.sections);
+				mesh->MarkDirty();
+				Physics::EnsureMeshCollider(*object);
+				if (!record.bones.empty()) {
+					Skeleton* skeleton = object->GetComponent<Skeleton>();
+					if (!skeleton) skeleton = &object->AddComponent<Skeleton>();
+					skeleton->bones = std::move(record.bones);
+					skeleton->InitializePose();
+				}
+			}
+			else {
+				Light* light = object->GetComponent<Light>();
+				if (!light) light = &object->AddComponent<Light>();
+				*light = record.light;
+				light->owner = object;
+				if (light->type == Light::Type::Directional) object->spatiallyLoaded = false;
+			}
+			objects[index] = object;
+		}
+		if (scene) scene->UpdateWorldPartition();
+		return true;
+	}
 }

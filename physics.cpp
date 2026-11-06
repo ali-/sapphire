@@ -47,6 +47,12 @@ namespace Sapphire {
 	};
 
 	namespace Physics {
+		void EnsureMeshCollider(Object& object) {
+			Collider* collider = object.GetComponent<Collider>();
+			if (!collider) collider = &object.AddComponent<Collider>();
+			collider->isMesh = true;
+		}
+
 		namespace {
 			using namespace Math;
 
@@ -1164,6 +1170,8 @@ namespace Sapphire {
 
 			void MoveCapsuleAndSlide(Scene& scene, Object& object, PhysicsBody& body, Collider& collider, Vector3 remaining, const Contact* floor) {
 				const bool walking = floor != nullptr;
+				Vector3 previousNormal;
+				bool hasPreviousNormal = false;
 				for (int iteration = 0; iteration < maxMoveIterations; ++iteration) {
 					const float distance = Length(remaining);
 					if (distance < axisEpsilon) return;
@@ -1182,13 +1190,19 @@ namespace Sapphire {
 						if (TryCapsuleTransition(scene, object, body, collider, remaining, contact, *floor, body.stepHeight, false)) return;
 					}
 					const bool descending = remaining.y < 0.0f;
-					const bool followSurface = (walkable && (walking || descending)) || (!walkable && contact.surfaceNormal.y > 0.0f && descending);
+					const bool followSurface = (walkable && (walking || descending)) || (!walkable && contact.surfaceNormal.y > axisEpsilon && descending);
 					Contact response = contact;
 					if (!followSurface) ConstrainCapsuleContact(body, response, false);
 					const float intoSurface = Dot(remaining, response.normal);
 					if (intoSurface > 0.0f) remaining += Scale(response.normal, -intoSurface);
-					if (!walkable && contact.surfaceNormal.y > 0.0f && remaining.y > 0.0f) remaining.y = 0.0f;
-					if (walking && !walkable && remaining.y > 0.0f) remaining.y = 0.0f;
+					if (hasPreviousNormal && Dot(remaining, previousNormal) > axisEpsilon) {
+						const Vector3 crease = Cross(previousNormal, response.normal);
+						const float lengthSquared = Dot(crease, crease);
+						remaining = lengthSquared > axisEpsilon ? Scale(crease, Dot(remaining, crease) / lengthSquared) : Vector3{};
+					}
+					previousNormal = response.normal;
+					hasPreviousNormal = true;
+					if (!walkable && contact.surfaceNormal.y > axisEpsilon && remaining.y > 0.0f) remaining.y = 0.0f;
 					if (!followSurface || contact.surfaceNormal.y < 0.0f) RemoveIntoSurface(body, response.normal);
 				}
 			}
