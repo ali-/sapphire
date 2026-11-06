@@ -178,7 +178,12 @@ namespace Sapphire::GUI {
 		pipelineInfo.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
 		pipelineInfo.target_info.num_color_targets = 1;
 		pipelineInfo.target_info.color_target_descriptions = &colorTarget;
-		pipeline = Graphics::CreatePipeline(gpuDevice, pipelineInfo);
+		try { pipeline = Graphics::CreatePipeline(gpuDevice, pipelineInfo); }
+		catch (...) {
+			SDL_ReleaseGPUShader(gpuDevice, vertexShader);
+			SDL_ReleaseGPUShader(gpuDevice, fragmentShader);
+			throw;
+		}
 		SDL_ReleaseGPUShader(gpuDevice, vertexShader);
 		SDL_ReleaseGPUShader(gpuDevice, fragmentShader);
 
@@ -250,9 +255,11 @@ namespace Sapphire::GUI {
 		const Uint32 vertexBytes = static_cast<Uint32>(vertices.size() * sizeof(Vertex));
 		if (!vertexTransferBuffer) vertexTransferBuffer = Graphics::CreateTransferBuffer(gpuDevice, static_cast<Uint32>(maxVertices * sizeof(Vertex)));
 		void* mappedVertices = SDL_MapGPUTransferBuffer(gpuDevice, vertexTransferBuffer, true);
+		if (!mappedVertices) throw std::runtime_error(std::string("Map GUI vertex transfer buffer: ") + SDL_GetError());
 		std::memcpy(mappedVertices, vertices.data(), vertexBytes);
 		SDL_UnmapGPUTransferBuffer(gpuDevice, vertexTransferBuffer);
 		SDL_GPUCopyPass* copyPass = SDL_BeginGPUCopyPass(commandBuffer);
+		if (!copyPass) throw std::runtime_error(std::string("Begin GUI copy pass: ") + SDL_GetError());
 		SDL_GPUTransferBufferLocation source{};
 		source.transfer_buffer = vertexTransferBuffer;
 		SDL_GPUBufferRegion destination{};
@@ -267,6 +274,7 @@ namespace Sapphire::GUI {
 		colorInfo.load_op = SDL_GPU_LOADOP_LOAD;
 		colorInfo.store_op = SDL_GPU_STOREOP_STORE;
 		SDL_GPURenderPass* renderPass = SDL_BeginGPURenderPass(commandBuffer, &colorInfo, 1, nullptr);
+		if (!renderPass) throw std::runtime_error(std::string("Begin GUI render pass: ") + SDL_GetError());
 		SDL_GPUBufferBinding vertexBinding{};
 		vertexBinding.buffer = vertexBuffer;
 		SDL_BindGPUVertexBuffers(renderPass, 0, &vertexBinding, 1);

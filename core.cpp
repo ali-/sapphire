@@ -5,6 +5,10 @@
 #include <cmath>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <deque>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <memory>
 #include <map>
@@ -12,6 +16,7 @@
 #include <sstream>
 #include <set>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -64,11 +69,16 @@ namespace Sapphire {
 		Vector3 position;
 		Vector3 rotation;
 		Vector3 scale{1.0f, 1.0f, 1.0f};
+		Vector3 localPosition;
+		Vector3 localRotation;
+		Vector3 localScale{1.0f, 1.0f, 1.0f};
 
 		Vector3 Forward() const {
-			const float yaw = rotation.y * Math::degreesToRadians;
 			const float pitch = rotation.x * Math::degreesToRadians;
-			return {std::sin(yaw) * std::cos(pitch), -std::sin(pitch), std::cos(yaw) * std::cos(pitch)};
+			const float roll = rotation.y * Math::degreesToRadians;
+			const float yaw = rotation.z * Math::degreesToRadians;
+			const float cosinePitch = std::cos(pitch), sinePitch = std::sin(pitch), cosineRoll = std::cos(roll), sineRoll = std::sin(roll), cosineYaw = std::cos(yaw), sineYaw = std::sin(yaw);
+			return {sineYaw * cosinePitch - cosineYaw * sineRoll * sinePitch, -sineYaw * sineRoll * sinePitch - cosineYaw * cosinePitch, -cosineRoll * sinePitch};
 		}
 	};
 
@@ -115,6 +125,42 @@ namespace Sapphire {
 			axes[2] = {cz * sy * cx + sz * sx, sz * sy * cx - cz * sx, cy * cx};
 		}
 
+		Vector3 ComposeRotation(const Vector3& parent, const Vector3& local) {
+			Vector3 parentAxes[3];
+			Vector3 localAxes[3];
+			Transform parentTransform;
+			Transform localTransform;
+			parentTransform.rotation = parent;
+			localTransform.rotation = local;
+			GetAxes(parentTransform, parentAxes);
+			GetAxes(localTransform, localAxes);
+			Vector3 axes[3];
+			for (int index = 0; index < 3; ++index) axes[index] = Add(Scale(parentAxes[0], localAxes[index].x), Add(Scale(parentAxes[1], localAxes[index].y), Scale(parentAxes[2], localAxes[index].z)));
+			const float roll = std::asin(std::clamp(-axes[0].z, -1.0f, 1.0f));
+			const float cosineRoll = std::cos(roll);
+			const float pitch = std::abs(cosineRoll) > 0.0001f ? std::atan2(axes[1].z, axes[2].z) : std::atan2(-axes[2].y, axes[1].y);
+			const float yaw = std::abs(cosineRoll) > 0.0001f ? std::atan2(axes[0].y, axes[0].x) : 0.0f;
+			return {pitch / degreesToRadians, roll / degreesToRadians, yaw / degreesToRadians};
+		}
+
+		Vector3 RelativeRotation(const Vector3& parent, const Vector3& world) {
+			Vector3 parentAxes[3];
+			Vector3 worldAxes[3];
+			Transform parentTransform;
+			Transform worldTransform;
+			parentTransform.rotation = parent;
+			worldTransform.rotation = world;
+			GetAxes(parentTransform, parentAxes);
+			GetAxes(worldTransform, worldAxes);
+			Vector3 localAxes[3];
+			for (int index = 0; index < 3; ++index) localAxes[index] = {Dot(parentAxes[0], worldAxes[index]), Dot(parentAxes[1], worldAxes[index]), Dot(parentAxes[2], worldAxes[index])};
+			const float roll = std::asin(std::clamp(-localAxes[0].z, -1.0f, 1.0f));
+			const float cosineRoll = std::cos(roll);
+			const float pitch = std::abs(cosineRoll) > 0.0001f ? std::atan2(localAxes[1].z, localAxes[2].z) : std::atan2(-localAxes[2].y, localAxes[1].y);
+			const float yaw = std::abs(cosineRoll) > 0.0001f ? std::atan2(localAxes[0].y, localAxes[0].x) : 0.0f;
+			return {pitch / degreesToRadians, roll / degreesToRadians, yaw / degreesToRadians};
+		}
+
 		Matrix4 Identity() {
 			Matrix4 matrix{};
 			matrix.values[0] = 1.0f;
@@ -134,9 +180,7 @@ namespace Sapphire {
 			return result;
 		}
 
-		Matrix4 Model(const Transform& transform) {
-			Vector3 axes[3];
-			GetAxes(transform, axes);
+		Matrix4 Model(const Transform& transform, const Vector3* axes) {
 			Matrix4 matrix = Identity();
 			const float scale[3] = {transform.scale.x, transform.scale.y, transform.scale.z};
 			for (int axis = 0; axis < 3; ++axis) {
@@ -150,7 +194,13 @@ namespace Sapphire {
 			return matrix;
 		}
 
-		Matrix4 NormalMatrix(const Transform& transform) {
+		Matrix4 Model(const Transform& transform) {
+			Vector3 axes[3];
+			GetAxes(transform, axes);
+			return Model(transform, axes);
+		}
+
+		Matrix4 NormalMatrix(const Transform& transform, const Vector3* axes) {
 			Transform normalTransform = transform;
 			normalTransform.position = {};
 			normalTransform.scale = {
@@ -158,7 +208,13 @@ namespace Sapphire {
 				std::abs(transform.scale.y) > 0.0001f ? 1.0f / transform.scale.y : 0.0f,
 				std::abs(transform.scale.z) > 0.0001f ? 1.0f / transform.scale.z : 0.0f
 			};
-			return Model(normalTransform);
+			return Model(normalTransform, axes);
+		}
+
+		Matrix4 NormalMatrix(const Transform& transform) {
+			Vector3 axes[3];
+			GetAxes(transform, axes);
+			return NormalMatrix(transform, axes);
 		}
 
 		Vector3 TransformNormal(const Matrix4& normal, const Vector3& value) {
@@ -238,11 +294,9 @@ namespace Sapphire {
 
 	class Camera : public Component {
 		public:
-			Vector3 localPosition;
-			Vector3 localRotation;
 			float fieldOfView = 60.0f;
-			float nearClip = 0.1f;
-			float farClip = 1000.0f;
+			float near = 0.1f;
+			float far = 1000.0f;
 	};
 
 	class Light : public Component {
@@ -259,6 +313,141 @@ namespace Sapphire {
 			float shadowBias = 0.02f;
 	};
 
+	struct Bone {
+		std::string name;
+		std::int32_t parentIndex = -1;
+		Transform bindTransform;
+		Transform poseTransform;
+	};
+
+	class Skeleton : public Component {
+		public:
+			std::vector<Bone> bones;
+			std::uint64_t poseRevision = 1;
+
+			void Validate() const {
+				if (bones.size() > static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()) + 1) throw std::length_error("Skeleton bone count exceeds supported range");
+				for (std::size_t index = 0; index < bones.size(); ++index) {
+					const Bone& bone = bones[index];
+					if (bone.parentIndex < -1 || bone.parentIndex >= static_cast<std::int32_t>(bones.size()) || bone.parentIndex == static_cast<std::int32_t>(index)) throw std::out_of_range("Skeleton bone parent index is invalid");
+					auto validateTransform = [](const Transform& transform) {
+						if (!std::isfinite(transform.position.x) || !std::isfinite(transform.position.y) || !std::isfinite(transform.position.z) || !std::isfinite(transform.rotation.x) || !std::isfinite(transform.rotation.y) || !std::isfinite(transform.rotation.z) || !std::isfinite(transform.scale.x) || !std::isfinite(transform.scale.y) || !std::isfinite(transform.scale.z)) throw std::invalid_argument("Skeleton transform must be finite");
+					};
+					validateTransform(bone.bindTransform);
+					validateTransform(bone.poseTransform);
+				}
+				std::vector<std::uint8_t> states(bones.size());
+				for (std::size_t index = 0; index < bones.size(); ++index) {
+					std::size_t current = index;
+					while (states[current] == 0) {
+						states[current] = 1;
+						const std::int32_t parentIndex = bones[current].parentIndex;
+						if (parentIndex < 0 || states[parentIndex] == 2) break;
+						if (states[parentIndex] == 1) throw std::invalid_argument("Skeleton hierarchy contains a cycle");
+						current = static_cast<std::size_t>(parentIndex);
+					}
+					current = index;
+					while (states[current] == 1) {
+						states[current] = 2;
+						const std::int32_t parentIndex = bones[current].parentIndex;
+						if (parentIndex < 0) break;
+						current = static_cast<std::size_t>(parentIndex);
+					}
+				}
+			}
+
+			void InitializePose() {
+				for (auto& bone : bones) bone.poseTransform = bone.bindTransform;
+				bindMatrices.clear();
+				inverseBindMatrices.clear();
+				poseGlobalMatrices.clear();
+				poseMatrices.clear();
+				++poseRevision;
+			}
+
+			void MarkPoseDirty() { ++poseRevision; }
+			void SetPoseTransform(std::size_t boneIndex, const Transform& transform) { bones.at(boneIndex).poseTransform = transform; MarkPoseDirty(); }
+
+			const std::vector<Math::Matrix4>& PoseMatrices() {
+				if (cachedPoseRevision == poseRevision) return poseMatrices;
+				Validate();
+				auto buildMatrices = [&](bool bindPose) {
+					std::vector<Math::Matrix4> matrices(bones.size());
+					std::vector<std::uint8_t> complete(bones.size());
+					std::vector<std::size_t> path;
+					for (std::size_t index = 0; index < bones.size(); ++index) {
+						if (complete[index]) continue;
+						path.clear();
+						std::size_t current = index;
+						while (!complete[current]) {
+							path.push_back(current);
+							const std::int32_t parentIndex = bones[current].parentIndex;
+							if (parentIndex < 0) break;
+							current = static_cast<std::size_t>(parentIndex);
+						}
+						for (auto boneIndex = path.rbegin(); boneIndex != path.rend(); ++boneIndex) {
+							const Bone& bone = bones[*boneIndex];
+							const Transform& transform = bindPose ? bone.bindTransform : bone.poseTransform;
+							const Math::Matrix4 local = Math::Model(transform);
+							matrices[*boneIndex] = bone.parentIndex < 0 ? local : Math::Multiply(matrices[bone.parentIndex], local);
+							complete[*boneIndex] = 1;
+						}
+					}
+					return matrices;
+				};
+				if (bindMatrices.size() != bones.size()) bindMatrices = buildMatrices(true);
+				if (inverseBindMatrices.size() != bones.size()) {
+					inverseBindMatrices.resize(bones.size());
+					for (std::size_t index = 0; index < bones.size(); ++index) inverseBindMatrices[index] = InverseAffine(bindMatrices[index]);
+				}
+				const auto poseGlobals = buildMatrices(false);
+				poseGlobalMatrices = poseGlobals;
+				poseMatrices.resize(bones.size());
+				for (std::size_t index = 0; index < bones.size(); ++index) poseMatrices[index] = Math::Multiply(poseGlobals[index], inverseBindMatrices[index]);
+				cachedPoseRevision = poseRevision;
+				return poseMatrices;
+			}
+
+			const std::vector<Math::Matrix4>& InverseBindMatrices() { PoseMatrices(); return inverseBindMatrices; }
+			const std::vector<Math::Matrix4>& PoseGlobalMatrices() { PoseMatrices(); return poseGlobalMatrices; }
+
+		private:
+			std::vector<Math::Matrix4> bindMatrices;
+			std::vector<Math::Matrix4> inverseBindMatrices;
+			std::vector<Math::Matrix4> poseGlobalMatrices;
+			std::vector<Math::Matrix4> poseMatrices;
+			std::uint64_t cachedPoseRevision = 0;
+
+			static Math::Matrix4 InverseAffine(const Math::Matrix4& matrix) {
+				const float a00 = matrix.values[0], a01 = matrix.values[4], a02 = matrix.values[8];
+				const float a10 = matrix.values[1], a11 = matrix.values[5], a12 = matrix.values[9];
+				const float a20 = matrix.values[2], a21 = matrix.values[6], a22 = matrix.values[10];
+				const float determinant = a00 * (a11 * a22 - a12 * a21) - a01 * (a10 * a22 - a12 * a20) + a02 * (a10 * a21 - a11 * a20);
+				if (!std::isfinite(determinant) || std::abs(determinant) < 0.000001f) throw std::invalid_argument("Skeleton bind transform is not invertible");
+				const float inverseDeterminant = 1.0f / determinant;
+				Math::Matrix4 inverse = Math::Identity();
+				inverse.values[0] = (a11 * a22 - a12 * a21) * inverseDeterminant;
+				inverse.values[4] = (a02 * a21 - a01 * a22) * inverseDeterminant;
+				inverse.values[8] = (a01 * a12 - a02 * a11) * inverseDeterminant;
+				inverse.values[1] = (a12 * a20 - a10 * a22) * inverseDeterminant;
+				inverse.values[5] = (a00 * a22 - a02 * a20) * inverseDeterminant;
+				inverse.values[9] = (a02 * a10 - a00 * a12) * inverseDeterminant;
+				inverse.values[2] = (a10 * a21 - a11 * a20) * inverseDeterminant;
+				inverse.values[6] = (a01 * a20 - a00 * a21) * inverseDeterminant;
+				inverse.values[10] = (a00 * a11 - a01 * a10) * inverseDeterminant;
+				const Vector3 translation{matrix.values[12], matrix.values[13], matrix.values[14]};
+				inverse.values[12] = -(inverse.values[0] * translation.x + inverse.values[4] * translation.y + inverse.values[8] * translation.z);
+				inverse.values[13] = -(inverse.values[1] * translation.x + inverse.values[5] * translation.y + inverse.values[9] * translation.z);
+				inverse.values[14] = -(inverse.values[2] * translation.x + inverse.values[6] * translation.y + inverse.values[10] * translation.z);
+				return inverse;
+			}
+	};
+
+	struct SkinInfluence {
+		std::uint16_t boneIndices[4]{};
+		std::uint16_t weights[4]{};
+	};
+
 	struct MeshVertex {
 		Vector3 position;
 		Vector3 normal;
@@ -269,11 +458,24 @@ namespace Sapphire {
 	struct MeshData {
 		std::vector<MeshVertex> vertices;
 		std::vector<std::uint32_t> indices;
+		std::vector<SkinInfluence> skinWeights;
 
 		void Validate() const {
-			if (vertices.size() > std::numeric_limits<std::uint32_t>::max() / sizeof(MeshVertex) || indices.size() > std::numeric_limits<std::uint32_t>::max() / sizeof(std::uint32_t)) throw std::length_error("Mesh exceeds GPU buffer size");
+			if (vertices.size() > std::numeric_limits<std::uint32_t>::max() / sizeof(MeshVertex) || indices.size() > std::numeric_limits<std::uint32_t>::max() / sizeof(std::uint32_t) || skinWeights.size() > std::numeric_limits<std::uint32_t>::max() / sizeof(SkinInfluence)) throw std::length_error("Mesh exceeds GPU buffer size");
+			if (!skinWeights.empty() && skinWeights.size() != vertices.size()) throw std::invalid_argument("Mesh skin weights must match vertex count");
 			for (const auto& vertex : vertices) if (!std::isfinite(vertex.position.x) || !std::isfinite(vertex.position.y) || !std::isfinite(vertex.position.z)) throw std::invalid_argument("Mesh position must be finite");
 			for (auto index : indices) if (index >= vertices.size()) throw std::out_of_range("Mesh index exceeds vertex count");
+			for (const auto& skin : skinWeights) {
+				const std::uint32_t weightSum = skin.weights[0] + skin.weights[1] + skin.weights[2] + skin.weights[3];
+				if (weightSum != std::numeric_limits<std::uint16_t>::max()) throw std::invalid_argument("Mesh skin weights must be normalized");
+			}
+		}
+
+		void ValidateSkeleton(const Skeleton& skeleton) const {
+			if (skinWeights.empty()) return;
+			skeleton.Validate();
+			if (skeleton.bones.empty()) throw std::invalid_argument("Skinned meshes require a skeleton with bones");
+			for (const auto& skin : skinWeights) for (const auto boneIndex : skin.boneIndices) if (boneIndex >= skeleton.bones.size()) throw std::out_of_range("Mesh skin weight references an invalid bone");
 		}
 	};
 
@@ -285,6 +487,7 @@ namespace Sapphire {
 		std::string aoTexturePath;
 		std::string displacementTexturePath;
 		std::string displacementMaskTexturePath;
+		std::string vertexModifierSource;
 		float roughness = 1.0f;
 		float metallic = 0.0f;
 		float normalScale = 1.0f;
@@ -298,18 +501,24 @@ namespace Sapphire {
 		float opacity = 1.0f;
 
 		auto Key() const {
-			return std::tie(baseTexturePath, normalTexturePath, roughnessTexturePath, aoTexturePath, displacementTexturePath, displacementMaskTexturePath, baseColor.x, baseColor.y, baseColor.z, roughness, metallic, normalScale, aoStrength, displacementScale, uvScale[0], uvScale[1], uvOffset[0], uvOffset[1], flipNormalY, transparent, unlit, opacity);
+			return std::tie(baseTexturePath, normalTexturePath, roughnessTexturePath, aoTexturePath, displacementTexturePath, displacementMaskTexturePath, vertexModifierSource, baseColor.x, baseColor.y, baseColor.z, roughness, metallic, normalScale, aoStrength, displacementScale, uvScale[0], uvScale[1], uvOffset[0], uvOffset[1], flipNormalY, transparent, unlit, opacity);
 		}
 
 		bool operator<(const Material& other) const { return Key() < other.Key(); }
 
 	};
 
+	struct MeshSection {
+		std::uint32_t firstIndex = 0;
+		std::uint32_t indexCount = 0;
+		std::uint32_t materialIndex = 0;
+	};
+
 	struct MeshInstance {
 		Vector3 position;
 		Vector3 rotation;
 		Vector3 scale{1.0f, 1.0f, 1.0f};
-		float variation = 0.0f;
+		float customData = 0.0f;
 	};
 
 	class Mesh : public Component {
@@ -318,11 +527,43 @@ namespace Sapphire {
 			std::vector<MeshInstance> instances;
 			bool instanced = false;
 			Material material;
+			std::vector<Material> materials;
+			std::vector<MeshSection> sections;
 			bool cullBackfaces = true;
 			bool castShadows = true;
-			bool windAnimated = false;
+			Vector3 vertexBoundsPadding{};
+			bool vertexAnimated = false;
 			std::uint64_t revision = 0;
+			std::uint64_t instanceRevision = 0;
+			bool IsSkinned() const { return !data.skinWeights.empty(); }
+			std::size_t MaterialCount() const { return materials.empty() ? 1 : materials.size(); }
+			const Material& GetMaterial(std::size_t index) const { return materials.empty() ? material : materials.at(index); }
+			std::size_t SectionCount() const { return sections.empty() ? (data.indices.empty() ? 0 : 1) : sections.size(); }
+			MeshSection GetSection(std::size_t index) const { return sections.empty() ? MeshSection{0, static_cast<std::uint32_t>(data.indices.size()), 0} : sections.at(index); }
+			std::uint32_t MaterialIndexAt(std::size_t index) const {
+				if (sections.empty()) return 0;
+				auto section = std::upper_bound(sections.begin(), sections.end(), index, [](std::size_t position, const MeshSection& value) { return position < value.firstIndex; });
+				return section == sections.begin() ? 0 : (section - 1)->materialIndex;
+			}
+			void ValidateSections() const {
+				if (materials.size() > std::numeric_limits<std::uint32_t>::max()) throw std::length_error("Mesh material count exceeds supported range");
+				if (materials.size() > 1 && sections.empty()) throw std::invalid_argument("Meshes with multiple materials require sections");
+				std::size_t nextIndex = 0;
+				for (const auto& section : sections) {
+					if (section.firstIndex != nextIndex || section.indexCount == 0 || section.indexCount % 3 != 0 || static_cast<std::size_t>(section.firstIndex) + section.indexCount > data.indices.size()) throw std::invalid_argument("Mesh sections must cover contiguous triangle index ranges");
+					if (section.materialIndex >= MaterialCount()) throw std::out_of_range("Mesh section material index is invalid");
+					nextIndex += section.indexCount;
+				}
+				if (!sections.empty() && nextIndex != data.indices.size()) throw std::invalid_argument("Mesh sections must cover all mesh indices");
+			}
+			void Validate() const {
+				data.Validate();
+				ValidateSections();
+				if (IsSkinned() && instanced) throw std::invalid_argument("Skinned meshes cannot be instanced");
+			}
+			void ValidateSkeleton(const Skeleton& skeleton) const { data.ValidateSkeleton(skeleton); }
 			void MarkDirty() { ++revision; }
+			void MarkInstancesDirty() { ++instanceRevision; }
 			static MeshData Cube();
 			static MeshData Plane(int subdivisions = 1);
 	};
@@ -331,10 +572,12 @@ namespace Sapphire {
 		std::uint64_t revision = 0;
 		const MeshVertex* vertices = nullptr;
 		const std::uint32_t* indices = nullptr;
+			const SkinInfluence* skinWeights = nullptr;
 		std::size_t vertexCount = 0;
 		std::size_t indexCount = 0;
-		bool Matches(const Mesh& mesh) const { return revision == mesh.revision && vertices == mesh.data.vertices.data() && indices == mesh.data.indices.data() && vertexCount == mesh.data.vertices.size() && indexCount == mesh.data.indices.size(); }
-		void Set(const Mesh& mesh) { revision = mesh.revision; vertices = mesh.data.vertices.data(); indices = mesh.data.indices.data(); vertexCount = mesh.data.vertices.size(); indexCount = mesh.data.indices.size(); }
+			std::size_t skinWeightCount = 0;
+			bool Matches(const Mesh& mesh) const { return revision == mesh.revision && vertices == mesh.data.vertices.data() && indices == mesh.data.indices.data() && skinWeights == mesh.data.skinWeights.data() && vertexCount == mesh.data.vertices.size() && indexCount == mesh.data.indices.size() && skinWeightCount == mesh.data.skinWeights.size(); }
+			void Set(const Mesh& mesh) { revision = mesh.revision; vertices = mesh.data.vertices.data(); indices = mesh.data.indices.data(); skinWeights = mesh.data.skinWeights.data(); vertexCount = mesh.data.vertices.size(); indexCount = mesh.data.indices.size(); skinWeightCount = mesh.data.skinWeights.size(); }
 	};
 
 	class Object {
@@ -347,13 +590,112 @@ namespace Sapphire {
 			bool spatiallyLoaded = true;
 			bool worldPartitionedMesh = false;
 			bool worldPartitionCell = false;
+			bool initializedForApp = true;
 			Object* worldPartitionSourceObject = nullptr;
+			std::uint64_t transformGeneration = 0;
 			explicit Object(std::string name) : name(std::move(name)) {}
 			virtual void Initialize() {}
 			virtual void Update() {}
 			virtual void FixedUpdate() {}
 			virtual void GUI() {}
 			virtual ~Object() = default;
+			bool LoadS3D(const std::string& fileName);
+
+			void UpdateWorldTransform() {
+				if (parent) parent->UpdateWorldTransform();
+				ApplyWorldTransform();
+			}
+
+			void UpdateWorldTransformSubtree() {
+				UpdateWorldTransform();
+				UpdateDescendantWorldTransforms();
+			}
+
+			bool HasChildren() const { return !children.empty(); }
+
+			void ApplyWorldTransform() {
+				if (!parent) {
+					transform.localPosition = transform.position;
+					transform.localRotation = transform.rotation;
+					transform.localScale = transform.scale;
+					return;
+				}
+				Vector3 axes[3];
+				Math::GetAxes(parent->transform, axes);
+				transform.position = Math::Add(parent->transform.position, Math::Add(Math::Scale(axes[0], transform.localPosition.x * parent->transform.scale.x), Math::Add(Math::Scale(axes[1], transform.localPosition.y * parent->transform.scale.y), Math::Scale(axes[2], transform.localPosition.z * parent->transform.scale.z))));
+				transform.rotation = Math::ComposeRotation(parent->transform.rotation, transform.localRotation);
+				transform.scale = {parent->transform.scale.x * transform.localScale.x, parent->transform.scale.y * transform.localScale.y, parent->transform.scale.z * transform.localScale.z};
+			}
+
+			void UpdateDescendantWorldTransforms() {
+				for (Object* child : children) {
+					child->ApplyWorldTransform();
+					child->UpdateDescendantWorldTransforms();
+				}
+			}
+
+			void UpdateWorldTransform(std::uint64_t generation) {
+				if (transformGeneration == generation) return;
+				if (parent) parent->UpdateWorldTransform(generation);
+				ApplyWorldTransform();
+				transformGeneration = generation;
+			}
+
+			void SetWorldPosition(const Vector3& position) {
+				transform.position = position;
+				if (!parent) {
+					UpdateDescendantWorldTransforms();
+					return;
+				}
+				parent->UpdateWorldTransform();
+				Vector3 axes[3];
+				Math::GetAxes(parent->transform, axes);
+				const Vector3 offset = Math::Subtract(position, parent->transform.position);
+				transform.localPosition = {std::abs(parent->transform.scale.x) > 0.0001f ? Math::Dot(offset, axes[0]) / parent->transform.scale.x : 0.0f, std::abs(parent->transform.scale.y) > 0.0001f ? Math::Dot(offset, axes[1]) / parent->transform.scale.y : 0.0f, std::abs(parent->transform.scale.z) > 0.0001f ? Math::Dot(offset, axes[2]) / parent->transform.scale.z : 0.0f};
+				UpdateDescendantWorldTransforms();
+			}
+
+			void SetWorldRotation(const Vector3& rotation) {
+				transform.rotation = rotation;
+				if (parent) parent->UpdateWorldTransform();
+				transform.localRotation = parent ? Math::RelativeRotation(parent->transform.rotation, rotation) : rotation;
+				UpdateDescendantWorldTransforms();
+			}
+
+			void SetWorldScale(const Vector3& scale) {
+				transform.scale = scale;
+				if (parent) parent->UpdateWorldTransform();
+				transform.localScale = parent ? Vector3{std::abs(parent->transform.scale.x) > 0.0001f ? scale.x / parent->transform.scale.x : 0.0f, std::abs(parent->transform.scale.y) > 0.0001f ? scale.y / parent->transform.scale.y : 0.0f, std::abs(parent->transform.scale.z) > 0.0001f ? scale.z / parent->transform.scale.z : 0.0f} : scale;
+				UpdateDescendantWorldTransforms();
+			}
+
+			void SetParent(Object* nextParent, bool worldPositionStays = true) {
+				if (parent == nextParent) return;
+				for (Object* ancestor = nextParent; ancestor; ancestor = ancestor->parent) if (ancestor == this) throw std::invalid_argument("Object cannot be parented to itself or a descendant");
+				const Vector3 worldPosition = transform.position;
+				const Vector3 worldRotation = transform.rotation;
+				const Vector3 worldScale = transform.scale;
+				if (parent) {
+					auto& siblings = parent->children;
+					siblings.erase(std::remove(siblings.begin(), siblings.end(), this), siblings.end());
+				}
+				parent = nextParent;
+				if (parent) parent->children.push_back(this);
+				if (worldPositionStays) {
+					SetWorldPosition(worldPosition);
+					SetWorldRotation(worldRotation);
+					SetWorldScale(worldScale);
+				}
+				else {
+					if (!parent) {
+						transform.position = transform.localPosition;
+						transform.rotation = transform.localRotation;
+						transform.scale = transform.localScale;
+					}
+					UpdateWorldTransform();
+					UpdateDescendantWorldTransforms();
+				}
+			}
 
 			template <typename T>
 			T& AddComponent() {
@@ -391,6 +733,7 @@ namespace Sapphire {
 			std::vector<std::unique_ptr<Component>> components;
 			std::vector<std::pair<const void*, Component*>> componentCache;
 			std::unordered_map<std::string, std::any> properties;
+			std::vector<Object*> children;
 	};
 
 	class WorldPartitioner {
@@ -403,17 +746,36 @@ namespace Sapphire {
 		std::vector<Object*> residentRenderObjects;
 		std::vector<CellKey> residentCells;
 		std::set<CellKey> residentCellKeys;
-		std::vector<CellKey> pendingCellLoads;
-		std::vector<CellKey> pendingCellUnloads;
+		std::deque<CellKey> pendingCellLoads;
+		std::deque<CellKey> pendingCellUnloads;
 		std::set<Object*> residentDynamicObjects;
 		std::vector<std::unique_ptr<Object>> cellsData;
+		struct SourceSnapshot {
+			Object* object;
+			Transform transform;
+			Mesh* mesh;
+			MeshRevision revision;
+			Material material;
+			std::vector<Material> materials;
+			std::vector<MeshSection> sections;
+			bool renderStatic;
+			bool spatiallyLoaded;
+			bool instanced;
+			bool cullBackfaces;
+			bool castShadows;
+			Vector3 padding;
+			bool animated;
+		};
+		std::vector<SourceSnapshot> sources;
 		int partitionSize = 0;
 		float loadingRange = 0.0f;
 		CellKey sourceCell{};
+		Vector3 sourceForward{};
 		bool initialized = false;
 		bool dirty = true;
 		bool hasCellSelection = false;
 		bool initialCellLoadComplete = false;
+		bool streamLoadNext = true;
 		std::chrono::steady_clock::time_point nextCellStreamTime{};
 
 		static CellKey Key(const Vector3& position, int size) {
@@ -423,15 +785,12 @@ namespace Sapphire {
 		static void IncludeBounds(std::map<CellKey, Math::Bounds>& boundsByCell, const CellKey& key, const Vector3& point) {
 			auto [entry, inserted] = boundsByCell.try_emplace(key, Math::Bounds{point, point});
 			if (inserted) return;
-			entry->second.minimum.x = std::min(entry->second.minimum.x, point.x);
-			entry->second.minimum.y = std::min(entry->second.minimum.y, point.y);
-			entry->second.minimum.z = std::min(entry->second.minimum.z, point.z);
-			entry->second.maximum.x = std::max(entry->second.maximum.x, point.x);
-			entry->second.maximum.y = std::max(entry->second.maximum.y, point.y);
-			entry->second.maximum.z = std::max(entry->second.maximum.z, point.z);
+			Math::Include(entry->second, point);
 		}
 
 		void Rebuild(const std::vector<std::unique_ptr<Object>>& objects, int size) {
+			const auto previousResidentCells = residentCells;
+			const bool hadSelection = hasCellSelection;
 			cells.clear();
 			cellBounds.clear();
 			alwaysResidentObjects.clear();
@@ -444,10 +803,23 @@ namespace Sapphire {
 			pendingCellUnloads.clear();
 			residentDynamicObjects.clear();
 			cellsData.clear();
+			sources.clear();
 			partitionSize = size;
 			for (const auto& object : objects) {
+				if (!object->initializedForApp) continue;
 				object->worldPartitionedMesh = false;
 				Mesh* mesh = object->GetComponent<Mesh>();
+				SourceSnapshot snapshot{object.get(), object->transform, mesh, {}, mesh ? mesh->material : Material{}, mesh ? mesh->materials : std::vector<Material>{}, mesh ? mesh->sections : std::vector<MeshSection>{}, object->renderStatic, object->spatiallyLoaded, mesh && mesh->instanced, mesh && mesh->cullBackfaces, mesh && mesh->castShadows, mesh ? mesh->vertexBoundsPadding : Vector3{}, mesh && mesh->vertexAnimated};
+				if (mesh) {
+					mesh->Validate();
+					if (mesh->IsSkinned()) {
+						Skeleton* skeleton = object->GetComponent<Skeleton>();
+						if (!skeleton) throw std::invalid_argument("Skinned meshes require a skeleton on the same object");
+						mesh->ValidateSkeleton(*skeleton);
+					}
+					snapshot.revision.Set(*mesh);
+				}
+				sources.push_back(std::move(snapshot));
 				if (!object->spatiallyLoaded) {
 					alwaysResidentObjects.push_back(object.get());
 					continue;
@@ -456,7 +828,7 @@ namespace Sapphire {
 					dynamicObjects.push_back(object.get());
 					continue;
 				}
-				if (!mesh || mesh->instanced || mesh->data.indices.size() < 3 || mesh->data.vertices.empty()) {
+				if (!mesh || mesh->instanced || mesh->IsSkinned() || mesh->data.indices.size() < 3 || mesh->data.vertices.empty()) {
 					const CellKey key = Key(object->transform.position, size);
 					cells[key].push_back(object.get());
 					IncludeBounds(cellBounds, key, object->transform.position);
@@ -465,6 +837,7 @@ namespace Sapphire {
 				using VertexMap = std::unordered_map<std::uint32_t, std::uint32_t>;
 				std::map<CellKey, MeshData> cellMeshes;
 				std::map<CellKey, VertexMap> cellVertices;
+				std::map<CellKey, std::vector<MeshSection>> cellSections;
 				std::map<CellKey, Math::Bounds> cellMeshBounds;
 				const Math::Matrix4 model = Math::Model(object->transform);
 				for (std::size_t index = 0; index + 2 < mesh->data.indices.size(); index += 3) {
@@ -478,12 +851,16 @@ namespace Sapphire {
 					IncludeBounds(cellMeshBounds, key, b);
 					IncludeBounds(cellMeshBounds, key, c);
 					MeshData& cellMesh = cellMeshes[key];
+					const std::uint32_t materialIndex = mesh->MaterialIndexAt(index);
+					auto& sections = cellSections[key];
+					if (sections.empty() || sections.back().materialIndex != materialIndex) sections.push_back({static_cast<std::uint32_t>(cellMesh.indices.size()), 0, materialIndex});
 					VertexMap& vertices = cellVertices[key];
 					for (const auto sourceIndex : sourceIndices) {
 						auto [entry, inserted] = vertices.try_emplace(sourceIndex, static_cast<std::uint32_t>(cellMesh.vertices.size()));
 						if (inserted) cellMesh.vertices.push_back(mesh->data.vertices[sourceIndex]);
 						cellMesh.indices.push_back(entry->second);
 					}
+					sections.back().indexCount += 3;
 				}
 				if (cellMeshes.empty()) {
 					const CellKey key = Key(object->transform.position, size);
@@ -502,9 +879,12 @@ namespace Sapphire {
 					Mesh& cellMesh = cellObject->AddComponent<Mesh>();
 					cellMesh.data = std::move(data);
 					cellMesh.material = mesh->material;
+					cellMesh.materials = mesh->materials;
+					cellMesh.sections = std::move(cellSections.at(key));
 					cellMesh.cullBackfaces = mesh->cullBackfaces;
 					cellMesh.castShadows = mesh->castShadows;
-					cellMesh.windAnimated = mesh->windAnimated;
+					cellMesh.vertexBoundsPadding = mesh->vertexBoundsPadding;
+					cellMesh.vertexAnimated = mesh->vertexAnimated;
 					cells[key].push_back(object.get());
 					cells[key].push_back(cellObject.get());
 					const Math::Bounds cellMeshBoundsValue = cellMeshBounds.at(key);
@@ -513,6 +893,11 @@ namespace Sapphire {
 					cellsData.push_back(std::move(cellObject));
 				}
 			}
+			for (const auto& key : previousResidentCells) {
+				if (cells.count(key) && residentCellKeys.insert(key).second) residentCells.push_back(key);
+			}
+			hasCellSelection = false;
+			if (!hadSelection) initialCellLoadComplete = false;
 			initialized = true;
 			dirty = false;
 		}
@@ -536,8 +921,10 @@ namespace Sapphire {
 				cellsData.clear();
 				hasCellSelection = false;
 				initialCellLoadComplete = false;
+				nextCellStreamTime = {};
 				for (const auto& object : objects) object->worldPartitionedMesh = false;
 				for (const auto& object : objects) {
+					if (!object->initializedForApp) continue;
 					residentObjects.push_back(object.get());
 					residentRenderObjects.push_back(object.get());
 				}
@@ -547,35 +934,76 @@ namespace Sapphire {
 				return;
 			}
 			Vector3 sourcePosition = camera->owner->transform.position;
-			Vector3 axes[3];
-			Math::GetAxes(camera->owner->transform, axes);
-			sourcePosition += Math::Scale(axes[0], camera->localPosition.x);
-			sourcePosition += Math::Scale(axes[1], camera->localPosition.y);
-			sourcePosition += Math::Scale(axes[2], camera->localPosition.z);
+			const Vector3 forward = camera->owner->transform.Forward();
 			const CellKey nextSource = Key(sourcePosition, size);
+			std::size_t sourceIndex = 0;
+			bool materialChanged = false;
+			for (const auto& object : objects) {
+				if (!object->initializedForApp) continue;
+				if (sourceIndex >= sources.size() || sources[sourceIndex].object != object.get()) { dirty = true; break; }
+				auto& source = sources[sourceIndex++];
+				Mesh* mesh = object->GetComponent<Mesh>();
+				const auto& a = source.transform;
+				const auto& b = object->transform;
+				const bool transformChanged = source.renderStatic && source.spatiallyLoaded && !object->GetComponent<Camera>() && std::tie(a.position.x, a.position.y, a.position.z, a.rotation.x, a.rotation.y, a.rotation.z, a.scale.x, a.scale.y, a.scale.z) != std::tie(b.position.x, b.position.y, b.position.z, b.rotation.x, b.rotation.y, b.rotation.z, b.scale.x, b.scale.y, b.scale.z);
+				if (source.renderStatic != object->renderStatic || source.spatiallyLoaded != object->spatiallyLoaded || source.mesh != mesh || transformChanged || (mesh && (!source.revision.Matches(*mesh) || source.instanced != mesh->instanced))) { dirty = true; break; }
+				if (mesh) {
+					bool sectionsChanged = source.sections.size() != mesh->sections.size();
+					for (std::size_t index = 0; !sectionsChanged && index < source.sections.size(); ++index) sectionsChanged = std::tie(source.sections[index].firstIndex, source.sections[index].indexCount, source.sections[index].materialIndex) != std::tie(mesh->sections[index].firstIndex, mesh->sections[index].indexCount, mesh->sections[index].materialIndex);
+					if (sectionsChanged) { dirty = true; break; }
+					bool materialsChanged = source.material.Key() != mesh->material.Key() || source.materials.size() != mesh->materials.size();
+					for (std::size_t index = 0; !materialsChanged && index < source.materials.size(); ++index) materialsChanged = source.materials[index].Key() != mesh->materials[index].Key();
+					if (materialsChanged || source.cullBackfaces != mesh->cullBackfaces || source.castShadows != mesh->castShadows || source.animated != mesh->vertexAnimated || std::tie(source.padding.x, source.padding.y, source.padding.z) != std::tie(mesh->vertexBoundsPadding.x, mesh->vertexBoundsPadding.y, mesh->vertexBoundsPadding.z)) materialChanged = true;
+				}
+			}
+			if (sourceIndex != sources.size()) dirty = true;
+			if (materialChanged && !dirty) {
+				for (auto& cell : cellsData) {
+					Mesh* sourceMesh = cell->worldPartitionSourceObject->GetComponent<Mesh>();
+					Mesh* cellMesh = cell->GetComponent<Mesh>();
+					cellMesh->material = sourceMesh->material;
+					cellMesh->materials = sourceMesh->materials;
+					cellMesh->cullBackfaces = sourceMesh->cullBackfaces;
+					cellMesh->castShadows = sourceMesh->castShadows;
+					cellMesh->vertexBoundsPadding = sourceMesh->vertexBoundsPadding;
+					cellMesh->vertexAnimated = sourceMesh->vertexAnimated;
+				}
+				for (auto& source : sources) if (source.mesh) { source.material = source.mesh->material; source.materials = source.mesh->materials; source.cullBackfaces = source.mesh->cullBackfaces; source.castShadows = source.mesh->castShadows; source.padding = source.mesh->vertexBoundsPadding; source.animated = source.mesh->vertexAnimated; }
+			}
 			if (!initialized || dirty || partitionSize != size) Rebuild(objects, size);
 			const float loadRange = std::max(range, 0.0f);
 			const float unloadRange = loadRange + size;
 			const float loadRangeSquared = loadRange * loadRange;
 			const float unloadRangeSquared = unloadRange * unloadRange;
-			const bool refreshCells = !hasCellSelection || sourceCell != nextSource || loadingRange != range;
+			const float priorityAngle = std::min(camera->fieldOfView * 0.5f + 15.0f, 89.0f) * Math::degreesToRadians;
+			const float forwardThreshold = std::cos(priorityAngle);
+			const bool directionChanged = !pendingCellLoads.empty() && Math::Dot(sourceForward, forward) < 0.9659258f;
+			const bool refreshCells = !hasCellSelection || sourceCell != nextSource || loadingRange != range || directionChanged;
 			if (refreshCells) {
-				std::vector<std::pair<float, CellKey>> ordered;
+				std::vector<std::tuple<int, float, CellKey>> ordered;
 				for (const auto& [key, members] : cells) {
 					const auto& bounds = cellBounds.at(key);
 					const Vector3 closest{std::clamp(sourcePosition.x, bounds.minimum.x, bounds.maximum.x), std::clamp(sourcePosition.y, bounds.minimum.y, bounds.maximum.y), std::clamp(sourcePosition.z, bounds.minimum.z, bounds.maximum.z)};
 					const Vector3 difference{closest.x - sourcePosition.x, closest.y - sourcePosition.y, closest.z - sourcePosition.z};
 					const float distanceSquared = Math::Dot(difference, difference);
-					if (key == nextSource || distanceSquared <= loadRangeSquared || (residentCellKeys.count(key) && distanceSquared <= unloadRangeSquared)) ordered.emplace_back(distanceSquared, key);
+					if (key == nextSource || distanceSquared <= loadRangeSquared || (residentCellKeys.count(key) && distanceSquared <= unloadRangeSquared)) {
+						const float distance = std::sqrt(distanceSquared);
+						const float alignment = distance > 0.0001f ? Math::Dot(Math::Scale(difference, 1.0f / distance), forward) : 1.0f;
+						const int priority = key == nextSource ? -1 : alignment >= forwardThreshold ? 0 : 1;
+						ordered.emplace_back(priority, distanceSquared, key);
+					}
 				}
 				std::sort(ordered.begin(), ordered.end(), [](const auto& left, const auto& right) {
-					if (left.first != right.first) return left.first < right.first;
-					return left.second < right.second;
+					if (std::get<0>(left) != std::get<0>(right)) return std::get<0>(left) < std::get<0>(right);
+					if (std::get<1>(left) != std::get<1>(right)) return std::get<1>(left) < std::get<1>(right);
+					return std::get<2>(left) < std::get<2>(right);
 				});
 				pendingCellLoads.clear();
 				pendingCellUnloads.clear();
 				std::set<CellKey> desiredCells;
-				for (const auto& [distance, key] : ordered) {
+				for (const auto& entry : ordered) {
+					const float distance = std::get<1>(entry);
+					const CellKey& key = std::get<2>(entry);
 					desiredCells.insert(key);
 					if ((key == nextSource || distance <= loadRangeSquared) && !residentCellKeys.count(key)) pendingCellLoads.push_back(key);
 				}
@@ -590,43 +1018,45 @@ namespace Sapphire {
 					return Math::Dot(leftDelta, leftDelta) > Math::Dot(rightDelta, rightDelta);
 				});
 				if (!initialCellLoadComplete) {
-					for (const auto& key : pendingCellLoads) {
-						if (residentCellKeys.insert(key).second) {
-							residentCells.push_back(key);
-						}
-					}
-					pendingCellLoads.clear();
+					if (cells.count(nextSource) && residentCellKeys.insert(nextSource).second) residentCells.push_back(nextSource);
+					pendingCellLoads.erase(std::remove(pendingCellLoads.begin(), pendingCellLoads.end(), nextSource), pendingCellLoads.end());
 					initialCellLoadComplete = true;
+					nextCellStreamTime = std::chrono::steady_clock::now() + std::chrono::milliseconds(8);
 				}
 				sourceCell = nextSource;
+				sourceForward = forward;
 				loadingRange = range;
 				hasCellSelection = true;
 			}
 			const auto now = std::chrono::steady_clock::now();
 			if (now >= nextCellStreamTime) {
-				if (!pendingCellLoads.empty()) {
+				const bool canLoad = !pendingCellLoads.empty();
+				const bool canUnload = !pendingCellUnloads.empty();
+				if (canLoad && (!canUnload || streamLoadNext)) {
 					const CellKey key = pendingCellLoads.front();
-					pendingCellLoads.erase(pendingCellLoads.begin());
+					pendingCellLoads.pop_front();
 					if (residentCellKeys.insert(key).second) {
 						residentCells.push_back(key);
 					}
+					streamLoadNext = false;
 					nextCellStreamTime = now + std::chrono::milliseconds(8);
 				}
-				else if (!pendingCellUnloads.empty()) {
+				else if (canUnload) {
 					const CellKey key = pendingCellUnloads.front();
-					pendingCellUnloads.erase(pendingCellUnloads.begin());
+					pendingCellUnloads.pop_front();
 					residentCellKeys.erase(key);
 					residentCells.erase(std::remove(residentCells.begin(), residentCells.end(), key), residentCells.end());
+					streamLoadNext = true;
 					nextCellStreamTime = now + std::chrono::milliseconds(8);
 				}
 			}
 			residentObjects.clear();
 			residentRenderObjects.clear();
 			std::unordered_set<Object*> residentSet;
-			std::unordered_set<Object*> renderSet;
 			auto addResident = [&](Object* object) {
-				if (residentSet.insert(object).second) residentObjects.push_back(object);
-				if ((!object->worldPartitionedMesh || object->worldPartitionCell) && renderSet.insert(object).second) residentRenderObjects.push_back(object);
+				if (!residentSet.insert(object).second) return;
+				residentObjects.push_back(object);
+				if (!object->worldPartitionedMesh || object->worldPartitionCell) residentRenderObjects.push_back(object);
 			};
 			for (const auto& key : residentCells) {
 				for (auto* object : cells.at(key)) addResident(object);
@@ -653,10 +1083,10 @@ namespace Sapphire {
 	class Scene {
 		public:
 			Camera* activeCamera = nullptr;
-			Vector3 gravity{0.0f, -9.81f, 0.0f};
+			Vector3 gravity{0.0f, 0.0f, -9.81f};
 			int cellSize = 20;
 			int partitionSize = 200;
-			float partitionLoadingRange = -1.0f;
+			float partitionBuffer = 1.50f;
 			bool shadowsEnabled = true;
 			float shadowFar = 10.0f;
 			int shadowResolution = 2048;
@@ -670,6 +1100,7 @@ namespace Sapphire {
 			T& CreateObject(std::string name) {
 				objects.push_back(std::make_unique<T>(std::move(name)));
 				objects.back()->scene = this;
+				if (appActive) objects.back()->initializedForApp = false;
 				worldPartitioner.MarkDirty();
 				return static_cast<T&>(*objects.back());
 			}
@@ -678,6 +1109,7 @@ namespace Sapphire {
 			void AddObject(std::unique_ptr<T> object) {
 				objects.push_back(std::move(object));
 				objects.back()->scene = this;
+				if (appActive) objects.back()->initializedForApp = false;
 				worldPartitioner.MarkDirty();
 			}
 
@@ -700,8 +1132,20 @@ namespace Sapphire {
 			}
 
 			void UpdateWorldPartition() {
-				const float range = partitionLoadingRange >= 0.0f ? partitionLoadingRange : activeCamera ? activeCamera->farClip + std::max(partitionSize, 0) : 0.0f;
+				UpdateTransforms();
+				const float range = activeCamera ? activeCamera->far * std::max(partitionBuffer, 0.0f) : 0.0f;
 				worldPartitioner.Update(objects, activeCamera, partitionSize, range);
+			}
+
+			void UpdateTransforms() {
+				++transformGeneration;
+				for (auto& object : objects) object->UpdateWorldTransform(transformGeneration);
+			}
+
+			void SetAppActive(bool active) {
+				appActive = active;
+				if (!active) for (auto& object : objects) object->initializedForApp = true;
+				worldPartitioner.MarkDirty();
 			}
 
 			const std::vector<Object*>& ResidentObjects() const { return worldPartitioner.Objects(); }
@@ -713,7 +1157,232 @@ namespace Sapphire {
 
 		private:
 			std::vector<std::unique_ptr<Object>> objects;
+			bool appActive = false;
+			std::uint64_t transformGeneration = 0;
 			WorldPartitioner worldPartitioner;
 	};
 
+	namespace {
+		struct S3DRecord {
+			std::string name;
+			std::uint8_t type;
+			bool parent;
+			Transform transform;
+			MeshData data;
+			std::vector<Material> materials;
+			std::vector<MeshSection> sections;
+			std::vector<Bone> bones;
+			Light light;
+		};
+
+		class S3DReader {
+			std::vector<std::uint8_t> data;
+			std::size_t offset = 0;
+			std::filesystem::path path;
+
+		public:
+			explicit S3DReader(const std::string& fileName) {
+				path = fileName;
+				std::ifstream file(path, std::ios::binary | std::ios::ate);
+				if (!file && path.is_relative()) {
+					const char* base = SDL_GetBasePath();
+					if (base) {
+						path = std::filesystem::path(base) / ".." / "resources" / path;
+						file.clear();
+						file.open(path, std::ios::binary | std::ios::ate);
+					}
+				}
+				if (!file) throw std::runtime_error("Could not open S3D file");
+				const auto length = file.tellg();
+				if (length < 8 || static_cast<std::uint64_t>(length) > std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("Invalid S3D file size");
+				data.resize(static_cast<std::size_t>(length));
+				file.seekg(0);
+				file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
+				if (!file) throw std::runtime_error("Could not read S3D file");
+				path = std::filesystem::absolute(path);
+			}
+
+			template <typename T> T Read() {
+				if (sizeof(T) > data.size() - offset) throw std::runtime_error("Truncated S3D file");
+				if constexpr (std::is_floating_point_v<T>) {
+					static_assert(sizeof(T) == sizeof(std::uint32_t));
+					const std::uint32_t bits = Read<std::uint32_t>();
+					T value;
+					std::memcpy(&value, &bits, sizeof(value));
+					if (!std::isfinite(value)) throw std::runtime_error("Non-finite S3D value");
+					return value;
+				}
+				else {
+					using Unsigned = std::make_unsigned_t<T>;
+					Unsigned value = 0;
+					for (std::size_t index = 0; index < sizeof(T); ++index) value |= static_cast<Unsigned>(data[offset++]) << (index * 8);
+					return static_cast<T>(value);
+				}
+			}
+
+			std::uint32_t Count(std::size_t itemSize) {
+				const auto count = Read<std::uint32_t>();
+				if (itemSize && count > (data.size() - offset) / itemSize) throw std::runtime_error("Invalid S3D count");
+				return count;
+			}
+
+			std::string String() {
+				const auto size = Count(1);
+				std::string value(reinterpret_cast<const char*>(data.data() + offset), size);
+				offset += size;
+				return value;
+			}
+
+			Vector3 Vector() { return {Read<float>(), Read<float>(), Read<float>()}; }
+			Transform TransformValue() { return {Vector(), Vector(), Vector()}; }
+			const std::filesystem::path& FilePath() const { return path; }
+			bool Finished() const { return offset == data.size(); }
+		};
+
+		std::vector<S3DRecord> ReadS3D(const std::string& fileName, std::filesystem::path& filePath) {
+			S3DReader reader(fileName);
+			filePath = reader.FilePath();
+			if (reader.Read<std::uint8_t>() != 'S' || reader.Read<std::uint8_t>() != '3' || reader.Read<std::uint8_t>() != 'D' || reader.Read<std::uint8_t>() != 0) throw std::runtime_error("Invalid S3D signature");
+			const auto objectCount = reader.Count(1);
+			if (!objectCount) throw std::runtime_error("S3D contains no objects");
+			std::vector<S3DRecord> records;
+			records.reserve(objectCount);
+			std::size_t parentCount = 0;
+			for (std::uint32_t objectIndex = 0; objectIndex < objectCount; ++objectIndex) {
+				S3DRecord record{};
+				record.name = reader.String();
+				record.type = reader.Read<std::uint8_t>();
+				record.parent = reader.Read<std::uint8_t>() != 0;
+				parentCount += record.parent;
+				record.transform = reader.TransformValue();
+				if (record.type == 0) {
+					record.data.vertices.resize(reader.Count(48));
+					record.data.indices.resize(reader.Count(4));
+					record.sections.resize(reader.Count(12));
+					record.materials.resize(reader.Count(1));
+					record.bones.resize(reader.Count(1));
+					for (auto& vertex : record.data.vertices) {
+						vertex.position = reader.Vector();
+						vertex.normal = reader.Vector();
+						vertex.uv[0] = reader.Read<float>();
+						vertex.uv[1] = reader.Read<float>();
+						for (float& color : vertex.color) color = reader.Read<float>();
+					}
+					for (auto& index : record.data.indices) index = reader.Read<std::uint32_t>();
+					for (auto& section : record.sections) section = {reader.Read<std::uint32_t>(), reader.Read<std::uint32_t>(), reader.Read<std::uint32_t>()};
+					for (auto& material : record.materials) {
+						material.baseColor = reader.Vector();
+					material.roughness = reader.Read<float>(); material.metallic = reader.Read<float>(); material.normalScale = reader.Read<float>(); material.aoStrength = reader.Read<float>(); material.displacementScale = reader.Read<float>();
+						for (float& value : material.uvScale) value = reader.Read<float>();
+						for (float& value : material.uvOffset) value = reader.Read<float>();
+					material.flipNormalY = reader.Read<std::uint8_t>() != 0; material.transparent = reader.Read<std::uint8_t>() != 0; material.unlit = reader.Read<std::uint8_t>() != 0;
+						material.opacity = reader.Read<float>();
+					std::string* paths[] = {&material.baseTexturePath, &material.normalTexturePath, &material.roughnessTexturePath, &material.aoTexturePath, &material.displacementTexturePath, &material.displacementMaskTexturePath};
+					for (auto* path : paths) *path = reader.String();
+						material.vertexModifierSource = reader.String();
+					}
+					for (auto& bone : record.bones) {
+						bone.name = reader.String();
+					bone.parentIndex = reader.Read<std::int32_t>(); bone.bindTransform = reader.TransformValue();
+					}
+					record.data.skinWeights.resize(reader.Count(16));
+					for (auto& skin : record.data.skinWeights) {
+						for (auto& index : skin.boneIndices) index = reader.Read<std::uint16_t>();
+						for (auto& weight : skin.weights) weight = reader.Read<std::uint16_t>();
+					}
+					record.data.Validate();
+					Mesh validation;
+					validation.data = std::move(record.data);
+					validation.materials = std::move(record.materials);
+					validation.sections = std::move(record.sections);
+					validation.ValidateSections();
+					record.data = std::move(validation.data);
+					record.materials = std::move(validation.materials);
+					record.sections = std::move(validation.sections);
+					if (!record.bones.empty()) {
+						Skeleton skeleton;
+						skeleton.bones = std::move(record.bones);
+						skeleton.Validate();
+						if (!record.data.skinWeights.empty()) record.data.ValidateSkeleton(skeleton);
+						record.bones = std::move(skeleton.bones);
+					}
+					else if (!record.data.skinWeights.empty()) throw std::runtime_error("Skinned mesh has no skeleton");
+				}
+				else if (record.type == 1) {
+					const auto type = reader.Read<std::uint8_t>();
+					if (type > 2) throw std::runtime_error("Invalid S3D light type");
+					record.light.type = static_cast<Light::Type>(type);
+					record.light.color = reader.Vector();
+					record.light.intensity = reader.Read<float>(); record.light.range = reader.Read<float>(); record.light.innerSpotAngle = reader.Read<float>(); record.light.outerSpotAngle = reader.Read<float>();
+					record.light.castShadows = reader.Read<std::uint8_t>() != 0; record.light.shadowBias = reader.Read<float>();
+				}
+				else throw std::runtime_error("Invalid S3D object type");
+				records.push_back(std::move(record));
+			}
+			if (parentCount > 1 || !reader.Finished()) throw std::runtime_error("Invalid S3D structure");
+			return records;
+		}
+	}
+
+	namespace Physics { void EnsureMeshCollider(Object& object); }
+
+	bool Object::LoadS3D(const std::string& fileName) {
+		std::filesystem::path sourcePath;
+		std::vector<S3DRecord> records;
+		try {
+			records = ReadS3D(fileName, sourcePath);
+			for (auto& record : records) for (auto& material : record.materials) {
+				std::string* paths[] = {&material.baseTexturePath, &material.normalTexturePath, &material.roughnessTexturePath, &material.aoTexturePath, &material.displacementTexturePath, &material.displacementMaskTexturePath};
+				for (auto* path : paths) if (!path->empty() && std::filesystem::path(*path).is_relative()) *path = (sourcePath.parent_path() / *path).lexically_normal().string();
+			}
+		}
+		catch (const std::exception&) { return false; }
+		const auto root = std::find_if(records.begin(), records.end(), [](const S3DRecord& record) { return record.parent; });
+		const bool hasParent = root != records.end();
+		const std::size_t rootIndex = hasParent ? static_cast<std::size_t>(root - records.begin()) : 0;
+		if (records.size() > 1 && !scene) return false;
+		std::vector<Object*> objects(records.size());
+		objects[rootIndex] = this;
+		for (std::size_t index = 0; index < records.size(); ++index) {
+			auto& record = records[index];
+			Object* object = objects[index];
+			if (!object) object = &scene->CreateObject<>(record.name);
+			object->name = record.name;
+			object->SetParent(index == rootIndex || !hasParent ? nullptr : objects[rootIndex], false);
+			object->transform.position = record.transform.position;
+			object->transform.rotation = record.transform.rotation;
+			object->transform.scale = record.transform.scale;
+			if (index != rootIndex && hasParent) {
+				object->transform.localPosition = record.transform.position;
+				object->transform.localRotation = record.transform.rotation;
+				object->transform.localScale = record.transform.scale;
+			}
+			if (record.type == 0) {
+				Mesh* mesh = object->GetComponent<Mesh>();
+				if (!mesh) mesh = &object->AddComponent<Mesh>();
+				mesh->data = std::move(record.data);
+				mesh->material = Material{};
+				mesh->materials = std::move(record.materials);
+				mesh->sections = std::move(record.sections);
+				mesh->MarkDirty();
+				Physics::EnsureMeshCollider(*object);
+				if (!record.bones.empty()) {
+					Skeleton* skeleton = object->GetComponent<Skeleton>();
+					if (!skeleton) skeleton = &object->AddComponent<Skeleton>();
+					skeleton->bones = std::move(record.bones);
+					skeleton->InitializePose();
+				}
+			}
+			else {
+				Light* light = object->GetComponent<Light>();
+				if (!light) light = &object->AddComponent<Light>();
+				*light = record.light;
+				light->owner = object;
+				if (light->type == Light::Type::Directional) object->spatiallyLoaded = false;
+			}
+			objects[index] = object;
+		}
+		if (scene) scene->UpdateWorldPartition();
+		return true;
+	}
 }

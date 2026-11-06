@@ -1,0 +1,10 @@
+schema_version = "1.0.0"
+id = "sapphire_s3d"
+version = "1.0.0"
+name = "Sapphire S3D Exporter"
+tagline = "Export selected meshes and lights to Sapphire S3D"
+maintainer = "Sapphire"
+type = "add-on"
+tags = ["Import-Export"]
+blender_version_min = "5.2.0"
+license = ["SPDX:GPL-2.0-or-later"]
