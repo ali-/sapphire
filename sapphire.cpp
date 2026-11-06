@@ -62,6 +62,16 @@ namespace Sapphire {
 					Object* object = scene.Objects()[index].get();
 					if (object->initializedForApp) continue;
 					object->UpdateWorldTransform();
+					if (auto* skeleton = object->GetComponent<Skeleton>()) {
+						skeleton->Validate();
+						skeleton->InitializePose();
+					}
+					if (auto* mesh = object->GetComponent<Mesh>(); mesh && mesh->IsSkinned()) {
+						if (mesh->instanced) throw std::invalid_argument("Skinned meshes cannot be instanced");
+						Skeleton* skeleton = object->GetComponent<Skeleton>();
+						if (!skeleton) throw std::invalid_argument("Skinned meshes require a skeleton on the same object");
+						mesh->ValidateSkeleton(*skeleton);
+					}
 					object->Initialize();
 					object->initializedForApp = true;
 					if (auto* body = object->GetComponent<PhysicsBody>()) body->previousPosition = object->transform.position;

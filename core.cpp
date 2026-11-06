@@ -309,6 +309,141 @@ namespace Sapphire {
 			float shadowBias = 0.02f;
 	};
 
+	struct Bone {
+		std::string name;
+		std::int32_t parentIndex = -1;
+		Transform bindTransform;
+		Transform poseTransform;
+	};
+
+	class Skeleton : public Component {
+		public:
+			std::vector<Bone> bones;
+			std::uint64_t poseRevision = 1;
+
+			void Validate() const {
+				if (bones.size() > static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()) + 1) throw std::length_error("Skeleton bone count exceeds supported range");
+				for (std::size_t index = 0; index < bones.size(); ++index) {
+					const Bone& bone = bones[index];
+					if (bone.parentIndex < -1 || bone.parentIndex >= static_cast<std::int32_t>(bones.size()) || bone.parentIndex == static_cast<std::int32_t>(index)) throw std::out_of_range("Skeleton bone parent index is invalid");
+					auto validateTransform = [](const Transform& transform) {
+						if (!std::isfinite(transform.position.x) || !std::isfinite(transform.position.y) || !std::isfinite(transform.position.z) || !std::isfinite(transform.rotation.x) || !std::isfinite(transform.rotation.y) || !std::isfinite(transform.rotation.z) || !std::isfinite(transform.scale.x) || !std::isfinite(transform.scale.y) || !std::isfinite(transform.scale.z)) throw std::invalid_argument("Skeleton transform must be finite");
+					};
+					validateTransform(bone.bindTransform);
+					validateTransform(bone.poseTransform);
+				}
+				std::vector<std::uint8_t> states(bones.size());
+				for (std::size_t index = 0; index < bones.size(); ++index) {
+					std::size_t current = index;
+					while (states[current] == 0) {
+						states[current] = 1;
+						const std::int32_t parentIndex = bones[current].parentIndex;
+						if (parentIndex < 0 || states[parentIndex] == 2) break;
+						if (states[parentIndex] == 1) throw std::invalid_argument("Skeleton hierarchy contains a cycle");
+						current = static_cast<std::size_t>(parentIndex);
+					}
+					current = index;
+					while (states[current] == 1) {
+						states[current] = 2;
+						const std::int32_t parentIndex = bones[current].parentIndex;
+						if (parentIndex < 0) break;
+						current = static_cast<std::size_t>(parentIndex);
+					}
+				}
+			}
+
+			void InitializePose() {
+				for (auto& bone : bones) bone.poseTransform = bone.bindTransform;
+				bindMatrices.clear();
+				inverseBindMatrices.clear();
+				poseGlobalMatrices.clear();
+				poseMatrices.clear();
+				++poseRevision;
+			}
+
+			void MarkPoseDirty() { ++poseRevision; }
+			void SetPoseTransform(std::size_t boneIndex, const Transform& transform) { bones.at(boneIndex).poseTransform = transform; MarkPoseDirty(); }
+
+			const std::vector<Math::Matrix4>& PoseMatrices() {
+				if (cachedPoseRevision == poseRevision) return poseMatrices;
+				Validate();
+				auto buildMatrices = [&](bool bindPose) {
+					std::vector<Math::Matrix4> matrices(bones.size());
+					std::vector<std::uint8_t> complete(bones.size());
+					std::vector<std::size_t> path;
+					for (std::size_t index = 0; index < bones.size(); ++index) {
+						if (complete[index]) continue;
+						path.clear();
+						std::size_t current = index;
+						while (!complete[current]) {
+							path.push_back(current);
+							const std::int32_t parentIndex = bones[current].parentIndex;
+							if (parentIndex < 0) break;
+							current = static_cast<std::size_t>(parentIndex);
+						}
+						for (auto boneIndex = path.rbegin(); boneIndex != path.rend(); ++boneIndex) {
+							const Bone& bone = bones[*boneIndex];
+							const Transform& transform = bindPose ? bone.bindTransform : bone.poseTransform;
+							const Math::Matrix4 local = Math::Model(transform);
+							matrices[*boneIndex] = bone.parentIndex < 0 ? local : Math::Multiply(matrices[bone.parentIndex], local);
+							complete[*boneIndex] = 1;
+						}
+					}
+					return matrices;
+				};
+				if (bindMatrices.size() != bones.size()) bindMatrices = buildMatrices(true);
+				if (inverseBindMatrices.size() != bones.size()) {
+					inverseBindMatrices.resize(bones.size());
+					for (std::size_t index = 0; index < bones.size(); ++index) inverseBindMatrices[index] = InverseAffine(bindMatrices[index]);
+				}
+				const auto poseGlobals = buildMatrices(false);
+				poseGlobalMatrices = poseGlobals;
+				poseMatrices.resize(bones.size());
+				for (std::size_t index = 0; index < bones.size(); ++index) poseMatrices[index] = Math::Multiply(poseGlobals[index], inverseBindMatrices[index]);
+				cachedPoseRevision = poseRevision;
+				return poseMatrices;
+			}
+
+			const std::vector<Math::Matrix4>& InverseBindMatrices() { PoseMatrices(); return inverseBindMatrices; }
+			const std::vector<Math::Matrix4>& PoseGlobalMatrices() { PoseMatrices(); return poseGlobalMatrices; }
+
+		private:
+			std::vector<Math::Matrix4> bindMatrices;
+			std::vector<Math::Matrix4> inverseBindMatrices;
+			std::vector<Math::Matrix4> poseGlobalMatrices;
+			std::vector<Math::Matrix4> poseMatrices;
+			std::uint64_t cachedPoseRevision = 0;
+
+			static Math::Matrix4 InverseAffine(const Math::Matrix4& matrix) {
+				const float a00 = matrix.values[0], a01 = matrix.values[4], a02 = matrix.values[8];
+				const float a10 = matrix.values[1], a11 = matrix.values[5], a12 = matrix.values[9];
+				const float a20 = matrix.values[2], a21 = matrix.values[6], a22 = matrix.values[10];
+				const float determinant = a00 * (a11 * a22 - a12 * a21) - a01 * (a10 * a22 - a12 * a20) + a02 * (a10 * a21 - a11 * a20);
+				if (!std::isfinite(determinant) || std::abs(determinant) < 0.000001f) throw std::invalid_argument("Skeleton bind transform is not invertible");
+				const float inverseDeterminant = 1.0f / determinant;
+				Math::Matrix4 inverse = Math::Identity();
+				inverse.values[0] = (a11 * a22 - a12 * a21) * inverseDeterminant;
+				inverse.values[4] = (a02 * a21 - a01 * a22) * inverseDeterminant;
+				inverse.values[8] = (a01 * a12 - a02 * a11) * inverseDeterminant;
+				inverse.values[1] = (a12 * a20 - a10 * a22) * inverseDeterminant;
+				inverse.values[5] = (a00 * a22 - a02 * a20) * inverseDeterminant;
+				inverse.values[9] = (a02 * a10 - a00 * a12) * inverseDeterminant;
+				inverse.values[2] = (a10 * a21 - a11 * a20) * inverseDeterminant;
+				inverse.values[6] = (a01 * a20 - a00 * a21) * inverseDeterminant;
+				inverse.values[10] = (a00 * a11 - a01 * a10) * inverseDeterminant;
+				const Vector3 translation{matrix.values[12], matrix.values[13], matrix.values[14]};
+				inverse.values[12] = -(inverse.values[0] * translation.x + inverse.values[4] * translation.y + inverse.values[8] * translation.z);
+				inverse.values[13] = -(inverse.values[1] * translation.x + inverse.values[5] * translation.y + inverse.values[9] * translation.z);
+				inverse.values[14] = -(inverse.values[2] * translation.x + inverse.values[6] * translation.y + inverse.values[10] * translation.z);
+				return inverse;
+			}
+	};
+
+	struct SkinInfluence {
+		std::uint16_t boneIndices[4]{};
+		std::uint16_t weights[4]{};
+	};
+
 	struct MeshVertex {
 		Vector3 position;
 		Vector3 normal;
@@ -319,11 +454,24 @@ namespace Sapphire {
 	struct MeshData {
 		std::vector<MeshVertex> vertices;
 		std::vector<std::uint32_t> indices;
+		std::vector<SkinInfluence> skinWeights;
 
 		void Validate() const {
-			if (vertices.size() > std::numeric_limits<std::uint32_t>::max() / sizeof(MeshVertex) || indices.size() > std::numeric_limits<std::uint32_t>::max() / sizeof(std::uint32_t)) throw std::length_error("Mesh exceeds GPU buffer size");
+			if (vertices.size() > std::numeric_limits<std::uint32_t>::max() / sizeof(MeshVertex) || indices.size() > std::numeric_limits<std::uint32_t>::max() / sizeof(std::uint32_t) || skinWeights.size() > std::numeric_limits<std::uint32_t>::max() / sizeof(SkinInfluence)) throw std::length_error("Mesh exceeds GPU buffer size");
+			if (!skinWeights.empty() && skinWeights.size() != vertices.size()) throw std::invalid_argument("Mesh skin weights must match vertex count");
 			for (const auto& vertex : vertices) if (!std::isfinite(vertex.position.x) || !std::isfinite(vertex.position.y) || !std::isfinite(vertex.position.z)) throw std::invalid_argument("Mesh position must be finite");
 			for (auto index : indices) if (index >= vertices.size()) throw std::out_of_range("Mesh index exceeds vertex count");
+			for (const auto& skin : skinWeights) {
+				const std::uint32_t weightSum = skin.weights[0] + skin.weights[1] + skin.weights[2] + skin.weights[3];
+				if (weightSum != std::numeric_limits<std::uint16_t>::max()) throw std::invalid_argument("Mesh skin weights must be normalized");
+			}
+		}
+
+		void ValidateSkeleton(const Skeleton& skeleton) const {
+			if (skinWeights.empty()) return;
+			skeleton.Validate();
+			if (skeleton.bones.empty()) throw std::invalid_argument("Skinned meshes require a skeleton with bones");
+			for (const auto& skin : skinWeights) for (const auto boneIndex : skin.boneIndices) if (boneIndex >= skeleton.bones.size()) throw std::out_of_range("Mesh skin weight references an invalid bone");
 		}
 	};
 
@@ -383,6 +531,7 @@ namespace Sapphire {
 			bool vertexAnimated = false;
 			std::uint64_t revision = 0;
 			std::uint64_t instanceRevision = 0;
+			bool IsSkinned() const { return !data.skinWeights.empty(); }
 			std::size_t MaterialCount() const { return materials.empty() ? 1 : materials.size(); }
 			const Material& GetMaterial(std::size_t index) const { return materials.empty() ? material : materials.at(index); }
 			std::size_t SectionCount() const { return sections.empty() ? (data.indices.empty() ? 0 : 1) : sections.size(); }
@@ -406,7 +555,9 @@ namespace Sapphire {
 			void Validate() const {
 				data.Validate();
 				ValidateSections();
+				if (IsSkinned() && instanced) throw std::invalid_argument("Skinned meshes cannot be instanced");
 			}
+			void ValidateSkeleton(const Skeleton& skeleton) const { data.ValidateSkeleton(skeleton); }
 			void MarkDirty() { ++revision; }
 			void MarkInstancesDirty() { ++instanceRevision; }
 			static MeshData Cube();
@@ -417,10 +568,12 @@ namespace Sapphire {
 		std::uint64_t revision = 0;
 		const MeshVertex* vertices = nullptr;
 		const std::uint32_t* indices = nullptr;
+			const SkinInfluence* skinWeights = nullptr;
 		std::size_t vertexCount = 0;
 		std::size_t indexCount = 0;
-		bool Matches(const Mesh& mesh) const { return revision == mesh.revision && vertices == mesh.data.vertices.data() && indices == mesh.data.indices.data() && vertexCount == mesh.data.vertices.size() && indexCount == mesh.data.indices.size(); }
-		void Set(const Mesh& mesh) { revision = mesh.revision; vertices = mesh.data.vertices.data(); indices = mesh.data.indices.data(); vertexCount = mesh.data.vertices.size(); indexCount = mesh.data.indices.size(); }
+			std::size_t skinWeightCount = 0;
+			bool Matches(const Mesh& mesh) const { return revision == mesh.revision && vertices == mesh.data.vertices.data() && indices == mesh.data.indices.data() && skinWeights == mesh.data.skinWeights.data() && vertexCount == mesh.data.vertices.size() && indexCount == mesh.data.indices.size() && skinWeightCount == mesh.data.skinWeights.size(); }
+			void Set(const Mesh& mesh) { revision = mesh.revision; vertices = mesh.data.vertices.data(); indices = mesh.data.indices.data(); skinWeights = mesh.data.skinWeights.data(); vertexCount = mesh.data.vertices.size(); indexCount = mesh.data.indices.size(); skinWeightCount = mesh.data.skinWeights.size(); }
 	};
 
 	class Object {
@@ -654,6 +807,11 @@ namespace Sapphire {
 				SourceSnapshot snapshot{object.get(), object->transform, mesh, {}, mesh ? mesh->material : Material{}, mesh ? mesh->materials : std::vector<Material>{}, mesh ? mesh->sections : std::vector<MeshSection>{}, object->renderStatic, object->spatiallyLoaded, mesh && mesh->instanced, mesh && mesh->cullBackfaces, mesh && mesh->castShadows, mesh ? mesh->vertexBoundsPadding : Vector3{}, mesh && mesh->vertexAnimated};
 				if (mesh) {
 					mesh->Validate();
+					if (mesh->IsSkinned()) {
+						Skeleton* skeleton = object->GetComponent<Skeleton>();
+						if (!skeleton) throw std::invalid_argument("Skinned meshes require a skeleton on the same object");
+						mesh->ValidateSkeleton(*skeleton);
+					}
 					snapshot.revision.Set(*mesh);
 				}
 				sources.push_back(std::move(snapshot));
@@ -665,7 +823,7 @@ namespace Sapphire {
 					dynamicObjects.push_back(object.get());
 					continue;
 				}
-				if (!mesh || mesh->instanced || mesh->data.indices.size() < 3 || mesh->data.vertices.empty()) {
+				if (!mesh || mesh->instanced || mesh->IsSkinned() || mesh->data.indices.size() < 3 || mesh->data.vertices.empty()) {
 					const CellKey key = Key(object->transform.position, size);
 					cells[key].push_back(object.get());
 					IncludeBounds(cellBounds, key, object->transform.position);

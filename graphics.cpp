@@ -52,6 +52,7 @@ namespace Sapphire::Graphics {
 
 		struct RenderItem {
 			Mesh* mesh;
+			Skeleton* skeleton = nullptr;
 			Matrix4 model;
 			Matrix4 normal;
 			int cellX = 0;
@@ -176,11 +177,13 @@ namespace Sapphire::Graphics {
 			SDL_GPUBuffer* vertexBuffer = nullptr;
 			SDL_GPUBuffer* indexBuffer = nullptr;
 			SDL_GPUBuffer* instanceBuffer = nullptr;
+			SDL_GPUBuffer* skinBuffer = nullptr;
 			std::vector<GpuMeshMaterial> materials;
 			Uint32 indexCount = 0;
 			Uint32 vertexCapacity = 0;
 			Uint32 indexCapacity = 0;
 			Uint32 instanceCapacity = 0;
+			Uint32 skinCapacity = 0;
 			Uint32 uploadedInstanceCount = 0;
 			const MeshInstance* instanceSource = nullptr;
 			std::size_t instanceSourceCount = 0;
@@ -188,6 +191,22 @@ namespace Sapphire::Graphics {
 			std::uint64_t instanceGeometryRevision = 0;
 			bool instanceSourceInstanced = false;
 			bool geometryDirty = false;
+		};
+
+		struct GpuSkeleton {
+			SDL_GPUBuffer* poseBuffer = nullptr;
+			Uint32 poseCapacity = 0;
+			std::uint64_t poseRevision = 0;
+		};
+
+		struct SkinBoundsCache {
+			std::uint64_t meshRevision = 0;
+			const MeshVertex* vertices = nullptr;
+			const SkinInfluence* weights = nullptr;
+			const Skeleton* skeleton = nullptr;
+			std::uint64_t poseRevision = 0;
+			std::vector<Bounds> boneBounds;
+			Bounds posedBounds = EmptyBounds();
 		};
 
 		struct BufferBindings {
@@ -208,6 +227,16 @@ namespace Sapphire::Graphics {
 			}
 		};
 
+		struct SkeletonBindings {
+			SDL_GPUBuffer* buffer = nullptr;
+
+			void Bind(SDL_GPURenderPass* pass, const GpuSkeleton& skeleton) {
+				if (buffer == skeleton.poseBuffer) return;
+				SDL_BindGPUVertexStorageBuffers(pass, 0, &skeleton.poseBuffer, 1);
+				buffer = skeleton.poseBuffer;
+			}
+		};
+
 		struct PendingGpuSubmission {
 			SDL_GPUFence* fence;
 			Uint64 submittedAt;
@@ -220,13 +249,19 @@ namespace Sapphire::Graphics {
 		SDL_GPUGraphicsPipeline* transparentPipelines[2]{};
 		SDL_GPUGraphicsPipeline* instanceTransparentPipelines[2]{};
 		SDL_GPUGraphicsPipeline* shadowPipelines[2][2]{};
+		SDL_GPUGraphicsPipeline* skinnedPipelines[2][2]{};
+		SDL_GPUGraphicsPipeline* skinnedTransparentPipelines[2]{};
+		SDL_GPUGraphicsPipeline* skinnedShadowPipelines[2][2]{};
 		struct ModifierPipelines {
 			SDL_GPUGraphicsPipeline* main[2][2][2]{};
 			SDL_GPUGraphicsPipeline* transparent[2][2]{};
 			SDL_GPUGraphicsPipeline* shadow[2][2][2]{};
+			SDL_GPUGraphicsPipeline* skinnedMain[2][2]{};
+			SDL_GPUGraphicsPipeline* skinnedTransparent[2]{};
+			SDL_GPUGraphicsPipeline* skinnedShadow[2][2]{};
 		};
-		std::map<std::string, ModifierPipelines> modifierPipelines;
-		ModifierPipelines& GetModifierPipelines(const std::string& source);
+		std::map<std::pair<std::string, bool>, ModifierPipelines> modifierPipelines;
+		ModifierPipelines& GetModifierPipelines(const std::string& source, bool skinned = false);
 		SDL_GPUGraphicsPipeline* instanceShadowPipelines[2][2]{};
 		SDL_GPUTexture* depthTexture = nullptr;
 		SDL_GPUTexture* emptyShadowTexture = nullptr;
@@ -282,8 +317,10 @@ namespace Sapphire::Graphics {
 		std::string fpsString = "0";
 		std::string triangleCountString = "0/0";
 		std::unordered_map<Mesh*, GpuMesh> gpuMeshes;
+		std::unordered_map<Skeleton*, GpuSkeleton> gpuSkeletons;
 		std::map<MaterialTextures, GpuMaterial> gpuMaterials;
 		std::unordered_map<Mesh*, Bounds> meshBounds;
+		std::unordered_map<Mesh*, SkinBoundsCache> skinBounds;
 				std::unordered_map<std::string, SDL_GPUTexture*> textures;
 		std::deque<PendingGpuSubmission> pendingGpuSubmissions;
 		std::vector<std::unique_ptr<Mesh>> staticBatches;
@@ -404,6 +441,7 @@ namespace Sapphire::Graphics {
 		bool IsBatchable(const Material& material) { return !material.transparent && material.displacementTexturePath.empty() && material.vertexModifierSource.empty(); }
 
 		bool IsBatchable(const Mesh& mesh) {
+			if (mesh.IsSkinned()) return false;
 			if (mesh.materials.empty()) return IsBatchable(mesh.material);
 			for (const auto& material : mesh.materials) if (!IsBatchable(material)) return false;
 			return true;
@@ -418,6 +456,8 @@ namespace Sapphire::Graphics {
 			AddHash(hash, revision.indexCount);
 			AddHash(hash, revision.vertices);
 			AddHash(hash, revision.indices);
+			AddHash(hash, revision.skinWeights);
+			AddHash(hash, revision.skinWeightCount);
 			return hash;
 		}
 
@@ -441,6 +481,8 @@ namespace Sapphire::Graphics {
 			AddHash(hash, mesh.data.indices.size());
 			AddHash(hash, mesh.data.vertices.data());
 			AddHash(hash, mesh.data.indices.data());
+			AddHash(hash, mesh.data.skinWeights.data());
+			AddHash(hash, mesh.data.skinWeights.size());
 			return hash;
 		}
 
@@ -521,18 +563,36 @@ namespace Sapphire::Graphics {
 
 		const std::string vertexShaderSource = deformationShaderSource + R"(
 			struct VertexInput { float3 position [[attribute(0)]]; float3 normal [[attribute(1)]]; float2 uv [[attribute(2)]]; float4 color [[attribute(3)]];
+			#if SKINNED
+			ushort4 boneIndices [[attribute(4)]]; float4 boneWeights [[attribute(5)]];
+			#endif
 			#if INSTANCED
 			float3 instancePosition [[attribute(4)]]; float3 instanceRotation [[attribute(5)]]; float3 instanceScale [[attribute(6)]]; float instanceData [[attribute(7)]];
 			#endif
 			};
 			struct VertexOutput { float4 position [[position]]; float2 uv; float4 color; float3 worldPosition; float3 worldNormal; float4 shadowPosition0; float4 shadowPosition1; float4 shadowPosition2; };
 			struct ObjectUniforms { float4x4 mvp; float4x4 model; float4x4 normal; float4 displacementParameters; float4 uvTransform; float4 modifierTime; float4x4 shadowMvp[3]; float4 shadowState; };
-			vertex VertexOutput main0(VertexInput input [[stage_in]], constant ObjectUniforms& uniforms [[buffer(0)]], texture2d<float> heightMap [[texture(0)]], sampler heightSampler [[sampler(0)]], texture2d<float> maskMap [[texture(1)]], sampler maskSampler [[sampler(1)]]) {
+			vertex VertexOutput main0(VertexInput input [[stage_in]], constant ObjectUniforms& uniforms [[buffer(0)]],
+			#if SKINNED
+			device const float4x4* boneMatrices [[buffer(1)]],
+			#endif
+			texture2d<float> heightMap [[texture(0)]], sampler heightSampler [[sampler(0)]], texture2d<float> maskMap [[texture(1)]], sampler maskSampler [[sampler(1)]]) {
 				VertexOutput output;
 				float2 uv = input.uv * uniforms.uvTransform.xy + uniforms.uvTransform.zw;
 				float3 localPosition = input.position;
 				float3 localNormal = input.normal;
 				float4 color = input.color;
+				#if SKINNED
+				float4 skinnedPosition = float4(0.0);
+				float3 skinnedNormal = float3(0.0);
+				for (uint influence = 0; influence < 4; ++influence) {
+					float weight = input.boneWeights[influence];
+					skinnedPosition += (boneMatrices[input.boneIndices[influence]] * float4(localPosition, 1.0)) * weight;
+					skinnedNormal += (boneMatrices[input.boneIndices[influence]] * float4(localNormal, 0.0)).xyz * weight;
+				}
+				localPosition = skinnedPosition.xyz;
+				localNormal = normalize(skinnedNormal);
+				#endif
 				#if INSTANCED
 				localPosition = input.instancePosition + InstanceRotate(localPosition * input.instanceScale, input.instanceRotation);
 				localNormal = InstanceNormal(localNormal, input.instanceScale, input.instanceRotation);
@@ -759,18 +819,36 @@ namespace Sapphire::Graphics {
 
 		const std::string shadowVertexShaderSource = deformationShaderSource + R"(
 			struct VertexInput { float3 position [[attribute(0)]]; float3 normal [[attribute(1)]]; float2 uv [[attribute(2)]]; float4 color [[attribute(3)]];
+			#if SKINNED
+			ushort4 boneIndices [[attribute(4)]]; float4 boneWeights [[attribute(5)]];
+			#endif
 			#if INSTANCED
 			float3 instancePosition [[attribute(4)]]; float3 instanceRotation [[attribute(5)]]; float3 instanceScale [[attribute(6)]]; float instanceData [[attribute(7)]];
 			#endif
 			};
 			struct VertexOutput { float4 position [[position]]; float2 uv; };
 			struct ShadowUniforms { float4x4 mvp; float4x4 model; float4 displacementParameters; float4 uvTransform; float4 modifierTime; };
-			vertex VertexOutput main0(VertexInput input [[stage_in]], constant ShadowUniforms& uniforms [[buffer(0)]], texture2d<float> heightMap [[texture(0)]], sampler heightSampler [[sampler(0)]], texture2d<float> maskMap [[texture(1)]], sampler maskSampler [[sampler(1)]]) {
+			vertex VertexOutput main0(VertexInput input [[stage_in]], constant ShadowUniforms& uniforms [[buffer(0)]],
+			#if SKINNED
+			device const float4x4* boneMatrices [[buffer(1)]],
+			#endif
+			texture2d<float> heightMap [[texture(0)]], sampler heightSampler [[sampler(0)]], texture2d<float> maskMap [[texture(1)]], sampler maskSampler [[sampler(1)]]) {
 				VertexOutput output;
 				float2 uv = input.uv * uniforms.uvTransform.xy + uniforms.uvTransform.zw;
 				float3 localPosition = input.position;
 				float3 localNormal = input.normal;
 				float4 color = input.color;
+				#if SKINNED
+				float4 skinnedPosition = float4(0.0);
+				float3 skinnedNormal = float3(0.0);
+				for (uint influence = 0; influence < 4; ++influence) {
+					float weight = input.boneWeights[influence];
+					skinnedPosition += (boneMatrices[input.boneIndices[influence]] * float4(localPosition, 1.0)) * weight;
+					skinnedNormal += (boneMatrices[input.boneIndices[influence]] * float4(localNormal, 0.0)).xyz * weight;
+				}
+				localPosition = skinnedPosition.xyz;
+				localNormal = normalize(skinnedNormal);
+				#endif
 				#if INSTANCED
 				localPosition = input.instancePosition + InstanceRotate(localPosition * input.instanceScale, input.instanceRotation);
 				localNormal = InstanceNormal(localNormal, input.instanceScale, input.instanceRotation);
@@ -1209,15 +1287,67 @@ namespace Sapphire::Graphics {
 
 		GpuMesh& GetMesh(Mesh* mesh);
 
+		const Bounds& GetSkinnedBounds(Mesh* mesh, Skeleton* skeleton) {
+			SkinBoundsCache& cache = skinBounds[mesh];
+			if (cache.meshRevision != mesh->revision || cache.vertices != mesh->data.vertices.data() || cache.weights != mesh->data.skinWeights.data() || cache.skeleton != skeleton || cache.boneBounds.size() != skeleton->bones.size()) {
+				mesh->ValidateSkeleton(*skeleton);
+				cache.boneBounds.assign(skeleton->bones.size(), EmptyBounds());
+				const auto& inverseBind = skeleton->InverseBindMatrices();
+				for (std::size_t vertexIndex = 0; vertexIndex < mesh->data.vertices.size(); ++vertexIndex) {
+					const auto& vertex = mesh->data.vertices[vertexIndex];
+					const auto& skin = mesh->data.skinWeights[vertexIndex];
+					for (int influence = 0; influence < 4; ++influence) {
+						if (!skin.weights[influence]) continue;
+						const std::size_t boneIndex = skin.boneIndices[influence];
+						Include(cache.boneBounds[boneIndex], TransformPoint(inverseBind[boneIndex], vertex.position));
+					}
+				}
+				cache.meshRevision = mesh->revision;
+				cache.vertices = mesh->data.vertices.data();
+				cache.weights = mesh->data.skinWeights.data();
+				cache.skeleton = skeleton;
+				cache.poseRevision = 0;
+			}
+			if (cache.poseRevision != skeleton->poseRevision) {
+				cache.posedBounds = EmptyBounds();
+				const auto& poseGlobals = skeleton->PoseGlobalMatrices();
+				for (std::size_t index = 0; index < cache.boneBounds.size(); ++index) {
+					const Bounds& boneBounds = cache.boneBounds[index];
+					if (boneBounds.minimum.x > boneBounds.maximum.x) continue;
+					const Bounds posedBoneBounds = TransformBounds(boneBounds, poseGlobals[index]);
+					Include(cache.posedBounds, posedBoneBounds.minimum);
+					Include(cache.posedBounds, posedBoneBounds.maximum);
+				}
+				cache.poseRevision = skeleton->poseRevision;
+			}
+			return cache.posedBounds;
+		}
+
 		RenderItem PrepareDraw(Mesh* mesh, const Transform& transform, const CellKey& cell, std::size_t sectionIndex = 0) {
 			Vector3 axes[3];
 			GetAxes(transform, axes);
-			RenderItem item{mesh, Model(transform, axes), NormalMatrix(transform, axes), std::get<0>(cell), std::get<1>(cell), std::get<2>(cell)};
+			RenderItem item{};
+			item.mesh = mesh;
+			item.skeleton = mesh->IsSkinned() && mesh->owner ? mesh->owner->GetComponent<Skeleton>() : nullptr;
+			item.model = Model(transform, axes);
+			item.normal = NormalMatrix(transform, axes);
+			item.cellX = std::get<0>(cell);
+			item.cellY = std::get<1>(cell);
+			item.cellZ = std::get<2>(cell);
 			const MeshSection section = mesh->GetSection(sectionIndex);
 			item.firstIndex = section.firstIndex;
 			item.indexCount = section.indexCount;
 			item.materialIndex = section.materialIndex;
-			item.bounds = TransformBounds(Culling::GetBounds(mesh), item.model);
+			Bounds localBounds = item.skeleton ? GetSkinnedBounds(mesh, item.skeleton) : Culling::GetBounds(mesh);
+			if (item.skeleton) {
+				localBounds.minimum = Subtract(localBounds.minimum, mesh->vertexBoundsPadding);
+				localBounds.maximum = Add(localBounds.maximum, mesh->vertexBoundsPadding);
+				float displacementPadding = 0.0f;
+				for (std::size_t index = 0; index < mesh->MaterialCount(); ++index) if (!mesh->GetMaterial(index).displacementTexturePath.empty()) displacementPadding = std::max(displacementPadding, std::abs(mesh->GetMaterial(index).displacementScale));
+				localBounds.minimum = Subtract(localBounds.minimum, {displacementPadding, displacementPadding, displacementPadding});
+				localBounds.maximum = Add(localBounds.maximum, {displacementPadding, displacementPadding, displacementPadding});
+			}
+			item.bounds = TransformBounds(localBounds, item.model);
 			const auto gpu = gpuMeshes.find(mesh);
 			item.gpu = gpu == gpuMeshes.end() ? nullptr : &gpu->second;
 			return item;
@@ -1225,6 +1355,7 @@ namespace Sapphire::Graphics {
 
 		void ReleaseMesh(Mesh* mesh, bool geometryOnly = false) {
 			meshBounds.erase(mesh);
+			skinBounds.erase(mesh);
 			const auto entry = gpuMeshes.find(mesh);
 			if (entry == gpuMeshes.end()) return;
 			auto& gpuMesh = entry->second;
@@ -1235,8 +1366,10 @@ namespace Sapphire::Graphics {
 			ReleaseBuffer(gpuDevice, gpuMesh.vertexBuffer);
 			ReleaseBuffer(gpuDevice, gpuMesh.indexBuffer);
 			ReleaseBuffer(gpuDevice, gpuMesh.instanceBuffer);
+			ReleaseBuffer(gpuDevice, gpuMesh.skinBuffer);
 			gpuMesh.vertexBuffer = nullptr;
 			gpuMesh.indexBuffer = nullptr;
+			gpuMesh.skinBuffer = nullptr;
 			gpuMesh.indexCount = 0;
 			for (auto& material : gpuMesh.materials) ReleaseMaterial(material.material);
 			gpuMeshes.erase(entry);
@@ -1473,25 +1606,34 @@ namespace Sapphire::Graphics {
 		GpuMesh UploadMesh(const MeshData& mesh, GpuMesh previous = {}) {
 			const auto vertexBytes = mesh.vertices.size() * sizeof(MeshVertex);
 			const auto indexBytes = mesh.indices.size() * sizeof(std::uint32_t);
+			const auto skinBytes = mesh.skinWeights.size() * sizeof(SkinInfluence);
 			mesh.Validate();
 			SDL_GPUBuffer* nextVertices = previous.vertexCapacity < vertexBytes ? nullptr : previous.vertexBuffer;
 			SDL_GPUBuffer* nextIndices = previous.indexCapacity < indexBytes ? nullptr : previous.indexBuffer;
+			SDL_GPUBuffer* nextSkin = skinBytes && previous.skinCapacity >= skinBytes ? previous.skinBuffer : nullptr;
 			const bool replaceVertices = !nextVertices;
 			const bool replaceIndices = !nextIndices;
+			const bool replaceSkin = !nextSkin;
 			try {
 				nextVertices = UploadBuffer(SDL_GPU_BUFFERUSAGE_VERTEX, mesh.vertices.data(), static_cast<Uint32>(vertexBytes), nextVertices);
 				nextIndices = UploadBuffer(SDL_GPU_BUFFERUSAGE_INDEX, mesh.indices.data(), static_cast<Uint32>(indexBytes), nextIndices);
+				if (skinBytes) nextSkin = UploadBuffer(SDL_GPU_BUFFERUSAGE_VERTEX, mesh.skinWeights.data(), static_cast<Uint32>(skinBytes), nextSkin);
 			}
 			catch (...) {
 				if (replaceVertices && nextVertices) ReleaseBuffer(gpuDevice, nextVertices);
+				if (replaceIndices && nextIndices) ReleaseBuffer(gpuDevice, nextIndices);
+				if (replaceSkin && nextSkin) ReleaseBuffer(gpuDevice, nextSkin);
 				throw;
 			}
 			if (replaceVertices) ReleaseBuffer(gpuDevice, previous.vertexBuffer);
 			if (replaceIndices) ReleaseBuffer(gpuDevice, previous.indexBuffer);
+			if (replaceSkin) ReleaseBuffer(gpuDevice, previous.skinBuffer);
 			previous.vertexBuffer = nextVertices;
 			previous.indexBuffer = nextIndices;
+			previous.skinBuffer = skinBytes ? nextSkin : nullptr;
 			previous.vertexCapacity = std::max(previous.vertexCapacity, static_cast<Uint32>(vertexBytes));
 			previous.indexCapacity = std::max(previous.indexCapacity, static_cast<Uint32>(indexBytes));
+			previous.skinCapacity = skinBytes ? std::max(previous.skinCapacity, static_cast<Uint32>(skinBytes)) : 0;
 			previous.indexCount = static_cast<Uint32>(mesh.indices.size());
 			previous.geometryDirty = false;
 			return previous;
@@ -1646,9 +1788,15 @@ namespace Sapphire::Graphics {
 			GpuMesh& gpuMesh = gpuMeshes.try_emplace(mesh).first->second;
 			const bool uploadGeometry = !gpuMesh.vertexBuffer || gpuMesh.geometryDirty;
 			if (uploadGeometry && !mesh->data.vertices.empty() && !mesh->data.indices.empty()) {
+				mesh->Validate();
+				if (mesh->IsSkinned()) {
+					if (!mesh->owner || !mesh->owner->GetComponent<Skeleton>()) throw std::invalid_argument("Skinned meshes require a skeleton on the same object");
+					mesh->ValidateSkeleton(*mesh->owner->GetComponent<Skeleton>());
+				}
 				auto uploaded = UploadMesh(mesh->data, gpuMesh);
 				gpuMesh.vertexCapacity = uploaded.vertexCapacity;
 				gpuMesh.indexCapacity = uploaded.indexCapacity;
+				gpuMesh.skinCapacity = uploaded.skinCapacity;
 				gpuMesh.geometryDirty = false;
 				gpuMesh.vertexBuffer = uploaded.vertexBuffer;
 				gpuMesh.indexBuffer = uploaded.indexBuffer;
@@ -1695,6 +1843,23 @@ namespace Sapphire::Graphics {
 			return gpuMesh;
 		}
 
+		GpuSkeleton& GetSkeleton(Skeleton* skeleton) {
+			GpuSkeleton& gpuSkeleton = gpuSkeletons[skeleton];
+			if (gpuSkeleton.poseRevision == skeleton->poseRevision && gpuSkeleton.poseBuffer) return gpuSkeleton;
+			const auto& matrices = skeleton->PoseMatrices();
+			if (matrices.empty()) throw std::invalid_argument("Skinned meshes require a skeleton with bones");
+			const Uint64 bytes = matrices.size() * sizeof(Math::Matrix4);
+			if (bytes > std::numeric_limits<Uint32>::max()) throw std::length_error("Skeleton pose exceeds GPU buffer size");
+			const Uint32 size = static_cast<Uint32>(bytes);
+			SDL_GPUBuffer* reusable = gpuSkeleton.poseCapacity >= size ? gpuSkeleton.poseBuffer : nullptr;
+			SDL_GPUBuffer* next = UploadBuffer(SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ, matrices.data(), size, reusable);
+			if (!reusable) ReleaseBuffer(gpuDevice, gpuSkeleton.poseBuffer);
+			gpuSkeleton.poseBuffer = next;
+			gpuSkeleton.poseCapacity = std::max(gpuSkeleton.poseCapacity, size);
+			gpuSkeleton.poseRevision = skeleton->poseRevision;
+			return gpuSkeleton;
+		}
+
 		bool UpdateBatchMaterial(const Object& object, const Mesh& mesh, const MeshSource& source) {
 			if (!mesh.materials.empty() || !mesh.sections.empty()) return false;
 			bool found = false;
@@ -1715,6 +1880,12 @@ namespace Sapphire::Graphics {
 		MeshSource* UpdateMeshSource(Object& object, int cellSize, bool rebuildAll) {
 			Mesh* mesh = object.GetComponent<Mesh>();
 			if (!mesh) return nullptr;
+			if (mesh->IsSkinned()) {
+				if (mesh->instanced) throw std::invalid_argument("Skinned meshes cannot be instanced");
+				Skeleton* skeleton = object.GetComponent<Skeleton>();
+				if (!skeleton) throw std::invalid_argument("Skinned meshes require a skeleton on the same object");
+				mesh->ValidateSkeleton(*skeleton);
+			}
 			sceneTriangleCount += mesh->data.indices.size() / 3 * (mesh->instanced ? mesh->instances.size() : 1);
 			auto [entry, inserted] = meshSources.try_emplace(&object);
 			auto& source = entry->second;
@@ -1733,9 +1904,9 @@ namespace Sapphire::Graphics {
 			const auto signature = MeshSignature(object, *mesh);
 			if (!inserted && source.signature == signature && !instancesChanged && (!rebuildAll || !source.batched)) return &source;
 			if (mesh->materials.empty()) {
-				if (!mesh->material.vertexModifierSource.empty()) GetModifierPipelines(mesh->material.vertexModifierSource);
+				if (!mesh->material.vertexModifierSource.empty()) GetModifierPipelines(mesh->material.vertexModifierSource, mesh->IsSkinned());
 			}
-			else for (const auto& material : mesh->materials) if (!material.vertexModifierSource.empty()) GetModifierPipelines(material.vertexModifierSource);
+			else for (const auto& material : mesh->materials) if (!material.vertexModifierSource.empty()) GetModifierPipelines(material.vertexModifierSource, mesh->IsSkinned());
 			const auto spatialSignature = SpatialSignature(object, *mesh);
 			const auto shadowSignature = ShadowSignature(object, *mesh);
 			const bool shadowChanged = inserted || source.shadowSignature != shadowSignature || instancesChanged;
@@ -1764,7 +1935,7 @@ namespace Sapphire::Graphics {
 			source.signature = signature;
 			source.drawReady = false;
 			source.batched = batched;
-			source.staticCaster = object.renderStatic && mesh->castShadows && !mesh->vertexAnimated && !mesh->data.vertices.empty() && !mesh->data.indices.empty();
+			source.staticCaster = object.renderStatic && mesh->castShadows && !mesh->vertexAnimated && !mesh->IsSkinned() && !mesh->data.vertices.empty() && !mesh->data.indices.empty();
 			if (source.staticCaster) {
 				source.shadowBounds = TransformBounds(Culling::GetBounds(mesh), Model(object.transform));
 				if (shadowChanged) shadowChanges.push_back(source.shadowBounds);
@@ -1828,7 +1999,10 @@ namespace Sapphire::Graphics {
 		}
 
 		void RenderShadowMap(SDL_GPUCommandBuffer* commandBuffer, SDL_GPUTexture* texture, const ShadowMapData& shadowMap, const std::vector<const RenderItem*>& items, float time, Uint8 layer = 0, bool cullBackfaces = true) {
-			for (const auto* item : items) item->gpu = &GetMesh(item->mesh);
+			for (const auto* item : items) {
+				item->gpu = &GetMesh(item->mesh);
+				if (item->skeleton) GetSkeleton(item->skeleton);
+			}
 			FlushUploads();
 			SDL_GPUDepthStencilTargetInfo depthInfo{};
 			depthInfo.texture = texture;
@@ -1847,6 +2021,7 @@ namespace Sapphire::Graphics {
 			SDL_GPUGraphicsPipeline* activePipeline = nullptr;
 			GpuMaterial* activeMaterial = nullptr;
 			BufferBindings buffers;
+			SkeletonBindings skeletonBindings;
 			for (const RenderItem* itemPointer : items) {
 				const RenderItem& item = *itemPointer;
 				Mesh* mesh = item.mesh;
@@ -1855,7 +2030,9 @@ namespace Sapphire::Graphics {
 				const Material& material = mesh->GetMaterial(item.materialIndex);
 				GpuMeshMaterial& gpuMeshMaterial = gpuMesh.materials.at(item.materialIndex);
 				GpuMaterial* activeGpuMaterial = gpuMeshMaterial.material;
-				SDL_GPUGraphicsPipeline* meshPipeline = material.vertexModifierSource.empty() ? (mesh->instanced ? instanceShadowPipelines : shadowPipelines)[activeGpuMaterial->masked ? 1 : 0][cullBackfaces && mesh->cullBackfaces ? 1 : 0] : GetModifierPipelines(material.vertexModifierSource).shadow[mesh->instanced ? 1 : 0][activeGpuMaterial->masked ? 1 : 0][cullBackfaces && mesh->cullBackfaces ? 1 : 0];
+				SDL_GPUGraphicsPipeline* meshPipeline = nullptr;
+				if (item.skeleton) meshPipeline = material.vertexModifierSource.empty() ? skinnedShadowPipelines[activeGpuMaterial->masked ? 1 : 0][cullBackfaces && mesh->cullBackfaces ? 1 : 0] : GetModifierPipelines(material.vertexModifierSource, true).skinnedShadow[activeGpuMaterial->masked ? 1 : 0][cullBackfaces && mesh->cullBackfaces ? 1 : 0];
+				else meshPipeline = material.vertexModifierSource.empty() ? (mesh->instanced ? instanceShadowPipelines : shadowPipelines)[activeGpuMaterial->masked ? 1 : 0][cullBackfaces && mesh->cullBackfaces ? 1 : 0] : GetModifierPipelines(material.vertexModifierSource).shadow[mesh->instanced ? 1 : 0][activeGpuMaterial->masked ? 1 : 0][cullBackfaces && mesh->cullBackfaces ? 1 : 0];
 				if (meshPipeline != activePipeline) {
 					SDL_BindGPUGraphicsPipeline(shadowPass, meshPipeline);
 					activePipeline = meshPipeline;
@@ -1875,7 +2052,12 @@ namespace Sapphire::Graphics {
 				uniforms.modifierTime[0] = time;
 				SDL_PushGPUVertexUniformData(commandBuffer, 0, &uniforms, sizeof(uniforms));
 				buffers.Bind(shadowPass, gpuMesh);
-				if (mesh->instanced) {
+				if (item.skeleton) {
+					SDL_GPUBufferBinding skinBinding{gpuMesh.skinBuffer, 0};
+					SDL_BindGPUVertexBuffers(shadowPass, 1, &skinBinding, 1);
+					skeletonBindings.Bind(shadowPass, GetSkeleton(item.skeleton));
+				}
+				else if (mesh->instanced) {
 					SDL_GPUBufferBinding instanceBinding{gpuMesh.instanceBuffer, 0};
 					SDL_BindGPUVertexBuffers(shadowPass, 1, &instanceBinding, 1);
 				}
@@ -1982,7 +2164,7 @@ namespace Sapphire::Graphics {
 
 	}
 
-	SDL_GPUShader* CreateShader(SDL_GPUDevice* gpuDevice, const char* source, SDL_GPUShaderStage stage, SDL_GPUShaderFormat format, Uint32 samplerCount = 0, Uint32 uniformBufferCount = 0) {
+	SDL_GPUShader* CreateShader(SDL_GPUDevice* gpuDevice, const char* source, SDL_GPUShaderStage stage, SDL_GPUShaderFormat format, Uint32 samplerCount = 0, Uint32 uniformBufferCount = 0, Uint32 storageBufferCount = 0) {
 		SDL_GPUShaderCreateInfo shaderInfo{};
 		shaderInfo.code_size = std::strlen(source) + 1;
 		shaderInfo.code = reinterpret_cast<const Uint8*>(source);
@@ -1991,6 +2173,7 @@ namespace Sapphire::Graphics {
 		shaderInfo.stage = stage;
 		shaderInfo.num_samplers = samplerCount;
 		shaderInfo.num_uniform_buffers = uniformBufferCount;
+		shaderInfo.num_storage_buffers = storageBufferCount;
 		return SDL_CreateGPUShader(gpuDevice, &shaderInfo);
 	}
 
@@ -2272,17 +2455,21 @@ namespace Sapphire::Graphics {
 	}
 
 	namespace {
-	ModifierPipelines& GetModifierPipelines(const std::string& source) {
-		auto [entry, inserted] = modifierPipelines.try_emplace(source);
+	ModifierPipelines& GetModifierPipelines(const std::string& source, bool skinned) {
+		auto [entry, inserted] = modifierPipelines.try_emplace(std::make_pair(source, skinned));
 		if (!inserted) return entry->second;
 		auto& family = entry->second;
 		SDL_GPUShader* vertex[2]{};
 		SDL_GPUShader* shadowVertex[2]{};
+		SDL_GPUShader* skinnedVertex = nullptr;
+		SDL_GPUShader* skinnedShadowVertex = nullptr;
 		SDL_GPUShader* fragment[2]{};
 		SDL_GPUShader* shadowFragment[2]{};
 		auto releaseShaders = [&] {
 			for (auto* shader : vertex) if (shader) SDL_ReleaseGPUShader(gpuDevice, shader);
 			for (auto* shader : shadowVertex) if (shader) SDL_ReleaseGPUShader(gpuDevice, shader);
+			if (skinnedVertex) SDL_ReleaseGPUShader(gpuDevice, skinnedVertex);
+			if (skinnedShadowVertex) SDL_ReleaseGPUShader(gpuDevice, skinnedShadowVertex);
 			for (auto* shader : fragment) if (shader) SDL_ReleaseGPUShader(gpuDevice, shader);
 			for (auto* shader : shadowFragment) if (shader) SDL_ReleaseGPUShader(gpuDevice, shader);
 		};
@@ -2294,6 +2481,14 @@ namespace Sapphire::Graphics {
 				vertex[instanced] = CreateShader(gpuDevice, mainSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
 				shadowVertex[instanced] = CreateShader(gpuDevice, shadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
 				if (!vertex[instanced] || !shadowVertex[instanced]) throw std::runtime_error(std::string("Compile vertex modifier: ") + SDL_GetError());
+			}
+			if (skinned) {
+				const std::string skinnedPrefix = "#define SKINNED 1\n#define CUSTOM_MODIFIER 1\n";
+				const std::string skinnedMainSource = skinnedPrefix + deformationShaderSource + source + vertexShaderSource.substr(deformationShaderSource.size());
+				const std::string skinnedShadowSource = skinnedPrefix + deformationShaderSource + source + shadowVertexShaderSource.substr(deformationShaderSource.size());
+				skinnedVertex = CreateShader(gpuDevice, skinnedMainSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1, 1);
+				skinnedShadowVertex = CreateShader(gpuDevice, skinnedShadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1, 1);
+				if (!skinnedVertex || !skinnedShadowVertex) throw std::runtime_error(std::string("Compile skinned vertex modifier: ") + SDL_GetError());
 			}
 			for (int masked = 0; masked < 2; ++masked) {
 				const std::string prefix = masked ? "#define ALPHA_MASKED 1\n" : "#define ALPHA_MASKED 0\n";
@@ -2360,12 +2555,63 @@ namespace Sapphire::Graphics {
 					}
 				}
 			}
+			if (skinned) {
+				SDL_GPUVertexBufferDescription skinnedDescriptions[2]{{0, sizeof(MeshVertex), SDL_GPU_VERTEXINPUTRATE_VERTEX, 0}, {1, sizeof(SkinInfluence), SDL_GPU_VERTEXINPUTRATE_VERTEX, 0}};
+				SDL_GPUVertexAttribute skinnedAttributes[6]{{0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(MeshVertex, position)}, {1, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(MeshVertex, normal)}, {2, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, offsetof(MeshVertex, uv)}, {3, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, offsetof(MeshVertex, color)}, {4, 1, SDL_GPU_VERTEXELEMENTFORMAT_USHORT4, offsetof(SkinInfluence, boneIndices)}, {5, 1, SDL_GPU_VERTEXELEMENTFORMAT_USHORT4_NORM, offsetof(SkinInfluence, weights)}};
+				info.vertex_input_state.num_vertex_buffers = 2;
+				info.vertex_input_state.vertex_buffer_descriptions = skinnedDescriptions;
+				info.vertex_input_state.num_vertex_attributes = 6;
+				info.vertex_input_state.vertex_attributes = skinnedAttributes;
+				info.vertex_shader = skinnedVertex;
+				info.depth_stencil_state.enable_depth_write = true;
+				info.rasterizer_state.enable_depth_bias = false;
+				info.target_info.num_color_targets = 1;
+				info.target_info.color_target_descriptions = &color;
+				for (int masked = 0; masked < 2; ++masked) {
+					info.fragment_shader = fragment[masked];
+					for (int cull = 0; cull < 2; ++cull) {
+						info.rasterizer_state.cull_mode = cull ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_NONE;
+						family.skinnedMain[masked][cull] = CreatePipeline(gpuDevice, info);
+					}
+				}
+				color.blend_state.enable_blend = true;
+				color.blend_state.src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA;
+				color.blend_state.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+				color.blend_state.color_blend_op = SDL_GPU_BLENDOP_ADD;
+				color.blend_state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+				color.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+				color.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
+				info.depth_stencil_state.enable_depth_write = false;
+				info.fragment_shader = fragment[0];
+				for (int cull = 0; cull < 2; ++cull) {
+					info.rasterizer_state.cull_mode = cull ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_NONE;
+					family.skinnedTransparent[cull] = CreatePipeline(gpuDevice, info);
+				}
+				color.blend_state.enable_blend = false;
+				info.depth_stencil_state.enable_depth_write = true;
+				info.vertex_shader = skinnedShadowVertex;
+				info.target_info.num_color_targets = 0;
+				info.target_info.color_target_descriptions = nullptr;
+				info.rasterizer_state.enable_depth_bias = true;
+				info.rasterizer_state.depth_bias_constant_factor = 2.0f;
+				info.rasterizer_state.depth_bias_slope_factor = shadowSlopeFactor;
+				for (int masked = 0; masked < 2; ++masked) {
+					info.fragment_shader = shadowFragment[masked];
+					for (int cull = 0; cull < 2; ++cull) {
+						info.rasterizer_state.cull_mode = cull ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_NONE;
+						family.skinnedShadow[masked][cull] = CreatePipeline(gpuDevice, info);
+					}
+				}
+			}
 		}
 		catch (...) {
 			releaseShaders();
 			for (auto& instanced : family.main) for (auto& masked : instanced) for (auto* pipeline : masked) if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
 			for (auto& instanced : family.transparent) for (auto* pipeline : instanced) if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
 			for (auto& instanced : family.shadow) for (auto& masked : instanced) for (auto* pipeline : masked) if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
+			for (auto& masked : family.skinnedMain) for (auto* pipeline : masked) if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
+			for (auto* pipeline : family.skinnedTransparent) if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
+			for (auto& masked : family.skinnedShadow) for (auto* pipeline : masked) if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
 			modifierPipelines.erase(entry);
 			throw;
 		}
@@ -2385,6 +2631,10 @@ namespace Sapphire::Graphics {
 		SDL_GPUShader* shadowVertexShader = CreateShader(gpuDevice, shadowVertexShaderSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
 		const std::string instanceShadowSource = "#define INSTANCED 1\n" + shadowVertexShaderSource;
 		SDL_GPUShader* instanceShadowShader = CreateShader(gpuDevice, instanceShadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
+		const std::string skinnedVertexSource = "#define SKINNED 1\n" + vertexShaderSource;
+		SDL_GPUShader* skinnedVertexShader = CreateShader(gpuDevice, skinnedVertexSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1, 1);
+		const std::string skinnedShadowSource = "#define SKINNED 1\n" + shadowVertexShaderSource;
+		SDL_GPUShader* skinnedShadowVertexShader = CreateShader(gpuDevice, skinnedShadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1, 1);
 		SDL_GPUShader* shadowFragmentShaders[2]{};
 		for (int masked = 0; masked < 2; ++masked) {
 			const std::string define = masked ? "#define ALPHA_MASKED 1\n" : "#define ALPHA_MASKED 0\n";
@@ -2398,10 +2648,12 @@ namespace Sapphire::Graphics {
 			if (instanceVertexShader) SDL_ReleaseGPUShader(gpuDevice, instanceVertexShader);
 			if (shadowVertexShader) SDL_ReleaseGPUShader(gpuDevice, shadowVertexShader);
 			if (instanceShadowShader) SDL_ReleaseGPUShader(gpuDevice, instanceShadowShader);
+			if (skinnedVertexShader) SDL_ReleaseGPUShader(gpuDevice, skinnedVertexShader);
+			if (skinnedShadowVertexShader) SDL_ReleaseGPUShader(gpuDevice, skinnedShadowVertexShader);
 			for (auto* shader : fragmentShaders) if (shader) SDL_ReleaseGPUShader(gpuDevice, shader);
 			for (auto* shader : shadowFragmentShaders) if (shader) SDL_ReleaseGPUShader(gpuDevice, shader);
 		};
-		if (!vertexShader || !instanceVertexShader || !shadowVertexShader || !instanceShadowShader || !fragmentShaders[0] || !fragmentShaders[1] || !shadowFragmentShaders[0] || !shadowFragmentShaders[1]) {
+		if (!vertexShader || !instanceVertexShader || !shadowVertexShader || !instanceShadowShader || !skinnedVertexShader || !skinnedShadowVertexShader || !fragmentShaders[0] || !fragmentShaders[1] || !shadowFragmentShaders[0] || !shadowFragmentShaders[1]) {
 			releaseShaders();
 			return false;
 		}
@@ -2436,6 +2688,14 @@ namespace Sapphire::Graphics {
 		instanceAttributes[5] = {5, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(MeshInstance, rotation)};
 		instanceAttributes[6] = {6, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(MeshInstance, scale)};
 		instanceAttributes[7] = {7, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT, offsetof(MeshInstance, customData)};
+		SDL_GPUVertexBufferDescription skinnedDescriptions[2]{vertexBufferDescription, {}};
+		skinnedDescriptions[1].slot = 1;
+		skinnedDescriptions[1].pitch = sizeof(SkinInfluence);
+		skinnedDescriptions[1].input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX;
+		SDL_GPUVertexAttribute skinnedAttributes[6]{};
+		std::copy_n(vertexAttributes, 4, skinnedAttributes);
+		skinnedAttributes[4] = {4, 1, SDL_GPU_VERTEXELEMENTFORMAT_USHORT4, offsetof(SkinInfluence, boneIndices)};
+		skinnedAttributes[5] = {5, 1, SDL_GPU_VERTEXELEMENTFORMAT_USHORT4_NORM, offsetof(SkinInfluence, weights)};
 		try {
 			const std::uint8_t whitePixel[4] = {255, 255, 255, 255};
 			whiteTexture = CreateTexture(gpuDevice, 1, 1, whitePixel);
@@ -2540,6 +2800,51 @@ namespace Sapphire::Graphics {
 					}
 				}
 			}
+			pipelineInfo.vertex_input_state.num_vertex_buffers = 2;
+			pipelineInfo.vertex_input_state.vertex_buffer_descriptions = skinnedDescriptions;
+			pipelineInfo.vertex_input_state.num_vertex_attributes = 6;
+			pipelineInfo.vertex_input_state.vertex_attributes = skinnedAttributes;
+			pipelineInfo.vertex_shader = skinnedVertexShader;
+			pipelineInfo.rasterizer_state.enable_depth_bias = false;
+			colorTarget.blend_state.enable_blend = false;
+			pipelineInfo.depth_stencil_state.enable_depth_write = true;
+			pipelineInfo.target_info.num_color_targets = 1;
+			pipelineInfo.target_info.color_target_descriptions = &colorTarget;
+			for (int masked = 0; masked < 2; ++masked) {
+				pipelineInfo.fragment_shader = fragmentShaders[masked];
+				for (int cull = 0; cull < 2; ++cull) {
+					pipelineInfo.rasterizer_state.cull_mode = cull ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_NONE;
+					skinnedPipelines[masked][cull] = CreatePipeline(gpuDevice, pipelineInfo);
+				}
+			}
+			pipelineInfo.fragment_shader = fragmentShaders[0];
+			pipelineInfo.depth_stencil_state.enable_depth_write = false;
+			colorTarget.blend_state.enable_blend = true;
+			colorTarget.blend_state.src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA;
+			colorTarget.blend_state.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+			colorTarget.blend_state.color_blend_op = SDL_GPU_BLENDOP_ADD;
+			colorTarget.blend_state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+			colorTarget.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+			colorTarget.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
+			for (int cull = 0; cull < 2; ++cull) {
+				pipelineInfo.rasterizer_state.cull_mode = cull ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_NONE;
+				skinnedTransparentPipelines[cull] = CreatePipeline(gpuDevice, pipelineInfo);
+			}
+			pipelineInfo.depth_stencil_state.enable_depth_write = true;
+			pipelineInfo.vertex_shader = skinnedShadowVertexShader;
+			pipelineInfo.rasterizer_state.enable_depth_bias = true;
+			pipelineInfo.rasterizer_state.depth_bias_constant_factor = 2.0f;
+			pipelineInfo.rasterizer_state.depth_bias_slope_factor = shadowSlopeFactor;
+			pipelineInfo.target_info.num_color_targets = 0;
+			pipelineInfo.target_info.color_target_descriptions = nullptr;
+			colorTarget.blend_state.enable_blend = false;
+			for (int masked = 0; masked < 2; ++masked) {
+				pipelineInfo.fragment_shader = shadowFragmentShaders[masked];
+				for (int cull = 0; cull < 2; ++cull) {
+					pipelineInfo.rasterizer_state.cull_mode = cull ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_NONE;
+					skinnedShadowPipelines[masked][cull] = CreatePipeline(gpuDevice, pipelineInfo);
+				}
+			}
 		}
 		catch (...) {
 			releaseShaders();
@@ -2547,13 +2852,16 @@ namespace Sapphire::Graphics {
 		}
 		releaseShaders();
 		if (!whiteTexture || !sampler || !shadowSampler || !emptyShadowTexture) return false;
-		for (int masked = 0; masked < 2; ++masked) for (int cull = 0; cull < 2; ++cull) if (!pipelines[masked][cull] || !shadowPipelines[masked][cull] || !instancePipelines[masked][cull] || !instanceShadowPipelines[masked][cull]) return false;
-		return transparentPipelines[0] && transparentPipelines[1] && instanceTransparentPipelines[0] && instanceTransparentPipelines[1];
+		for (int masked = 0; masked < 2; ++masked) for (int cull = 0; cull < 2; ++cull) if (!pipelines[masked][cull] || !shadowPipelines[masked][cull] || !instancePipelines[masked][cull] || !instanceShadowPipelines[masked][cull] || !skinnedPipelines[masked][cull] || !skinnedShadowPipelines[masked][cull]) return false;
+		return transparentPipelines[0] && transparentPipelines[1] && instanceTransparentPipelines[0] && instanceTransparentPipelines[1] && skinnedTransparentPipelines[0] && skinnedTransparentPipelines[1];
 	}
 
 	static void ReleaseSceneResources() {
 		while (!gpuMeshes.empty()) ReleaseMesh(gpuMeshes.begin()->first);
+		for (auto& [skeleton, gpuSkeleton] : gpuSkeletons) ReleaseBuffer(gpuDevice, gpuSkeleton.poseBuffer);
+		gpuSkeletons.clear();
 		meshBounds.clear();
+		skinBounds.clear();
 		meshSources.clear();
 		meshEntries.clear();
 		lightEntries.clear();
@@ -2680,7 +2988,7 @@ namespace Sapphire::Graphics {
 					const float alpha = Time::interpolationAlpha;
 					transform.position = {body->previousPosition.x + (transform.position.x - body->previousPosition.x) * alpha, body->previousPosition.y + (transform.position.y - body->previousPosition.y) * alpha, body->previousPosition.z + (transform.position.z - body->previousPosition.z) * alpha};
 				}
-				if (!object->renderStatic || !source.drawReady) {
+				if (!object->renderStatic || mesh->IsSkinned() || !source.drawReady) {
 					const CellKey cell{scene.cellSize > 0 ? static_cast<int>(std::floor(transform.position.x / scene.cellSize)) : 0, scene.cellSize > 0 ? static_cast<int>(std::floor(transform.position.y / scene.cellSize)) : 0, scene.cellSize > 0 ? static_cast<int>(std::floor(transform.position.z / scene.cellSize)) : 0};
 					source.draws.clear();
 					for (std::size_t sectionIndex = 0; sectionIndex < mesh->SectionCount(); ++sectionIndex) source.draws.push_back(PrepareDraw(mesh, transform, cell, sectionIndex));
@@ -2689,7 +2997,7 @@ namespace Sapphire::Graphics {
 				for (const auto& item : source.draws) {
 					renderItems.push_back(&item);
 					if (shadowsActive) {
-						if (object->renderStatic && !mesh->vertexAnimated) staticItems.push_back(&item);
+						if (object->renderStatic && !mesh->vertexAnimated && !mesh->IsSkinned()) staticItems.push_back(&item);
 						else dynamicItems.push_back(&item);
 					}
 				}
@@ -2709,7 +3017,10 @@ namespace Sapphire::Graphics {
 				visibleItems.push_back(&item);
 			}
 			cullingTimeNanoseconds = SDL_GetTicksNS() - cullingStart;
-			for (const auto* item : visibleItems) item->gpu = &GetMesh(item->mesh);
+			for (const auto* item : visibleItems) {
+				item->gpu = &GetMesh(item->mesh);
+				if (item->skeleton) GetSkeleton(item->skeleton);
+			}
 			FlushUploads();
 			if (directionalShadowsActive) {
 				Loading::Timer shadowLoading("Initial directional shadow preparation and command recording", logLoading);
@@ -2827,6 +3138,7 @@ namespace Sapphire::Graphics {
 		std::array<SDL_GPUTexture*, 8> activeTextures{};
 		GpuMaterial* activeMaterial = nullptr;
 		BufferBindings buffers;
+		SkeletonBindings skeletonBindings;
 		for (const auto* itemPointer : visibleItems) {
 			const RenderItem& item = *itemPointer;
 			Mesh* mesh = item.mesh;
@@ -2839,7 +3151,9 @@ namespace Sapphire::Graphics {
 			const Material& material = mesh->GetMaterial(item.materialIndex);
 			GpuMeshMaterial& gpuMeshMaterial = gpuMesh.materials.at(item.materialIndex);
 			GpuMaterial* activeGpuMaterial = gpuMeshMaterial.material;
-			SDL_GPUGraphicsPipeline* meshPipeline = material.vertexModifierSource.empty() ? (material.transparent ? (mesh->instanced ? instanceTransparentPipelines : transparentPipelines)[mesh->cullBackfaces ? 1 : 0] : (mesh->instanced ? instancePipelines : pipelines)[activeGpuMaterial->masked ? 1 : 0][mesh->cullBackfaces ? 1 : 0]) : (material.transparent ? GetModifierPipelines(material.vertexModifierSource).transparent[mesh->instanced ? 1 : 0][mesh->cullBackfaces ? 1 : 0] : GetModifierPipelines(material.vertexModifierSource).main[mesh->instanced ? 1 : 0][activeGpuMaterial->masked ? 1 : 0][mesh->cullBackfaces ? 1 : 0]);
+			SDL_GPUGraphicsPipeline* meshPipeline = nullptr;
+			if (item.skeleton) meshPipeline = material.vertexModifierSource.empty() ? (material.transparent ? skinnedTransparentPipelines[mesh->cullBackfaces ? 1 : 0] : skinnedPipelines[activeGpuMaterial->masked ? 1 : 0][mesh->cullBackfaces ? 1 : 0]) : (material.transparent ? GetModifierPipelines(material.vertexModifierSource, true).skinnedTransparent[mesh->cullBackfaces ? 1 : 0] : GetModifierPipelines(material.vertexModifierSource, true).skinnedMain[activeGpuMaterial->masked ? 1 : 0][mesh->cullBackfaces ? 1 : 0]);
+			else meshPipeline = material.vertexModifierSource.empty() ? (material.transparent ? (mesh->instanced ? instanceTransparentPipelines : transparentPipelines)[mesh->cullBackfaces ? 1 : 0] : (mesh->instanced ? instancePipelines : pipelines)[activeGpuMaterial->masked ? 1 : 0][mesh->cullBackfaces ? 1 : 0]) : (material.transparent ? GetModifierPipelines(material.vertexModifierSource).transparent[mesh->instanced ? 1 : 0][mesh->cullBackfaces ? 1 : 0] : GetModifierPipelines(material.vertexModifierSource).main[mesh->instanced ? 1 : 0][activeGpuMaterial->masked ? 1 : 0][mesh->cullBackfaces ? 1 : 0]);
 			if (meshPipeline != activePipeline) {
 				SDL_BindGPUGraphicsPipeline(pass, meshPipeline);
 				activePipeline = meshPipeline;
@@ -2874,7 +3188,12 @@ namespace Sapphire::Graphics {
 			SDL_PushGPUVertexUniformData(commandBuffer, 0, &vertex, sizeof(vertex));
 			SDL_PushGPUFragmentUniformData(commandBuffer, 0, &fragment, sizeof(fragment));
 			buffers.Bind(pass, gpuMesh);
-			if (mesh->instanced) {
+			if (item.skeleton) {
+				SDL_GPUBufferBinding skinBinding{gpuMesh.skinBuffer, 0};
+				SDL_BindGPUVertexBuffers(pass, 1, &skinBinding, 1);
+				skeletonBindings.Bind(pass, GetSkeleton(item.skeleton));
+			}
+			else if (mesh->instanced) {
 				SDL_GPUBufferBinding instanceBinding{gpuMesh.instanceBuffer, 0};
 				SDL_BindGPUVertexBuffers(pass, 1, &instanceBinding, 1);
 			}
@@ -2949,6 +3268,9 @@ namespace Sapphire::Graphics {
 			for (auto& instanced : family.main) for (auto& masked : instanced) for (auto* pipeline : masked) if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
 			for (auto& instanced : family.transparent) for (auto* pipeline : instanced) if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
 			for (auto& instanced : family.shadow) for (auto& masked : instanced) for (auto* pipeline : masked) if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
+			for (auto& masked : family.skinnedMain) for (auto* pipeline : masked) if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
+			for (auto* pipeline : family.skinnedTransparent) if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
+			for (auto& masked : family.skinnedShadow) for (auto* pipeline : masked) if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
 		}
 		modifierPipelines.clear();
 		for (const auto& submission : pendingGpuSubmissions) SDL_ReleaseGPUFence(gpuDevice, submission.fence);
@@ -2967,6 +3289,18 @@ namespace Sapphire::Graphics {
 					pipeline = nullptr;
 				}
 			}
+		}
+		for (auto& masked : skinnedPipelines) for (auto*& pipeline : masked) {
+			if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
+			pipeline = nullptr;
+		}
+		for (auto& masked : skinnedShadowPipelines) for (auto*& pipeline : masked) {
+			if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
+			pipeline = nullptr;
+		}
+		for (auto*& pipeline : skinnedTransparentPipelines) {
+			if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
+			pipeline = nullptr;
 		}
 		for (auto& pipeline : transparentPipelines) {
 			if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
