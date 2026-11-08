@@ -1,4 +1,3 @@
-#include "loading.cpp"
 #include <algorithm>
 #include <any>
 #include <limits>
@@ -479,6 +478,106 @@ namespace Sapphire {
 		}
 	};
 
+	struct Primitive {
+		enum class Shape { Cube, Capsule, Plane };
+		Shape shape;
+		static const Primitive Cube;
+		static const Primitive Capsule;
+		static const Primitive Plane;
+		MeshData Mesh(Vector3 size = {1.0f, 1.0f, 1.0f}) const;
+		MeshData Mesh(int subdivisions) const;
+		static float CapsuleRadius(Vector3 size) {
+			return std::min({size.x, size.y, size.z}) * 0.5f;
+		}
+	};
+
+	inline const Primitive Primitive::Cube{Primitive::Shape::Cube};
+	inline const Primitive Primitive::Capsule{Primitive::Shape::Capsule};
+	inline const Primitive Primitive::Plane{Primitive::Shape::Plane};
+
+	inline MeshData Primitive::Mesh(int subdivisions) const {
+		if (shape != Shape::Plane) throw std::invalid_argument("Only planes support subdivisions");
+		MeshData mesh;
+		subdivisions = std::max(subdivisions, 1);
+		const std::uint64_t rowCount = static_cast<std::uint64_t>(subdivisions) + 1;
+		const std::uint64_t vertexCount = rowCount * rowCount;
+		const std::uint64_t quadCount = static_cast<std::uint64_t>(subdivisions) * subdivisions;
+		if (vertexCount > std::numeric_limits<std::uint32_t>::max() / sizeof(MeshVertex) || quadCount > std::numeric_limits<std::uint32_t>::max() / sizeof(std::uint32_t) / 6) throw std::length_error("Plane exceeds GPU buffer size");
+		const int rowSize = static_cast<int>(rowCount);
+		mesh.vertices.reserve(static_cast<std::size_t>(vertexCount));
+		mesh.indices.reserve(static_cast<std::size_t>(quadCount * 6));
+		for (int y = 0; y <= subdivisions; ++y) {
+			for (int x = 0; x <= subdivisions; ++x) {
+				const float u = static_cast<float>(x) / subdivisions;
+				const float v = static_cast<float>(y) / subdivisions;
+				mesh.vertices.push_back({{u - 0.5f, v - 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {u, v}});
+			}
+		}
+		for (int y = 0; y < subdivisions; ++y) {
+			for (int x = 0; x < subdivisions; ++x) {
+				const std::uint32_t first = y * rowSize + x;
+				const std::uint32_t nextRow = first + rowSize;
+				mesh.indices.insert(mesh.indices.end(), {first, nextRow + 1, nextRow, first, first + 1, nextRow + 1});
+			}
+		}
+		return mesh;
+	}
+
+	inline MeshData Primitive::Mesh(Vector3 size) const {
+		if (shape == Shape::Plane) {
+			MeshData mesh = Mesh(1);
+			for (auto& vertex : mesh.vertices) {
+				vertex.position.x *= size.x;
+				vertex.position.y *= size.y;
+			}
+			return mesh;
+		}
+		if (shape == Shape::Cube) {
+			MeshData mesh;
+			const Vector3 faces[6][4] = {
+				{{-0.5f,-0.5f,0.5f}, {0.5f,-0.5f,0.5f}, {0.5f,0.5f,0.5f}, {-0.5f,0.5f,0.5f}},
+				{{0.5f,-0.5f,-0.5f}, {-0.5f,-0.5f,-0.5f}, {-0.5f,0.5f,-0.5f}, {0.5f,0.5f,-0.5f}},
+				{{0.5f,-0.5f,0.5f}, {0.5f,-0.5f,-0.5f}, {0.5f,0.5f,-0.5f}, {0.5f,0.5f,0.5f}},
+				{{-0.5f,-0.5f,-0.5f}, {-0.5f,-0.5f,0.5f}, {-0.5f,0.5f,0.5f}, {-0.5f,0.5f,-0.5f}},
+				{{-0.5f,0.5f,0.5f}, {0.5f,0.5f,0.5f}, {0.5f,0.5f,-0.5f}, {-0.5f,0.5f,-0.5f}},
+				{{-0.5f,-0.5f,-0.5f}, {0.5f,-0.5f,-0.5f}, {0.5f,-0.5f,0.5f}, {-0.5f,-0.5f,0.5f}}
+			};
+			const Vector3 normals[6] = {{0,0,1}, {0,0,-1}, {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}};
+			for (int face = 0; face < 6; ++face) {
+				const std::uint32_t first = static_cast<std::uint32_t>(mesh.vertices.size());
+				for (int corner = 0; corner < 4; ++corner) mesh.vertices.push_back({{faces[face][corner].x * size.x, faces[face][corner].y * size.y, faces[face][corner].z * size.z}, normals[face], {corner == 1 || corner == 2 ? 1.0f : 0.0f, corner >= 2 ? 1.0f : 0.0f}});
+				mesh.indices.insert(mesh.indices.end(), {first, first + 1, first + 2, first, first + 2, first + 3});
+			}
+			return mesh;
+		}
+		MeshData mesh;
+		const float radius = CapsuleRadius(size);
+		const float halfStraight = std::max(0.0f, size.z * 0.5f - radius);
+		constexpr int sides = 16;
+		constexpr int hemisphereRings = 8;
+		constexpr float pi = 3.14159265358979323846f;
+		auto addRing = [&](float angle, float centerZ) {
+			const float ringRadius = radius * std::cos(angle);
+			const float z = centerZ + radius * std::sin(angle);
+			for (int side = 0; side <= sides; ++side) {
+				const float u = static_cast<float>(side) / sides;
+				const float azimuth = u * 2.0f * pi;
+				const float cosine = std::cos(azimuth);
+				const float sine = std::sin(azimuth);
+				mesh.vertices.push_back({{ringRadius * cosine, ringRadius * sine, z}, {std::cos(angle) * cosine, std::cos(angle) * sine, std::sin(angle)}, {u, size.z > 0.0f ? z / size.z + 0.5f : 0.5f}});
+			}
+		};
+		for (int ring = 0; ring <= hemisphereRings; ++ring) addRing(-pi * 0.5f + static_cast<float>(ring) / hemisphereRings * pi * 0.5f, -halfStraight);
+		for (int ring = halfStraight > 0.0f ? 0 : 1; ring <= hemisphereRings; ++ring) addRing(static_cast<float>(ring) / hemisphereRings * pi * 0.5f, halfStraight);
+		const std::uint32_t ringCount = static_cast<std::uint32_t>(mesh.vertices.size() / (sides + 1));
+		for (std::uint32_t ring = 0; ring + 1 < ringCount; ++ring) for (int side = 0; side < sides; ++side) {
+			const std::uint32_t first = ring * (sides + 1) + side;
+			const std::uint32_t next = first + sides + 1;
+			mesh.indices.insert(mesh.indices.end(), {first, first + 1, next, first + 1, next + 1, next});
+		}
+		return mesh;
+	}
+
 	struct Material {
 		Vector3 baseColor{1.0f, 1.0f, 1.0f};
 		std::string baseTexturePath;
@@ -564,8 +663,6 @@ namespace Sapphire {
 			void ValidateSkeleton(const Skeleton& skeleton) const { data.ValidateSkeleton(skeleton); }
 			void MarkDirty() { ++revision; }
 			void MarkInstancesDirty() { ++instanceRevision; }
-			static MeshData Cube();
-			static MeshData Plane(int subdivisions = 1);
 	};
 
 	struct MeshRevision {
@@ -1093,6 +1190,7 @@ namespace Sapphire {
 			bool ambientLight = true;
 			Vector3 ambientLightColor{1.0f, 1.0f, 1.0f};
 			bool fogEnabled = false;
+			bool debugMode = false;
 			Vector3 fogColor;
 			Vector3 backgroundColor;
 
@@ -1161,6 +1259,8 @@ namespace Sapphire {
 			std::uint64_t transformGeneration = 0;
 			WorldPartitioner worldPartitioner;
 	};
+
+	namespace Physics { std::vector<Vector3> ColliderDebugLines(Scene& scene); }
 
 	namespace {
 		struct S3DRecord {

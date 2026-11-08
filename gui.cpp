@@ -132,7 +132,6 @@ namespace Sapphire::GUI {
 	}
 
 	bool Initialize(SDL_GPUDevice* device, SDL_Window* window) {
-		Loading::Timer loading("GUI shaders and font atlas");
 		gpuDevice = device;
 		SDL_GPUShader* vertexShader = Graphics::CreateShader(gpuDevice, vertexShaderSource, SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 0, 1);
 		SDL_GPUShader* fragmentShader = Graphics::CreateShader(gpuDevice, fragmentShaderSource, SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 1);
