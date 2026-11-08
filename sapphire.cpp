@@ -6,7 +6,7 @@
 
 namespace Sapphire {
 	namespace {
-		bool running = false;
+		bool running = true;
 	}
 
 	void Exit() {
@@ -25,9 +25,6 @@ namespace Sapphire {
 	}
 
 	int App(const char* windowTitle, Scene& scene) {
-		Loading::Timer loading("Engine initialization");
-		Loading::Timer windowLoading("SDL, window and GPU device");
-		running = true;
 		if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) return 1;
 		Input::Initialize();
 		SDL_Window *window = SDL_CreateWindow(windowTitle, Screen::width, Screen::height, SDL_WINDOW_RESIZABLE | SDL_WINDOW_FULLSCREEN);
@@ -43,9 +40,9 @@ namespace Sapphire {
 			Shutdown(gpuDevice, window, claimed);
 			return 1;
 		}
+
 		try {
 			SDL_SetWindowAspectRatio(window, 16.0f / 9.0f, 16.0f / 9.0f);
-			windowLoading.Stop();
 			if (!Graphics::Initialize(gpuDevice, window) || !GUI::Initialize(gpuDevice, window) || !std::isfinite(Time::fixedDeltaTime) || Time::fixedDeltaTime <= 0.0f) {
 				SDL_Log("Engine initialization failed: %s", SDL_GetError());
 				Shutdown(gpuDevice, window, claimed);
@@ -55,7 +52,6 @@ namespace Sapphire {
 			const float fixedStep = Time::fixedDeltaTime;
 			const Uint64 fixedStepNs = std::max<Uint64>(1, static_cast<Uint64>(fixedStep * 1'000'000'000.0));
 			Uint64 accumulator = 0;
-			Loading::Timer sceneLoading("Scene object initialization");
 			scene.SetAppActive(true);
 			auto initializeObjects = [&] {
 				for (std::size_t index = 0; index < scene.Objects().size(); ++index) {
@@ -81,15 +77,10 @@ namespace Sapphire {
 			for (auto& object : scene.Objects()) object->initializedForApp = false;
 			initializeObjects();
 			scene.SelectFirstCamera();
-			sceneLoading.Stop();
 			Physics::Initialize(scene);
 			Graphics::PrepareScene(scene);
-			loading.Stop();
-			std::cout.flush();
-			bool firstFrame = true;
 			Uint64 previous_time = SDL_GetTicksNS();
 			while (running) {
-				Loading::Timer frameLoading("First frame CPU preparation, swapchain acquire and submission", firstFrame);
 				const Uint64 frameStart = SDL_GetTicksNS();
 				Input::BeginFrame();
 				GUI::BeginFrame();
@@ -102,7 +93,6 @@ namespace Sapphire {
 						Screen::height = event.window.data2;
 					}
 				}
-
 				Input::EndEvents();
 
 				const Uint64 current_time = frameStart;
@@ -162,9 +152,6 @@ namespace Sapphire {
 					}
 					throw;
 				}
-				frameLoading.Stop();
-				if (firstFrame) std::cout.flush();
-				firstFrame = false;
 				if (!swapchainTexture) SDL_Delay(10);
 			}
 

@@ -244,6 +244,9 @@ namespace Sapphire::Graphics {
 
 		SDL_GPUDevice* gpuDevice = nullptr;
 		SDL_GPUTextureFormat pipelineColorFormat = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+		SDL_GPUGraphicsPipeline* colliderDebugPipeline = nullptr;
+		SDL_GPUBuffer* colliderDebugBuffer = nullptr;
+		Uint32 colliderDebugCapacity = 0;
 		SDL_GPUGraphicsPipeline* pipelines[2][2]{};
 		SDL_GPUGraphicsPipeline* instancePipelines[2][2]{};
 		SDL_GPUGraphicsPipeline* transparentPipelines[2]{};
@@ -274,7 +277,6 @@ namespace Sapphire::Graphics {
 		ShadowMapData fallbackShadowMap;
 		bool fallbackShadowReady = false;
 		int batchCellSize = -1;
-		bool loadingFrame = true;
 		const Light* shadowLight = nullptr;
 		std::map<CellKey, StaticShadowMap> staticShadowMaps;
 		std::unordered_map<Mesh*, CellKey> staticBatchCells;
@@ -690,12 +692,12 @@ namespace Sapphire::Graphics {
 				float nDotV;
 				float viewVisibility;
 			};
-			float3 EvaluateLight(Surface surface, float3 light) {
-				float nDotL = max(dot(surface.normal, light), 0.0);
+			float3 EvaluateLight(Surface surface, float3 light, bool twoSided) {
+				float nDotL = max(twoSided ? abs(dot(surface.normal, light)) : dot(surface.normal, light), 0.0);
 				if (nDotL <= 0.0) return float3(0.0);
 				float3 halfVector = surface.view + light;
 				halfVector *= rsqrt(max(dot(halfVector, halfVector), 0.000001));
-				float nDotH = clamp(dot(surface.normal, halfVector), 0.0, 1.0);
+				float nDotH = clamp(twoSided ? abs(dot(surface.normal, halfVector)) : dot(surface.normal, halfVector), 0.0, 1.0);
 				float vDotH = clamp(dot(surface.view, halfVector), 0.0, 1.0);
 				float denominator = nDotH * nDotH * (surface.alphaSquared - 1.0) + 1.0;
 				float distribution = surface.alphaSquared / max(3.14159265 * denominator * denominator, 0.000000000001);
@@ -733,6 +735,7 @@ namespace Sapphire::Graphics {
 			}
 			fragment float4 main0(FragmentInput input [[stage_in]], constant FragmentUniforms& uniforms [[buffer(0)]], constant FrameUniforms& frame [[buffer(1)]], texture2d<float> image [[texture(0)]], sampler imageSampler [[sampler(0)]], depth2d<float> detailMap [[texture(1)]], sampler detailSampler [[sampler(1)]], depth2d<float> fallbackMap [[texture(2)]], sampler fallbackSampler [[sampler(2)]], depth2d<float> dynamicMap [[texture(3)]], sampler dynamicSampler [[sampler(3)]], depth2d_array<float> pointShadowMap [[texture(4)]], sampler pointShadowSampler [[sampler(4)]], texture2d<float> normalMap [[texture(5)]], sampler normalSampler [[sampler(5)]], texture2d<float> roughnessMap [[texture(6)]], sampler roughnessSampler [[sampler(6)]], texture2d<float> aoMap [[texture(7)]], sampler aoSampler [[sampler(7)]]) {
 				uint materialFlags = uint(uniforms.lightingParameters.x);
+				bool twoSided = (materialFlags & 32u) != 0u;
 				float3 normal = (materialFlags & 16u) != 0u ? float3(0.0) : normalize(input.worldNormal);
 				if ((materialFlags & 16u) == 0u && (materialFlags & 9u) != 0u) {
 					float3 dpdx = dfdx(input.worldPosition);
@@ -778,9 +781,9 @@ namespace Sapphire::Graphics {
 				float3 view = frame.cameraPosition.xyz - input.worldPosition;
 				view *= rsqrt(max(dot(view, view), 0.000001));
 				float alphaSquared = roughness * roughness * roughness * roughness;
-				float nDotV = max(dot(normal, view), 0.0001);
+				float nDotV = max(twoSided ? abs(dot(normal, view)) : dot(normal, view), 0.0001);
 				Surface surface{normal, view, albedo, mix(float3(0.04), albedo, metallic), metallic, alphaSquared, nDotV, sqrt(nDotV * nDotV * (1.0 - alphaSquared) + alphaSquared)};
-				float diffuse = max(dot(normal, -frame.directionalDirection.xyz), 0.0) * frame.directionalDirection.w;
+				float diffuse = max(twoSided ? abs(dot(normal, -frame.directionalDirection.xyz)) : dot(normal, -frame.directionalDirection.xyz), 0.0) * frame.directionalDirection.w;
 				bool directionalShadow = uniforms.lightingParameters.z > 0.5 && diffuse > 0.0;
 				float staticShadow = 0.0;
 				if (directionalShadow) {
@@ -790,7 +793,7 @@ namespace Sapphire::Graphics {
 				}
 				float dynamicShadow = 0.0;
 				if (directionalShadow) dynamicShadow = ShadowAmount(input.shadowPosition2, dynamicMap, dynamicSampler, uniforms.shadowParameters[2]);
-				float3 direct = frame.directionalDirection.w > 0.0 ? EvaluateLight(surface, -frame.directionalDirection.xyz) * frame.directionalColor.rgb * frame.directionalDirection.w * (1.0 - staticShadow) * (1.0 - dynamicShadow) : float3(0.0);
+				float3 direct = frame.directionalDirection.w > 0.0 ? EvaluateLight(surface, -frame.directionalDirection.xyz, twoSided) * frame.directionalColor.rgb * frame.directionalDirection.w * (1.0 - staticShadow) * (1.0 - dynamicShadow) : float3(0.0);
 				float3 pointLighting = float3(0.0);
 				for (int light = 0; light < int(uniforms.lightingParameters.w); ++light) {
 					uint index = uniforms.pointLightIndices[light / 4][light % 4];
@@ -800,7 +803,7 @@ namespace Sapphire::Graphics {
 					float distanceSquared = dot(toLight, toLight);
 					if (distanceSquared < positionRange.w * positionRange.w) {
 						float distanceToLight = sqrt(distanceSquared);
-						float pointDiffuse = max(dot(normal, toLight / max(distanceToLight, 0.0001)), 0.0);
+						float pointDiffuse = max(twoSided ? abs(dot(normal, toLight / max(distanceToLight, 0.0001))) : dot(normal, toLight / max(distanceToLight, 0.0001)), 0.0);
 						if (pointDiffuse <= 0.0) continue;
 						float rangeFade = clamp(1.0 - distanceToLight / positionRange.w, 0.0, 1.0);
 						float attenuation = rangeFade * rangeFade / max(distanceSquared, 1.0);
@@ -808,7 +811,7 @@ namespace Sapphire::Graphics {
 						float shadowBias = frame.pointLightShadowBias[index].x;
 						float staticPointShadow = uniforms.lightingParameters.z > 0.5 && shadowInfo.z > 0.5 ? PointShadowAmount(-toLight, positionRange.w, shadowBias, uint(shadowInfo.x), pointShadowMap, pointShadowSampler, uniforms.shadowParameters[0].z) : 0.0;
 						float dynamicPointShadow = uniforms.lightingParameters.z > 0.5 && shadowInfo.w > 0.5 ? PointShadowAmount(-toLight, positionRange.w, shadowBias, uint(shadowInfo.y), pointShadowMap, pointShadowSampler, uniforms.shadowParameters[0].z) : 0.0;
-						pointLighting += EvaluateLight(surface, toLight / max(distanceToLight, 0.0001)) * colorIntensity.rgb * colorIntensity.a * attenuation * (1.0 - staticPointShadow) * (1.0 - dynamicPointShadow);
+						pointLighting += EvaluateLight(surface, toLight / max(distanceToLight, 0.0001), twoSided) * colorIntensity.rgb * colorIntensity.a * attenuation * (1.0 - staticPointShadow) * (1.0 - dynamicPointShadow);
 					}
 				}
 				float3 ambient = frame.ambientLight.a > 0.5 ? frame.ambientLight.rgb : float3(0.0);
@@ -1403,7 +1406,6 @@ namespace Sapphire::Graphics {
 		}
 
 		void BuildStaticBatches(Scene& scene, bool rebuildAll) {
-			Loading::Timer loading("Static mesh batching and upload recording", loadingFrame);
 			++meshRebuildCount;
 			std::vector<GpuMaterial*> retainedMaterials;
 			for (auto batch = staticBatches.begin(); batch != staticBatches.end();) {
@@ -1510,62 +1512,6 @@ namespace Sapphire::Graphics {
 			staticDraws.reserve(staticBatches.size());
 			for (auto& batch : staticBatches) staticDraws.push_back(PrepareDraw(batch.get(), {}, staticBatchCells.at(batch.get())));
 			for (auto* material : retainedMaterials) ReleaseMaterial(material);
-		}
-
-		MeshVertex MakeVertex(Vector3 position, Vector3 normal, float u, float v) {
-			return {position, normal, {u, v}};
-		}
-
-		void AddFace(MeshData& mesh, const Vector3 (&positions)[4], Vector3 normal) {
-			const std::uint32_t first = static_cast<std::uint32_t>(mesh.vertices.size());
-			mesh.vertices.push_back(MakeVertex(positions[0], normal, 0.0f, 0.0f));
-			mesh.vertices.push_back(MakeVertex(positions[1], normal, 1.0f, 0.0f));
-			mesh.vertices.push_back(MakeVertex(positions[2], normal, 1.0f, 1.0f));
-			mesh.vertices.push_back(MakeVertex(positions[3], normal, 0.0f, 1.0f));
-			mesh.indices.insert(mesh.indices.end(), {first, first + 1, first + 2, first, first + 2, first + 3});
-		}
-
-		MeshData CreatePlane(int subdivisions) {
-			MeshData mesh;
-			subdivisions = std::max(subdivisions, 1);
-			const std::uint64_t rowCount = static_cast<std::uint64_t>(subdivisions) + 1;
-			const std::uint64_t vertexCount = rowCount * rowCount;
-			const std::uint64_t quadCount = static_cast<std::uint64_t>(subdivisions) * subdivisions;
-			if (vertexCount > std::numeric_limits<Uint32>::max() / sizeof(MeshVertex) || quadCount > std::numeric_limits<Uint32>::max() / sizeof(std::uint32_t) / 6) throw std::length_error("Plane exceeds GPU buffer size");
-			const std::uint64_t indexCount = quadCount * 6;
-			const int rowSize = static_cast<int>(rowCount);
-			mesh.vertices.reserve(static_cast<std::size_t>(vertexCount));
-			mesh.indices.reserve(static_cast<std::size_t>(indexCount));
-			for (int y = 0; y <= subdivisions; ++y) {
-				for (int x = 0; x <= subdivisions; ++x) {
-					const float u = static_cast<float>(x) / subdivisions;
-					const float v = static_cast<float>(y) / subdivisions;
-					mesh.vertices.push_back(MakeVertex({u - 0.5f, v - 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, u, v));
-				}
-			}
-			for (int y = 0; y < subdivisions; ++y) {
-				for (int x = 0; x < subdivisions; ++x) {
-					const std::uint32_t first = y * rowSize + x;
-					const std::uint32_t nextRow = first + rowSize;
-					mesh.indices.insert(mesh.indices.end(), {first, nextRow + 1, nextRow, first, first + 1, nextRow + 1});
-				}
-			}
-			return mesh;
-		}
-
-		MeshData CreateCube() {
-			MeshData mesh;
-			const Vector3 faces[6][4] = {
-				{{-0.5f,-0.5f,0.5f}, {0.5f,-0.5f,0.5f}, {0.5f,0.5f,0.5f}, {-0.5f,0.5f,0.5f}},
-				{{0.5f,-0.5f,-0.5f}, {-0.5f,-0.5f,-0.5f}, {-0.5f,0.5f,-0.5f}, {0.5f,0.5f,-0.5f}},
-				{{0.5f,-0.5f,0.5f}, {0.5f,-0.5f,-0.5f}, {0.5f,0.5f,-0.5f}, {0.5f,0.5f,0.5f}},
-				{{-0.5f,-0.5f,-0.5f}, {-0.5f,-0.5f,0.5f}, {-0.5f,0.5f,0.5f}, {-0.5f,0.5f,-0.5f}},
-				{{-0.5f,0.5f,0.5f}, {0.5f,0.5f,0.5f}, {0.5f,0.5f,-0.5f}, {-0.5f,0.5f,-0.5f}},
-				{{-0.5f,-0.5f,-0.5f}, {0.5f,-0.5f,-0.5f}, {0.5f,-0.5f,0.5f}, {-0.5f,-0.5f,0.5f}}
-			};
-			const Vector3 normals[6] = {{0,0,1}, {0,0,-1}, {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}};
-			for (int face = 0; face < 6; ++face) AddFace(mesh, faces[face], normals[face]);
-			return mesh;
 		}
 
 		SDL_GPUBuffer* UploadBuffer(SDL_GPUBufferUsageFlags usage, const void* data, Uint32 size, SDL_GPUBuffer* existing = nullptr) {
@@ -2355,7 +2301,6 @@ namespace Sapphire::Graphics {
 			++textureReferences[found->second];
 			return found->second;
 		}
-		Loading::Timer loading("Texture decode, mipmaps and upload recording: " + std::string(fileName));
 		SDL_Surface* loadedSurface = SDL_LoadSurface(path.c_str());
 		if (!loadedSurface) return nullptr;
 		SDL_Surface* rgbaSurface = SDL_ConvertSurface(loadedSurface, SDL_PIXELFORMAT_RGBA32);
@@ -2456,6 +2401,40 @@ namespace Sapphire::Graphics {
 		auto* pipeline = SDL_CreateGPUGraphicsPipeline(gpuDevice, &pipelineInfo);
 		if (!pipeline) throw std::runtime_error(std::string("Create GPU pipeline: ") + SDL_GetError());
 		return pipeline;
+	}
+
+	void PrepareColliderDebugPipeline() {
+		if (colliderDebugPipeline) return;
+		constexpr const char* vertexSource = R"(using namespace metal;
+		struct Input { float3 position [[attribute(0)]]; };
+		struct Output { float4 position [[position]]; };
+		vertex Output main0(Input input [[stage_in]], constant float4x4& mvp [[buffer(0)]]) { return {mvp * float4(input.position, 1.0)}; }
+		)";
+		constexpr const char* fragmentSource = R"(using namespace metal;
+		fragment float4 main0() { return float4(0.0, 1.0, 1.0, 1.0); }
+		)";
+		SDL_GPUShader* vertex = CreateShader(gpuDevice, vertexSource, SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 0, 1);
+		SDL_GPUShader* fragment = CreateShader(gpuDevice, fragmentSource, SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL);
+		if (!vertex || !fragment) throw std::runtime_error(std::string("Create collider debug shader: ") + SDL_GetError());
+		SDL_GPUVertexBufferDescription bufferDescription{0, sizeof(Vector3), SDL_GPU_VERTEXINPUTRATE_VERTEX, 0};
+		SDL_GPUVertexAttribute attribute{0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, 0};
+		SDL_GPUColorTargetDescription colorTarget{};
+		colorTarget.format = pipelineColorFormat;
+		SDL_GPUGraphicsPipelineCreateInfo info{};
+		info.vertex_shader = vertex;
+		info.fragment_shader = fragment;
+		info.vertex_input_state.vertex_buffer_descriptions = &bufferDescription;
+		info.vertex_input_state.num_vertex_buffers = 1;
+		info.vertex_input_state.vertex_attributes = &attribute;
+		info.vertex_input_state.num_vertex_attributes = 1;
+		info.primitive_type = SDL_GPU_PRIMITIVETYPE_LINELIST;
+		info.target_info.color_target_descriptions = &colorTarget;
+		info.target_info.num_color_targets = 1;
+		info.target_info.has_depth_stencil_target = true;
+		info.target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+		colliderDebugPipeline = CreatePipeline(gpuDevice, info);
+		SDL_ReleaseGPUShader(gpuDevice, vertex);
+		SDL_ReleaseGPUShader(gpuDevice, fragment);
 	}
 
 	namespace {
@@ -2625,7 +2604,6 @@ namespace Sapphire::Graphics {
 	}
 
 	bool Initialize(SDL_GPUDevice* device, SDL_Window* window) {
-		Loading::Timer loading("Graphics shaders and pipelines");
 		gpuDevice = device;
 		linearOutput = window && SDL_WindowSupportsGPUSwapchainComposition(device, window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR) && SDL_SetGPUSwapchainParameters(device, window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR, SDL_GPU_PRESENTMODE_VSYNC);
 		SDL_GPUShader* vertexShader = CreateShader(gpuDevice, vertexShaderSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
@@ -2890,8 +2868,6 @@ namespace Sapphire::Graphics {
 	}
 
 	void PrepareScene(Scene& scene) {
-		Loading::Timer loading("Graphics scene preparation");
-		loadingFrame = true;
 		ReleaseSceneResources();
 		UpdateSceneResources(scene);
 		fallbackShadowReady = false;
@@ -2940,9 +2916,6 @@ namespace Sapphire::Graphics {
 
 	void Render(Scene& scene, SDL_GPUCommandBuffer* commandBuffer, SDL_GPUTexture* colorTarget, Uint32 width, Uint32 height) {
 		if (!colorTarget || !width || !height) return;
-		const bool logLoading = loadingFrame;
-		loadingFrame = false;
-		Loading::Timer loading("First frame graphics preparation and command recording", logLoading);
 		const Uint64 renderStart = SDL_GetTicksNS();
 		UpdateSceneResources(scene);
 		EnsureShadowResolution(scene.shadowResolution);
@@ -3027,7 +3000,6 @@ namespace Sapphire::Graphics {
 			}
 			FlushUploads();
 			if (directionalShadowsActive) {
-				Loading::Timer shadowLoading("Initial directional shadow preparation and command recording", logLoading);
 				if (light->renderStatic) {
 					const Vector3 direction = Normalize(light->direction);
 					if (shadowLight != light->source || direction.x != staticShadowDirection.x || direction.y != staticShadowDirection.y || direction.z != staticShadowDirection.z) {
@@ -3069,9 +3041,23 @@ namespace Sapphire::Graphics {
 				RenderShadowMap(commandBuffer, dynamicShadowTexture, dynamicMap, shadowCasters, frameTime);
 			}
 		}
-		Loading::Timer pointShadowLoading("Initial point shadow preparation and command recording", logLoading);
 		RenderPointShadows(scene, commandBuffer, frameTime);
-		pointShadowLoading.Stop();
+		Uint32 colliderDebugVertices = 0;
+		if (scene.debugMode && scene.activeCamera) {
+			const std::vector<Vector3> lines = Physics::ColliderDebugLines(scene);
+			if (!lines.empty()) {
+				PrepareColliderDebugPipeline();
+				const Uint32 bytes = static_cast<Uint32>(lines.size() * sizeof(Vector3));
+				if (bytes > colliderDebugCapacity) {
+					ReleaseBuffer(gpuDevice, colliderDebugBuffer);
+					colliderDebugBuffer = nullptr;
+					colliderDebugCapacity = bytes;
+				}
+				colliderDebugBuffer = UploadBuffer(SDL_GPU_BUFFERUSAGE_VERTEX, lines.data(), bytes, colliderDebugBuffer);
+				colliderDebugVertices = static_cast<Uint32>(lines.size());
+				FlushUploads();
+			}
+		}
 		FrameUniforms frame{};
 		frame.cameraPosition[0] = cameraTransform.position.x;
 		frame.cameraPosition[1] = cameraTransform.position.y;
@@ -3172,6 +3158,7 @@ namespace Sapphire::Graphics {
 			std::memcpy(vertex.uvTransform, gpuMeshMaterial.uv, sizeof(vertex.uvTransform));
 			vertex.modifierTime[0] = frameTime;
 			FragmentUniforms fragment = gpuMeshMaterial.fragment;
+			if (!mesh->cullBackfaces) fragment.lightingParameters[0] = static_cast<float>(static_cast<Uint32>(fragment.lightingParameters[0]) | 32u);
 			Uint32 lightCount = 0;
 			for (Uint32 index = 0; index < pointLights.size(); ++index) {
 				if (!(item.lightMask & (1u << index))) continue;
@@ -3222,6 +3209,14 @@ namespace Sapphire::Graphics {
 			SDL_DrawGPUIndexedPrimitives(pass, item.indexCount, mesh->instanced ? gpuMesh.uploadedInstanceCount : 1, item.firstIndex, 0, 0);
 			++drawCallCount;
 		}
+		if (colliderDebugVertices) {
+			SDL_BindGPUGraphicsPipeline(pass, colliderDebugPipeline);
+			SDL_GPUBufferBinding binding{colliderDebugBuffer, 0};
+			SDL_BindGPUVertexBuffers(pass, 0, &binding, 1);
+			SDL_PushGPUVertexUniformData(commandBuffer, 0, viewProjection.values, sizeof(viewProjection.values));
+			SDL_DrawGPUPrimitives(pass, colliderDebugVertices, 1, 0, 0);
+			++drawCallCount;
+		}
 		SDL_EndGPURenderPass(pass);
 		triangleCountString = std::to_string(visibleTriangles) + "/" + std::to_string(sceneTriangleCount);
 		renderTimeNanoseconds = SDL_GetTicksNS() - renderStart;
@@ -3260,6 +3255,11 @@ namespace Sapphire::Graphics {
 	}
 
 	void Shutdown() {
+		if (colliderDebugPipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, colliderDebugPipeline);
+		colliderDebugPipeline = nullptr;
+		ReleaseBuffer(gpuDevice, colliderDebugBuffer);
+		colliderDebugBuffer = nullptr;
+		colliderDebugCapacity = 0;
 		if (uploadCommandBuffer) {
 			if (uploadPass) SDL_EndGPUCopyPass(uploadPass);
 			SDL_CancelGPUCommandBuffer(uploadCommandBuffer);
@@ -3360,9 +3360,4 @@ namespace Sapphire::Graphics {
 		shadowSampler = nullptr;
 		gpuDevice = nullptr;
 	}
-}
-
-namespace Sapphire {
-	MeshData Mesh::Cube() { return Graphics::CreateCube(); }
-	MeshData Mesh::Plane(int subdivisions) { return Graphics::CreatePlane(subdivisions); }
 }

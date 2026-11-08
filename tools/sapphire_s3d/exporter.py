@@ -2,7 +2,7 @@ import bpy
 import math
 import os
 import struct
-from bpy.props import StringProperty
+from bpy.props import BoolProperty, StringProperty
 from bpy_extras.io_utils import ExportHelper
 
 
@@ -143,8 +143,7 @@ def vertex_weights(obj, vertex_index, bone_indices):
     return (tuple(index for index, _ in weights) + (0,) * (4 - len(weights)), tuple(quantized) + (0,) * (4 - len(weights)))
 
 
-def mesh_payload(obj, export_path):
-    mesh = obj.data
+def mesh_payload(obj, export_path, mesh, apply_modifiers):
     mesh.calc_loop_triangles()
     materials = list(mesh.materials)
     if not materials:
@@ -154,7 +153,7 @@ def mesh_payload(obj, export_path):
         material_index = min(triangle.material_index, len(materials) - 1)
         used[material_index].append(triangle)
 
-    armature = armature_for(obj)
+    armature = None if apply_modifiers else armature_for(obj)
     bones = bone_records(obj, armature)
     bone_indices = {bone[0]: index for index, bone in enumerate(bones)}
     uv_layer = mesh.uv_layers.active
@@ -196,7 +195,7 @@ def mesh_payload(obj, export_path):
     return vertices, indices, sections, material_records, bones, skin
 
 
-def write_object(file, obj, export_path):
+def write_object(file, obj, export_path, apply_modifiers, depsgraph):
     is_light = obj.type == "LIGHT"
     write_string(file, obj.name)
     file.write(struct.pack("<BB", int(is_light), int(bool(obj.get("isParent", False)))))
@@ -213,10 +212,20 @@ def write_object(file, obj, export_path):
         color = tuple(light.color)
         outer = math.degrees(light.spot_size) if light.type == "SPOT" else 30.0
         inner = outer * (1.0 - light.spot_blend) if light.type == "SPOT" else 25.0
-        file.write(struct.pack("<B3f4fBf", light_type, *color, light.energy, light.cutoff_distance if light.type != "SUN" else 1000.0, inner, outer, int(light.use_shadow), 0.02))
+        file.write(struct.pack("<B3f4fBf", light_type, *color, light.energy * 2.0 ** light.exposure, light.cutoff_distance if light.type != "SUN" else 1000.0, inner, outer, int(light.use_shadow), 0.02))
         return
 
-    vertices, indices, sections, materials, bones, skin = mesh_payload(obj, export_path)
+    if apply_modifiers:
+        evaluated = obj.evaluated_get(depsgraph)
+        mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+        try:
+            if mesh is None:
+                raise ValueError("Could not evaluate mesh: " + obj.name)
+            vertices, indices, sections, materials, bones, skin = mesh_payload(obj, export_path, mesh, True)
+        finally:
+            evaluated.to_mesh_clear()
+    else:
+        vertices, indices, sections, materials, bones, skin = mesh_payload(obj, export_path, obj.data, False)
     file.write(struct.pack("<5I", len(vertices), len(indices), len(sections), len(materials), len(bones)))
     for position, normal, uv, color in vertices:
         file.write(struct.pack("<12f", *position, *normal, *uv, *color))
@@ -244,6 +253,7 @@ class ExportSapphireS3D(bpy.types.Operator, ExportHelper):
 
     filename_ext = ".s3d"
     filter_glob: StringProperty(default="*.s3d", options={"HIDDEN"})
+    apply_modifiers: BoolProperty(name="Apply Modifiers", default=False)
 
     def execute(self, context):
         objects = [obj for obj in context.selected_objects if obj.type in {"MESH", "LIGHT"}]
@@ -254,12 +264,13 @@ class ExportSapphireS3D(bpy.types.Operator, ExportHelper):
             self.report({"ERROR"}, "Only one selected object may have isParent enabled")
             return {"CANCELLED"}
         objects.sort(key=lambda obj: not bool(obj.get("isParent", False)))
+        depsgraph = context.evaluated_depsgraph_get() if self.apply_modifiers else None
         try:
             with open(self.filepath, "wb") as file:
                 file.write(b"S3D\0")
                 file.write(struct.pack("<I", len(objects)))
                 for obj in objects:
-                    write_object(file, obj, self.filepath)
+                    write_object(file, obj, self.filepath, self.apply_modifiers, depsgraph)
         except (OSError, ValueError, struct.error) as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
