@@ -1355,7 +1355,7 @@ namespace Sapphire {
 		struct S3DRecord {
 			std::string name;
 			std::uint8_t type;
-			bool parent;
+			std::vector<std::pair<std::string, std::string>> parameters;
 			Transform transform;
 			MeshData data;
 			std::vector<Material> materials;
@@ -1436,13 +1436,32 @@ namespace Sapphire {
 			if (!objectCount) throw std::runtime_error("S3D contains no objects");
 			std::vector<S3DRecord> records;
 			records.reserve(objectCount);
-			std::size_t parentCount = 0;
+			std::unordered_set<std::string> names;
+			std::unordered_set<std::string> parents;
 			for (std::uint32_t objectIndex = 0; objectIndex < objectCount; ++objectIndex) {
 				S3DRecord record{};
 				record.name = reader.String();
+				if (!names.insert(record.name).second) throw std::runtime_error("Duplicate S3D object name");
 				record.type = reader.Read<std::uint8_t>();
-				record.parent = reader.Read<std::uint8_t>() != 0;
-				parentCount += record.parent;
+				const auto parameterCount = reader.Count(8);
+				if (!parameterCount) throw std::runtime_error("S3D object has no hierarchy parameter");
+				record.parameters.reserve(parameterCount);
+				std::unordered_set<std::string> keys;
+				for (std::uint32_t parameterIndex = 0; parameterIndex < parameterCount; ++parameterIndex) {
+					std::string key = reader.String();
+					std::string value = reader.String();
+					if (!keys.insert(key).second || (parameterIndex && (key == "isParent" || key == "parent"))) throw std::runtime_error("Invalid S3D parameter key");
+					record.parameters.emplace_back(std::move(key), std::move(value));
+				}
+				const auto& hierarchy = record.parameters.front();
+				if (hierarchy.first == "isParent") {
+					if (hierarchy.second != "True" && hierarchy.second != "False") throw std::runtime_error("Invalid S3D isParent value");
+					if (hierarchy.second == "True") parents.insert(record.name);
+				}
+				else if (hierarchy.first == "parent") {
+					if (!parents.count(hierarchy.second)) throw std::runtime_error("S3D child references a missing or later parent");
+				}
+				else throw std::runtime_error("Invalid S3D hierarchy parameter");
 				record.transform = reader.TransformValue();
 				if (record.type == 0) {
 					record.data.vertices.resize(reader.Count(48));
@@ -1508,7 +1527,7 @@ namespace Sapphire {
 				else throw std::runtime_error("Invalid S3D object type");
 				records.push_back(std::move(record));
 			}
-			if (parentCount > 1 || !reader.Finished()) throw std::runtime_error("Invalid S3D structure");
+			if (!reader.Finished()) throw std::runtime_error("Invalid S3D structure");
 			return records;
 		}
 	}
@@ -1526,26 +1545,28 @@ namespace Sapphire {
 			}
 		}
 		catch (const std::exception&) { return false; }
-		const auto root = std::find_if(records.begin(), records.end(), [](const S3DRecord& record) { return record.parent; });
-		const bool hasParent = root != records.end();
-		const std::size_t rootIndex = hasParent ? static_cast<std::size_t>(root - records.begin()) : 0;
 		if (records.size() > 1 && !scene) return false;
-		std::vector<Object*> objects(records.size());
-		objects[rootIndex] = this;
+		std::unordered_map<std::string, Object*> created;
+		created.reserve(records.size());
 		for (std::size_t index = 0; index < records.size(); ++index) {
 			auto& record = records[index];
-			Object* object = objects[index];
-			if (!object) object = &scene->CreateObject<>(record.name);
+			Object* object = index ? &scene->CreateObject<>(record.name) : this;
 			object->name = record.name;
-			object->SetParent(index == rootIndex || !hasParent ? nullptr : objects[rootIndex], false);
-			object->transform.position = record.transform.position;
-			object->transform.rotation = record.transform.rotation;
-			object->transform.scale = record.transform.scale;
-			if (index != rootIndex && hasParent) {
+			const auto& hierarchy = record.parameters.front();
+			Object* parent = hierarchy.first == "parent" ? created.at(hierarchy.second) : nullptr;
+			object->SetParent(parent, false);
+			if (parent) {
 				object->transform.localPosition = record.transform.position;
 				object->transform.localRotation = record.transform.rotation;
 				object->transform.localScale = record.transform.scale;
 			}
+			else {
+				object->transform.position = record.transform.position;
+				object->transform.rotation = record.transform.rotation;
+				object->transform.scale = record.transform.scale;
+			}
+			object->UpdateWorldTransform();
+			for (const auto& [key, value] : record.parameters) object->SetProperty<std::string>(key, value);
 			if (record.type == 0) {
 				Mesh* mesh = object->GetComponent<Mesh>();
 				if (!mesh) mesh = &object->AddComponent<Mesh>();
@@ -1569,7 +1590,7 @@ namespace Sapphire {
 				light->owner = object;
 				if (light->type == Light::Type::Directional) object->spatiallyLoaded = false;
 			}
-			objects[index] = object;
+			created.emplace(record.name, object);
 		}
 		if (scene) scene->UpdateWorldPartition();
 		return true;

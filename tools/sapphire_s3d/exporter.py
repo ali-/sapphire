@@ -1,7 +1,9 @@
 import bpy
+import json
 import math
 import os
 import struct
+from collections.abc import Mapping, Sequence
 from bpy.props import BoolProperty, StringProperty
 from bpy_extras.io_utils import ExportHelper
 
@@ -22,8 +24,74 @@ def export_transform(matrix):
     return (location.x, location.y, location.z), tuple(math.degrees(value) for value in (euler.x, euler.y, euler.z)), (scale.x, scale.y, scale.z)
 
 
-def object_transform(obj):
-    return export_transform(obj.matrix_basis)
+def parameter_value(value):
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("Non-finite custom property value")
+        return str(value)
+    if isinstance(value, str):
+        return value
+    def json_value(item):
+        if item is None or isinstance(item, (bool, int, str)):
+            return item
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                raise ValueError("Non-finite custom property value")
+            return item
+        if isinstance(item, Mapping) or hasattr(item, "items"):
+            return {str(key): json_value(entry) for key, entry in item.items()}
+        if isinstance(item, Sequence) and not isinstance(item, (str, bytes)):
+            return [json_value(entry) for entry in item]
+        if hasattr(item, "to_list"):
+            return json_value(item.to_list())
+        raise ValueError("Unsupported custom property value: " + type(item).__name__)
+    return json.dumps(json_value(value), separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+def export_objects(context, objects):
+    depths = {}
+    def visit(collection, depth):
+        depths[collection] = max(depth, depths.get(collection, -1))
+        for child in collection.children:
+            visit(child, depth + 1)
+    visit(context.scene.collection, 0)
+    groups = {}
+    for obj in objects:
+        memberships = [(depths[collection], collection) for collection in obj.users_collection if collection in depths]
+        if not memberships:
+            raise ValueError("Object is not in the active scene: " + obj.name)
+        depth = max(item[0] for item in memberships)
+        closest = [collection for level, collection in memberships if level == depth]
+        if len(closest) != 1:
+            raise ValueError("Ambiguous deepest collection for " + obj.name)
+        if "isParent" in obj and not isinstance(obj["isParent"], bool):
+            raise ValueError("isParent must be boolean on " + obj.name)
+        groups.setdefault(closest[0], []).append(obj)
+    if len({obj.name for obj in objects}) != len(objects):
+        raise ValueError("Exported object names must be unique")
+    entries = []
+    for collection in sorted(groups, key=lambda item: item.name):
+        members = groups[collection]
+        designated = [obj for obj in collection.objects if obj.get("isParent") is True]
+        if len(designated) > 1:
+            raise ValueError("Multiple parents in collection " + collection.name)
+        parent = designated[0] if designated else None
+        if parent and parent not in members:
+            raise ValueError("Collection parent must be selected for export: " + parent.name)
+        if parent and "parent" in parent:
+            raise ValueError("Parent object has a parent property: " + parent.name)
+        ordered = ([parent] if parent else []) + sorted((obj for obj in members if obj != parent), key=lambda obj: obj.name)
+        for obj in ordered:
+            actual_parent = parent if obj != parent else None
+            if "parent" in obj and (not actual_parent or parameter_value(obj["parent"]) != actual_parent.name):
+                raise ValueError("Conflicting parent property on " + obj.name)
+            hierarchy = ("parent", parent.name) if actual_parent else ("isParent", "True" if obj == parent else "False")
+            parameters = [hierarchy]
+            parameters.extend((key, parameter_value(obj[key])) for key in sorted(obj.keys()) if key not in {"isParent", "parent"})
+            entries.append((obj, actual_parent, parameters))
+    return entries
 
 
 def material_image(material, socket_name):
@@ -195,11 +263,15 @@ def mesh_payload(obj, export_path, mesh, apply_modifiers):
     return vertices, indices, sections, material_records, bones, skin
 
 
-def write_object(file, obj, export_path, apply_modifiers, depsgraph):
+def write_object(file, obj, parent, parameters, export_path, apply_modifiers, depsgraph):
     is_light = obj.type == "LIGHT"
     write_string(file, obj.name)
-    file.write(struct.pack("<BB", int(is_light), int(bool(obj.get("isParent", False)))))
-    position, rotation, scale = object_transform(obj)
+    file.write(struct.pack("<BI", int(is_light), len(parameters)))
+    for key, value in parameters:
+        write_string(file, key)
+        write_string(file, value)
+    matrix = parent.matrix_world.inverted() @ obj.matrix_world if parent else obj.matrix_world
+    position, rotation, scale = export_transform(matrix)
     write_vec3(file, position)
     write_vec3(file, rotation)
     write_vec3(file, scale)
@@ -260,17 +332,14 @@ class ExportSapphireS3D(bpy.types.Operator, ExportHelper):
         if not objects:
             self.report({"ERROR"}, "Select at least one mesh or light object")
             return {"CANCELLED"}
-        if sum(bool(obj.get("isParent", False)) for obj in objects) > 1:
-            self.report({"ERROR"}, "Only one selected object may have isParent enabled")
-            return {"CANCELLED"}
-        objects.sort(key=lambda obj: not bool(obj.get("isParent", False)))
         depsgraph = context.evaluated_depsgraph_get() if self.apply_modifiers else None
         try:
+            entries = export_objects(context, objects)
             with open(self.filepath, "wb") as file:
                 file.write(b"S3D\0")
-                file.write(struct.pack("<I", len(objects)))
-                for obj in objects:
-                    write_object(file, obj, self.filepath, self.apply_modifiers, depsgraph)
+                file.write(struct.pack("<I", len(entries)))
+                for obj, parent, parameters in entries:
+                    write_object(file, obj, parent, parameters, self.filepath, self.apply_modifiers, depsgraph)
         except (OSError, ValueError, struct.error) as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
