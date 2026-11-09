@@ -1354,6 +1354,7 @@ namespace Sapphire {
 	namespace {
 		struct S3DRecord {
 			std::string name;
+			std::string source;
 			std::uint8_t type;
 			std::vector<std::pair<std::string, std::string>> parameters;
 			Transform transform;
@@ -1428,10 +1429,73 @@ namespace Sapphire {
 			bool Finished() const { return offset == data.size(); }
 		};
 
-		std::vector<S3DRecord> ReadS3D(const std::string& fileName, std::filesystem::path& filePath) {
+		void ReadS3DModel(S3DReader& reader, S3DRecord& record) {
+			record.data.vertices.resize(reader.Count(48));
+			record.data.indices.resize(reader.Count(4));
+			record.sections.resize(reader.Count(12));
+			record.materials.resize(reader.Count(1));
+			record.bones.resize(reader.Count(1));
+			for (auto& vertex : record.data.vertices) {
+				vertex.position = reader.Vector();
+				vertex.normal = reader.Vector();
+				vertex.uv[0] = reader.Read<float>();
+				vertex.uv[1] = reader.Read<float>();
+				for (float& color : vertex.color) color = reader.Read<float>();
+			}
+			for (auto& index : record.data.indices) index = reader.Read<std::uint32_t>();
+			for (auto& section : record.sections) section = {reader.Read<std::uint32_t>(), reader.Read<std::uint32_t>(), reader.Read<std::uint32_t>()};
+			for (auto& material : record.materials) {
+				material.baseColor = reader.Vector();
+				material.roughness = reader.Read<float>(); material.metallic = reader.Read<float>(); material.normalScale = reader.Read<float>(); material.aoStrength = reader.Read<float>(); material.displacementScale = reader.Read<float>();
+				for (float& value : material.uvScale) value = reader.Read<float>();
+				for (float& value : material.uvOffset) value = reader.Read<float>();
+				material.flipNormalY = reader.Read<std::uint8_t>() != 0; material.transparent = reader.Read<std::uint8_t>() != 0; material.unlit = reader.Read<std::uint8_t>() != 0;
+				material.opacity = reader.Read<float>();
+				std::string* paths[] = {&material.baseTexturePath, &material.normalTexturePath, &material.roughnessTexturePath, &material.aoTexturePath, &material.displacementTexturePath, &material.displacementMaskTexturePath};
+				for (auto* path : paths) *path = reader.String();
+				material.vertexModifierSource = reader.String();
+			}
+			for (auto& bone : record.bones) {
+				bone.name = reader.String();
+				bone.parentIndex = reader.Read<std::int32_t>(); bone.bindTransform = reader.TransformValue();
+			}
+			record.data.skinWeights.resize(reader.Count(16));
+			for (auto& skin : record.data.skinWeights) {
+				for (auto& index : skin.boneIndices) index = reader.Read<std::uint16_t>();
+				for (auto& weight : skin.weights) weight = reader.Read<std::uint16_t>();
+			}
+			record.data.Validate();
+			Mesh validation;
+			validation.data = std::move(record.data);
+			validation.materials = std::move(record.materials);
+			validation.sections = std::move(record.sections);
+			validation.ValidateSections();
+			record.data = std::move(validation.data);
+			record.materials = std::move(validation.materials);
+			record.sections = std::move(validation.sections);
+			if (!record.bones.empty()) {
+				Skeleton skeleton;
+				skeleton.bones = std::move(record.bones);
+				skeleton.Validate();
+				if (!record.data.skinWeights.empty()) record.data.ValidateSkeleton(skeleton);
+				record.bones = std::move(skeleton.bones);
+			}
+			else if (!record.data.skinWeights.empty()) throw std::runtime_error("Skinned mesh has no skeleton");
+		}
+
+		std::vector<S3DRecord> ReadS3D(const std::string& fileName, std::filesystem::path& filePath, std::unordered_map<std::string, S3DRecord>& models) {
 			S3DReader reader(fileName);
 			filePath = reader.FilePath();
 			if (reader.Read<std::uint8_t>() != 'S' || reader.Read<std::uint8_t>() != '3' || reader.Read<std::uint8_t>() != 'D' || reader.Read<std::uint8_t>() != 0) throw std::runtime_error("Invalid S3D signature");
+			const auto modelCount = reader.Count(1);
+			models.reserve(modelCount);
+			for (std::uint32_t modelIndex = 0; modelIndex < modelCount; ++modelIndex) {
+				S3DRecord model{};
+				model.name = reader.String();
+				ReadS3DModel(reader, model);
+				std::string name = model.name;
+				if (!models.emplace(std::move(name), std::move(model)).second) throw std::runtime_error("Duplicate S3D model name");
+			}
 			const auto objectCount = reader.Count(1);
 			if (!objectCount) throw std::runtime_error("S3D contains no objects");
 			std::vector<S3DRecord> records;
@@ -1464,57 +1528,8 @@ namespace Sapphire {
 				else throw std::runtime_error("Invalid S3D hierarchy parameter");
 				record.transform = reader.TransformValue();
 				if (record.type == 0) {
-					record.data.vertices.resize(reader.Count(48));
-					record.data.indices.resize(reader.Count(4));
-					record.sections.resize(reader.Count(12));
-					record.materials.resize(reader.Count(1));
-					record.bones.resize(reader.Count(1));
-					for (auto& vertex : record.data.vertices) {
-						vertex.position = reader.Vector();
-						vertex.normal = reader.Vector();
-						vertex.uv[0] = reader.Read<float>();
-						vertex.uv[1] = reader.Read<float>();
-						for (float& color : vertex.color) color = reader.Read<float>();
-					}
-					for (auto& index : record.data.indices) index = reader.Read<std::uint32_t>();
-					for (auto& section : record.sections) section = {reader.Read<std::uint32_t>(), reader.Read<std::uint32_t>(), reader.Read<std::uint32_t>()};
-					for (auto& material : record.materials) {
-						material.baseColor = reader.Vector();
-					material.roughness = reader.Read<float>(); material.metallic = reader.Read<float>(); material.normalScale = reader.Read<float>(); material.aoStrength = reader.Read<float>(); material.displacementScale = reader.Read<float>();
-						for (float& value : material.uvScale) value = reader.Read<float>();
-						for (float& value : material.uvOffset) value = reader.Read<float>();
-					material.flipNormalY = reader.Read<std::uint8_t>() != 0; material.transparent = reader.Read<std::uint8_t>() != 0; material.unlit = reader.Read<std::uint8_t>() != 0;
-						material.opacity = reader.Read<float>();
-					std::string* paths[] = {&material.baseTexturePath, &material.normalTexturePath, &material.roughnessTexturePath, &material.aoTexturePath, &material.displacementTexturePath, &material.displacementMaskTexturePath};
-					for (auto* path : paths) *path = reader.String();
-						material.vertexModifierSource = reader.String();
-					}
-					for (auto& bone : record.bones) {
-						bone.name = reader.String();
-					bone.parentIndex = reader.Read<std::int32_t>(); bone.bindTransform = reader.TransformValue();
-					}
-					record.data.skinWeights.resize(reader.Count(16));
-					for (auto& skin : record.data.skinWeights) {
-						for (auto& index : skin.boneIndices) index = reader.Read<std::uint16_t>();
-						for (auto& weight : skin.weights) weight = reader.Read<std::uint16_t>();
-					}
-					record.data.Validate();
-					Mesh validation;
-					validation.data = std::move(record.data);
-					validation.materials = std::move(record.materials);
-					validation.sections = std::move(record.sections);
-					validation.ValidateSections();
-					record.data = std::move(validation.data);
-					record.materials = std::move(validation.materials);
-					record.sections = std::move(validation.sections);
-					if (!record.bones.empty()) {
-						Skeleton skeleton;
-						skeleton.bones = std::move(record.bones);
-						skeleton.Validate();
-						if (!record.data.skinWeights.empty()) record.data.ValidateSkeleton(skeleton);
-						record.bones = std::move(skeleton.bones);
-					}
-					else if (!record.data.skinWeights.empty()) throw std::runtime_error("Skinned mesh has no skeleton");
+					record.source = reader.String();
+					if (!models.count(record.source)) throw std::runtime_error("S3D object references a missing model");
 				}
 				else if (record.type == 1) {
 					const auto type = reader.Read<std::uint8_t>();
@@ -1537,9 +1552,10 @@ namespace Sapphire {
 	bool Object::LoadS3D(const std::string& fileName) {
 		std::filesystem::path sourcePath;
 		std::vector<S3DRecord> records;
+		std::unordered_map<std::string, S3DRecord> models;
 		try {
-			records = ReadS3D(fileName, sourcePath);
-			for (auto& record : records) for (auto& material : record.materials) {
+			records = ReadS3D(fileName, sourcePath, models);
+			for (auto& [name, model] : models) for (auto& material : model.materials) {
 				std::string* paths[] = {&material.baseTexturePath, &material.normalTexturePath, &material.roughnessTexturePath, &material.aoTexturePath, &material.displacementTexturePath, &material.displacementMaskTexturePath};
 				for (auto* path : paths) if (!path->empty() && std::filesystem::path(*path).is_relative()) *path = (sourcePath.parent_path() / *path).lexically_normal().string();
 			}
@@ -1568,18 +1584,19 @@ namespace Sapphire {
 			object->UpdateWorldTransform();
 			for (const auto& [key, value] : record.parameters) object->SetProperty<std::string>(key, value);
 			if (record.type == 0) {
+				const auto& model = models.at(record.source);
 				Mesh* mesh = object->GetComponent<Mesh>();
 				if (!mesh) mesh = &object->AddComponent<Mesh>();
-				mesh->data = std::move(record.data);
+				mesh->data = model.data;
 				mesh->material = Material{};
-				mesh->materials = std::move(record.materials);
-				mesh->sections = std::move(record.sections);
+				mesh->materials = model.materials;
+				mesh->sections = model.sections;
 				mesh->MarkDirty();
 				Physics::EnsureMeshCollider(*object);
-				if (!record.bones.empty()) {
+				if (!model.bones.empty()) {
 					Skeleton* skeleton = object->GetComponent<Skeleton>();
 					if (!skeleton) skeleton = &object->AddComponent<Skeleton>();
-					skeleton->bones = std::move(record.bones);
+					skeleton->bones = model.bones;
 					skeleton->InitializePose();
 				}
 			}
