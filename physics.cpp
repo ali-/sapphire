@@ -116,31 +116,9 @@ namespace Sapphire {
 				bool hit = false;
 			};
 
-			bool IsWalkable(const PhysicsBody& body, const Contact& contact) {
-				return contact.hit && contact.surfaceNormal.z >= body.SlopeCosine();
-			}
-
-			bool IsCapsuleFootContact(const Capsule& capsule, const Contact& contact) {
-				const float x = contact.point.x - capsule.start.x;
-				const float y = contact.point.y - capsule.start.y;
-				const float radius = std::max(0.0f, capsule.radius - skinWidth);
-				return contact.hit && contact.point.z <= capsule.start.z && x * x + y * y <= radius * radius;
-			}
-
-			bool IsCapsuleSupport(const Capsule& capsule, const PhysicsBody& body, const Contact& contact) {
-				return IsWalkable(body, contact) && IsCapsuleFootContact(capsule, contact);
-			}
-
-			bool PreferCapsuleHit(const Contact& candidate, const Contact& current, const Capsule& capsule, float displacementSquared, const PhysicsBody* floorBody) {
-				if (!current.hit) return true;
-				if (floorBody && (candidate.time - current.time) * (candidate.time - current.time) * displacementSquared <= axisEpsilon * axisEpsilon) {
-					const bool candidateSupport = IsCapsuleSupport(capsule, *floorBody, candidate);
-					const bool currentSupport = IsCapsuleSupport(capsule, *floorBody, current);
-					if (candidateSupport != currentSupport) return candidateSupport;
-					if (candidateSupport) return candidate.surfaceNormal.z > current.surfaceNormal.z;
-				}
-				return candidate.time < current.time;
-			}
+			struct EarlierContact {
+				bool operator()(const Contact& candidate, const Contact& current) const { return !current.hit || candidate.time < current.time; }
+			};
 
 			std::unordered_map<const Mesh*, MeshBounds> meshBounds;
 			std::vector<std::uint32_t> triangleCandidates;
@@ -253,11 +231,9 @@ namespace Sapphire {
 				return box;
 			}
 
-			Capsule WorldCapsule(Object& object, const Collider& collider) {
-				const Transform transform = ColliderPose(object, collider);
+			Capsule CapsuleFromPose(const Transform& transform, const Vector3& size) {
 				Vector3 axes[3];
 				GetAxes(transform, axes);
-				const Vector3 size = ColliderSize(object, collider);
 				const float height = size.z;
 				const float radius = Primitive::CapsuleRadius(size);
 				const Vector3 segment = Scale(axes[2], std::max(0.0f, height * 0.5f - radius));
@@ -265,6 +241,8 @@ namespace Sapphire {
 				if (start.z > end.z) std::swap(start, end);
 				return {start, end, radius};
 			}
+
+			Capsule WorldCapsule(Object& object, const Collider& collider) { return CapsuleFromPose(ColliderPose(object, collider), ColliderSize(object, collider)); }
 
 			Bounds BoxBounds(const Box& box) {
 				const Vector3 extent{box.halfSize[0] * std::abs(box.axes[0].x) + box.halfSize[1] * std::abs(box.axes[1].x) + box.halfSize[2] * std::abs(box.axes[2].x), box.halfSize[0] * std::abs(box.axes[0].y) + box.halfSize[1] * std::abs(box.axes[1].y) + box.halfSize[2] * std::abs(box.axes[2].y), box.halfSize[0] * std::abs(box.axes[0].z) + box.halfSize[1] * std::abs(box.axes[1].z) + box.halfSize[2] * std::abs(box.axes[2].z)};
@@ -983,7 +961,7 @@ namespace Sapphire {
 				return found;
 			}
 
-			bool FindCapsuleMeshSweep(Object& meshObject, const Capsule& capsule, const Vector3& displacement, Contact& result, const PhysicsBody* floorBody = nullptr, const Vector3* preparedAxes = nullptr) {
+			template <typename Prefer> bool FindCapsuleMeshSweep(Object& meshObject, const Capsule& capsule, const Vector3& displacement, Contact& result, const Prefer& prefer, const Vector3* preparedAxes = nullptr) {
 				auto* collider = meshObject.GetComponent<Collider>();
 				if (!collider) return false;
 				const MeshData* data = CollisionMesh(meshObject, *collider);
@@ -998,14 +976,13 @@ namespace Sapphire {
 				else GetAxes(transform, axes);
 				auto& candidates = triangleCandidates;
 				QueryTree(tree, transform, SweptBounds(capsule, displacement), axes, candidates);
-				const float displacementSquared = Dot(displacement, displacement);
-				const float displacementLength = std::sqrt(displacementSquared);
+				const float displacementLength = Length(displacement);
 				bool found = false;
 				for (const auto index : candidates) {
 					Vector3 triangle[3];
 					GetWorldTriangle(transform, *data, tree.triangles[index], axes, triangle);
 					Contact contact;
-					if (SweepCapsuleTriangle(capsule, triangle, displacement, displacementLength, winding, tree.closed, contact) && PreferCapsuleHit(contact, result, capsule, displacementSquared, floorBody)) {
+					if (SweepCapsuleTriangle(capsule, triangle, displacement, displacementLength, winding, tree.closed, contact) && prefer(contact, result)) {
 						result = contact;
 						found = true;
 					}
@@ -1027,15 +1004,14 @@ namespace Sapphire {
 				return found;
 			}
 
-			bool FindCapsuleBoxSweep(const Box& box, const Capsule& capsule, const Vector3& displacement, Contact& result, const PhysicsBody* floorBody = nullptr) {
+			template <typename Prefer> bool FindCapsuleBoxSweep(const Box& box, const Capsule& capsule, const Vector3& displacement, Contact& result, const Prefer& prefer) {
 				Vector3 triangles[12][3];
 				GetBoxTriangles(box, triangles);
-				const float displacementSquared = Dot(displacement, displacement);
-				const float displacementLength = std::sqrt(displacementSquared);
+				const float displacementLength = Length(displacement);
 				bool found = false;
 				for (const auto& triangle : triangles) {
 					Contact contact;
-					if (SweepCapsuleTriangle(capsule, triangle, displacement, displacementLength, 1.0f, true, contact) && PreferCapsuleHit(contact, result, capsule, displacementSquared, floorBody)) {
+					if (SweepCapsuleTriangle(capsule, triangle, displacement, displacementLength, 1.0f, true, contact) && prefer(contact, result)) {
 						result = contact;
 						found = true;
 					}
@@ -1066,12 +1042,11 @@ namespace Sapphire {
 				return false;
 			}
 
-			bool FindCapsuleHit(Object& object, const Capsule& capsule, const Vector3& displacement, Contact& result, const PhysicsBody* floorBody = nullptr) {
-				const float displacementSquared = Dot(displacement, displacement);
+			template <typename Prefer> bool SphereTrace(const Object* ignoredObject, const Capsule& capsule, const Vector3& displacement, Contact& result, const Prefer& prefer, bool includeBodies = false, const ColliderRecord** hitRecord = nullptr) {
 				const Bounds sweptBounds = SweptBounds(capsule, displacement);
 				for (const auto& record : colliderRecords) {
 					Object* obstacle = record.object;
-					if (obstacle == &object || record.body) continue;
+					if (obstacle == ignoredObject || (!includeBodies && record.body)) continue;
 					auto* collider = record.collider;
 					if (!Overlaps(sweptBounds, record.bounds)) continue;
 					Contact contact;
@@ -1079,15 +1054,44 @@ namespace Sapphire {
 						if (!CapsuleContact(capsule, record.capsule, displacement, true, contact)) continue;
 					}
 					else if (record.type == CollisionType::Mesh) {
-						if (!FindCapsuleMeshSweep(*obstacle, capsule, displacement, contact, floorBody, record.axes)) continue;
+						if (!FindCapsuleMeshSweep(*obstacle, capsule, displacement, contact, prefer, record.axes)) continue;
 					}
 					else {
 						const Box& box = record.box;
-						if (!FindCapsuleBoxSweep(box, capsule, displacement, contact, floorBody)) continue;
+						if (!FindCapsuleBoxSweep(box, capsule, displacement, contact, prefer)) continue;
 					}
-					if (PreferCapsuleHit(contact, result, capsule, displacementSquared, floorBody)) result = contact;
+					if (prefer(contact, result)) {
+						result = contact;
+						if (hitRecord) *hitRecord = &record;
+					}
 				}
 				return result.hit;
+			}
+
+			bool IsWalkable(const PhysicsBody& body, const Contact& contact) {
+				return contact.hit && contact.surfaceNormal.z >= body.SlopeCosine();
+			}
+
+			bool IsCapsuleFootContact(const Capsule& capsule, const Contact& contact) {
+				const float x = contact.point.x - capsule.start.x;
+				const float y = contact.point.y - capsule.start.y;
+				const float radius = std::max(0.0f, capsule.radius - skinWidth);
+				return contact.hit && contact.point.z <= capsule.start.z && x * x + y * y <= radius * radius;
+			}
+
+			bool IsCapsuleSupport(const Capsule& capsule, const PhysicsBody& body, const Contact& contact) {
+				return IsWalkable(body, contact) && IsCapsuleFootContact(capsule, contact);
+			}
+
+			bool PreferCapsuleHit(const Contact& candidate, const Contact& current, const Capsule& capsule, float displacementSquared, const PhysicsBody& body) {
+				if (!current.hit) return true;
+				if ((candidate.time - current.time) * (candidate.time - current.time) * displacementSquared <= axisEpsilon * axisEpsilon) {
+					const bool candidateSupport = IsCapsuleSupport(capsule, body, candidate);
+					const bool currentSupport = IsCapsuleSupport(capsule, body, current);
+					if (candidateSupport != currentSupport) return candidateSupport;
+					if (candidateSupport) return candidate.surfaceNormal.z > current.surfaceNormal.z;
+				}
+				return candidate.time < current.time;
 			}
 
 			bool FindCapsuleFloor(Scene& scene, Object& object, Collider& collider, float distance, Contact& result) {
@@ -1095,8 +1099,10 @@ namespace Sapphire {
 				capsule.radius = std::max(axisEpsilon, capsule.radius - skinWidth);
 				const PhysicsBody& body = *object.GetComponent<PhysicsBody>();
 				const Vector3 displacement{0.0f, 0.0f, -distance};
+				const float displacementSquared = Dot(displacement, displacement);
+				auto prefer = [&](const Contact& candidate, const Contact& current) { return PreferCapsuleHit(candidate, current, capsule, displacementSquared, body); };
 				Contact contact;
-				FindCapsuleHit( object, capsule, displacement, contact, &body);
+				SphereTrace(&object, capsule, displacement, contact, prefer);
 				if (IsCapsuleSupport(capsule, body, contact)) {
 					result = contact;
 					return true;
@@ -1107,7 +1113,7 @@ namespace Sapphire {
 				capsule.start.z -= shrink;
 				capsule.end.z += shrink;
 				Contact narrowContact;
-				FindCapsuleHit( object, capsule, displacement, narrowContact, &body);
+				SphereTrace(&object, capsule, displacement, narrowContact, prefer);
 				if (!IsCapsuleSupport(capsule, body, narrowContact)) return false;
 				if (blockingFloor && std::abs(Dot(Subtract(contact.point, narrowContact.point), narrowContact.surfaceNormal)) > skinWidth) return false;
 				result = narrowContact;
@@ -1185,7 +1191,7 @@ namespace Sapphire {
 			}
 
 			bool FindEarliestHit(Object& object, Collider& collider, const Vector3& displacement, Contact& result) {
-				if (ColliderType(object, collider) == CollisionType::Capsule) return FindCapsuleHit( object, WorldCapsule(object, collider), displacement, result);
+				if (ColliderType(object, collider) == CollisionType::Capsule) return SphereTrace(&object, WorldCapsule(object, collider), displacement, result, EarlierContact{});
 				const Box movingBox = WorldBox(object, collider);
 				const Bounds sweptBounds = SweptBounds(movingBox, displacement);
 				for (const auto& record : colliderRecords) {
@@ -1195,7 +1201,7 @@ namespace Sapphire {
 					if (!Overlaps(sweptBounds, record.bounds)) continue;
 					Contact contact;
 					if (record.type == CollisionType::Capsule) {
-						if (!FindCapsuleBoxSweep(movingBox, record.capsule, Scale(displacement, -1.0f), contact)) continue;
+						if (!FindCapsuleBoxSweep(movingBox, record.capsule, Scale(displacement, -1.0f), contact, EarlierContact{})) continue;
 						contact.normal = Scale(contact.normal, -1.0f);
 						contact.surfaceNormal = Scale(contact.normal, -1.0f);
 						contact.point += Scale(displacement, contact.time);
@@ -1362,6 +1368,19 @@ namespace Sapphire {
 				}
 			}
 
+		}
+
+		bool SphereTrace(Scene& scene, const Transform& start, const Vector3& end, const Vector3& size, const Object* ignoredObject, RaycastHit& hit) {
+			hit = {};
+			const Vector3 displacement = Math::Subtract(end, start.position);
+			const float distance = Math::Length(displacement);
+			if (!std::isfinite(distance) || distance <= axisEpsilon || !std::isfinite(size.x) || !std::isfinite(size.y) || !std::isfinite(size.z) || size.x <= 0.0f || size.y <= 0.0f || size.z <= 0.0f) return false;
+			SyncColliders(scene);
+			Contact contact;
+			const ColliderRecord* record = nullptr;
+			if (!SphereTrace(ignoredObject, CapsuleFromPose(start, size), displacement, contact, EarlierContact{}, true, &record)) return false;
+			hit = {record->object->worldPartitionSourceObject ? record->object->worldPartitionSourceObject : record->object, record->collider, contact.point, contact.surfaceNormal, contact.time * distance};
+			return true;
 		}
 
 		bool Raycast(Scene& scene, const Vector3& origin, const Vector3& direction, float maxDistance, RaycastHit& hit) {
