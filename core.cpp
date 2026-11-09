@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <random>
 #include <map>
 #include <string>
 #include <sstream>
@@ -1260,13 +1261,101 @@ namespace Sapphire {
 			WorldPartitioner worldPartitioner;
 	};
 
+	class ParticleEmitter : public Object {
+		struct Particle {
+			Vector3 velocity;
+			float age = 0.0f;
+		};
+	
+		std::vector<Particle> particles;
+		std::mt19937 random;
+		float emissionRemainder = 0.0f;
+		std::size_t pendingBurst = 0;
+	
+		public:
+			float rate = 24.0f;
+			float lifetime = 1.0f;
+			float speed = 1.0f;
+			float spread = 0.0f;
+			float size = 0.15f;
+			std::size_t maxParticles = 256;
+			Vector3 direction{0.0f, 0.0f, 1.0f};
+			Vector3 startColor{1.0f, 1.0f, 1.0f};
+			Vector3 endColor{-1.0f, -1.0f, -1.0f};
+			Material material;
+			using Object::Object;
+	
+			void Emit(std::size_t count) { pendingBurst = std::min(maxParticles, pendingBurst + count); }
+	
+			void Initialize() override {
+				renderStatic = false;
+				auto& mesh = AddComponent<Mesh>();
+				mesh.data = Primitive::Plane.Mesh();
+				mesh.material = material;
+				if (endColor.x >= 0.0f) mesh.material.vertexModifierSource = "void ModifyVertex(thread float3& position, thread float3& normal, thread float4& color, float instanceData, float time, float4x4 model) { color.rgb *= mix(float3(" + std::to_string(startColor.x) + ", " + std::to_string(startColor.y) + ", " + std::to_string(startColor.z) + "), float3(" + std::to_string(endColor.x) + ", " + std::to_string(endColor.y) + ", " + std::to_string(endColor.z) + "), clamp(instanceData, 0.0, 1.0)); }";
+				else mesh.material.baseColor = {material.baseColor.x * startColor.x, material.baseColor.y * startColor.y, material.baseColor.z * startColor.z};
+				mesh.instanced = true;
+				mesh.cullBackfaces = false;
+				mesh.castShadows = false;
+				particles.reserve(maxParticles);
+				mesh.instances.reserve(maxParticles);
+			}
+	
+			void Update() override {
+				auto& mesh = *GetComponent<Mesh>();
+				const float deltaTime = Time::deltaTime;
+				bool changed = false;
+				for (std::size_t index = 0; index < particles.size();) {
+					Particle& particle = particles[index];
+					particle.age += deltaTime;
+					if (particle.age >= lifetime) {
+						particles[index] = particles.back();
+						particles.pop_back();
+						mesh.instances[index] = mesh.instances.back();
+						mesh.instances.pop_back();
+						changed = true;
+						continue;
+					}
+					mesh.instances[index].position += particle.velocity * deltaTime;
+					mesh.instances[index].customData = particle.age / lifetime;
+					++index;
+					changed = true;
+				}
+				emissionRemainder += std::max(rate, 0.0f) * deltaTime;
+				const std::size_t scheduled = static_cast<std::size_t>(emissionRemainder);
+				emissionRemainder -= static_cast<float>(scheduled);
+				const std::size_t available = maxParticles > particles.size() ? maxParticles - particles.size() : 0;
+				const std::size_t count = std::min(available, scheduled + pendingBurst);
+				pendingBurst = 0;
+				const Vector3 launchDirection = Math::Normalize(direction);
+				std::uniform_real_distribution<float> deviation(-spread, spread);
+				for (std::size_t index = 0; index < count; ++index) {
+					Vector3 travel = launchDirection;
+					if (spread > 0.0f) travel = Math::Normalize(Math::Add(travel, {deviation(random), deviation(random), deviation(random)}));
+					particles.push_back({Math::Scale(travel, speed), 0.0f});
+					MeshInstance instance{};
+					instance.scale = {size, size, size};
+					mesh.instances.push_back(instance);
+					changed = true;
+				}
+				if (!changed) return;
+				if (scene->activeCamera && scene->activeCamera->owner) {
+					Vector3 facing = scene->activeCamera->owner->transform.rotation;
+					facing.x -= 90.0f;
+					const Vector3 rotation = Math::RelativeRotation(transform.rotation, facing);
+					for (auto& instance : mesh.instances) instance.rotation = rotation;
+				}
+				mesh.MarkInstancesDirty();
+			}
+	};
+
 	namespace Physics { std::vector<Vector3> ColliderDebugLines(Scene& scene); }
 
 	namespace {
 		struct S3DRecord {
 			std::string name;
 			std::uint8_t type;
-			bool parent;
+			std::vector<std::pair<std::string, std::string>> parameters;
 			Transform transform;
 			MeshData data;
 			std::vector<Material> materials;
@@ -1347,13 +1436,32 @@ namespace Sapphire {
 			if (!objectCount) throw std::runtime_error("S3D contains no objects");
 			std::vector<S3DRecord> records;
 			records.reserve(objectCount);
-			std::size_t parentCount = 0;
+			std::unordered_set<std::string> names;
+			std::unordered_set<std::string> parents;
 			for (std::uint32_t objectIndex = 0; objectIndex < objectCount; ++objectIndex) {
 				S3DRecord record{};
 				record.name = reader.String();
+				if (!names.insert(record.name).second) throw std::runtime_error("Duplicate S3D object name");
 				record.type = reader.Read<std::uint8_t>();
-				record.parent = reader.Read<std::uint8_t>() != 0;
-				parentCount += record.parent;
+				const auto parameterCount = reader.Count(8);
+				if (!parameterCount) throw std::runtime_error("S3D object has no hierarchy parameter");
+				record.parameters.reserve(parameterCount);
+				std::unordered_set<std::string> keys;
+				for (std::uint32_t parameterIndex = 0; parameterIndex < parameterCount; ++parameterIndex) {
+					std::string key = reader.String();
+					std::string value = reader.String();
+					if (!keys.insert(key).second || (parameterIndex && (key == "isParent" || key == "parent"))) throw std::runtime_error("Invalid S3D parameter key");
+					record.parameters.emplace_back(std::move(key), std::move(value));
+				}
+				const auto& hierarchy = record.parameters.front();
+				if (hierarchy.first == "isParent") {
+					if (hierarchy.second != "True" && hierarchy.second != "False") throw std::runtime_error("Invalid S3D isParent value");
+					if (hierarchy.second == "True") parents.insert(record.name);
+				}
+				else if (hierarchy.first == "parent") {
+					if (!parents.count(hierarchy.second)) throw std::runtime_error("S3D child references a missing or later parent");
+				}
+				else throw std::runtime_error("Invalid S3D hierarchy parameter");
 				record.transform = reader.TransformValue();
 				if (record.type == 0) {
 					record.data.vertices.resize(reader.Count(48));
@@ -1419,7 +1527,7 @@ namespace Sapphire {
 				else throw std::runtime_error("Invalid S3D object type");
 				records.push_back(std::move(record));
 			}
-			if (parentCount > 1 || !reader.Finished()) throw std::runtime_error("Invalid S3D structure");
+			if (!reader.Finished()) throw std::runtime_error("Invalid S3D structure");
 			return records;
 		}
 	}
@@ -1437,26 +1545,28 @@ namespace Sapphire {
 			}
 		}
 		catch (const std::exception&) { return false; }
-		const auto root = std::find_if(records.begin(), records.end(), [](const S3DRecord& record) { return record.parent; });
-		const bool hasParent = root != records.end();
-		const std::size_t rootIndex = hasParent ? static_cast<std::size_t>(root - records.begin()) : 0;
 		if (records.size() > 1 && !scene) return false;
-		std::vector<Object*> objects(records.size());
-		objects[rootIndex] = this;
+		std::unordered_map<std::string, Object*> created;
+		created.reserve(records.size());
 		for (std::size_t index = 0; index < records.size(); ++index) {
 			auto& record = records[index];
-			Object* object = objects[index];
-			if (!object) object = &scene->CreateObject<>(record.name);
+			Object* object = index ? &scene->CreateObject<>(record.name) : this;
 			object->name = record.name;
-			object->SetParent(index == rootIndex || !hasParent ? nullptr : objects[rootIndex], false);
-			object->transform.position = record.transform.position;
-			object->transform.rotation = record.transform.rotation;
-			object->transform.scale = record.transform.scale;
-			if (index != rootIndex && hasParent) {
+			const auto& hierarchy = record.parameters.front();
+			Object* parent = hierarchy.first == "parent" ? created.at(hierarchy.second) : nullptr;
+			object->SetParent(parent, false);
+			if (parent) {
 				object->transform.localPosition = record.transform.position;
 				object->transform.localRotation = record.transform.rotation;
 				object->transform.localScale = record.transform.scale;
 			}
+			else {
+				object->transform.position = record.transform.position;
+				object->transform.rotation = record.transform.rotation;
+				object->transform.scale = record.transform.scale;
+			}
+			object->UpdateWorldTransform();
+			for (const auto& [key, value] : record.parameters) object->SetProperty<std::string>(key, value);
 			if (record.type == 0) {
 				Mesh* mesh = object->GetComponent<Mesh>();
 				if (!mesh) mesh = &object->AddComponent<Mesh>();
@@ -1480,7 +1590,7 @@ namespace Sapphire {
 				light->owner = object;
 				if (light->type == Light::Type::Directional) object->spatiallyLoaded = false;
 			}
-			objects[index] = object;
+			created.emplace(record.name, object);
 		}
 		if (scene) scene->UpdateWorldPartition();
 		return true;
