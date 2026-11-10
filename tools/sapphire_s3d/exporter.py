@@ -230,13 +230,37 @@ def bake_materials(context, obj, materials, records, export_path, texture_dir):
     active_mode = active.mode if active else "OBJECT"
     engine = scene.render.engine
     original_mesh = obj.data
-    temporary_mesh = original_mesh.copy()
+    source_uv = original_mesh.uv_layers.active
+    minimum_u = min(loop.uv.x for loop in source_uv.data)
+    maximum_u = max(loop.uv.x for loop in source_uv.data)
+    minimum_v = min(loop.uv.y for loop in source_uv.data)
+    maximum_v = max(loop.uv.y for loop in source_uv.data)
+    if minimum_u == maximum_u or minimum_v == maximum_v:
+        raise ValueError("Mesh UV map has no area: " + obj.name)
     images = []
     base_images = {}
     digest = hashlib.sha256(obj.name.encode("utf-8")).hexdigest()[:16]
     prefix = bpy.path.clean_name(obj.name) + "_" + digest
     os.makedirs(texture_dir, exist_ok=True)
+    temporary_mesh = original_mesh.copy()
     try:
+        source_uv = temporary_mesh.uv_layers.active
+        render_uv = temporary_mesh.uv_layers.active_render
+        margin = 0.02
+        scale_u = (1.0 - margin * 2.0) / (maximum_u - minimum_u)
+        scale_v = (1.0 - margin * 2.0) / (maximum_v - minimum_v)
+        offset_u = margin - minimum_u * scale_u
+        offset_v = margin - minimum_v * scale_v
+        bake_uv = temporary_mesh.uv_layers.new(name="S3D Bake", do_init=True)
+        for loop in bake_uv.data:
+            loop.uv = (loop.uv.x * scale_u + offset_u, loop.uv.y * scale_v + offset_v)
+        source_uv.active = True
+        if render_uv:
+            render_uv.active_render = True
+        for index, record in enumerate(records):
+            if channels[index]:
+                record["uv_scale"] = (scale_u, scale_v)
+                record["uv_offset"] = (offset_u, 1.0 - scale_v - offset_v)
         if active and active_mode != "OBJECT":
             bpy.ops.object.mode_set(mode="OBJECT")
         obj.data = temporary_mesh
@@ -274,7 +298,7 @@ def bake_materials(context, obj, materials, records, export_path, texture_dir):
                         node.select = False
                     target.select = True
                     material.node_tree.nodes.active = target
-                result = bpy.ops.object.bake(type="NORMAL" if channel == "normal" else "EMIT", use_clear=True, normal_space="TANGENT", uv_layer=temporary_mesh.uv_layers.active.name)
+                result = bpy.ops.object.bake(type="NORMAL" if channel == "normal" else "EMIT", use_clear=True, normal_space="TANGENT", uv_layer=bake_uv.name)
                 if "FINISHED" not in result:
                     raise ValueError("Could not bake " + channel + " for " + obj.name)
                 for index, image in enumerate(targets):
@@ -298,6 +322,7 @@ def bake_materials(context, obj, materials, records, export_path, texture_dir):
                         records[index]["roughness"] = 1.0
                     elif channel == "normal":
                         records[index]["normal_scale"] = 1.0
+                        records[index]["flip_normal_y"] = True
                     elif channel == "displacement":
                         records[index]["displacement_scale"] = 1.0
                     path = os.path.join(texture_dir, f"{prefix}_{index}_{channel}.png")
@@ -409,6 +434,7 @@ def mesh_payload(obj, mesh, apply_modifiers, material_records):
     uv_layer = mesh.uv_layers.active
     color_layer = mesh.color_attributes.active_color if hasattr(mesh, "color_attributes") else None
     vertices = []
+    normal_sums = []
     indices = []
     skin = []
     sections = []
@@ -420,26 +446,35 @@ def mesh_payload(obj, mesh, apply_modifiers, material_records):
             for loop_index in triangle.loops:
                 loop = mesh.loops[loop_index]
                 source = mesh.vertices[loop.vertex_index]
-                position = source.co
+                position = tuple(source.co)
                 normal = mesh.corner_normals[loop_index].vector
-                uv = uv_layer.data[loop_index].uv if uv_layer else (0.0, 0.0)
+                uv = (uv_layer.data[loop_index].uv.x, 1.0 - uv_layer.data[loop_index].uv.y) if uv_layer else (0.0, 0.0)
                 color = (1.0, 1.0, 1.0, 1.0)
                 if color_layer:
                     color_value = color_layer.data[loop_index if color_layer.domain == "CORNER" else loop.vertex_index].color
                     color = tuple(color_value)
                 influence = vertex_weights(obj, loop.vertex_index, bone_indices) if bones else ((0, 0, 0, 0), (65535, 0, 0, 0))
-                key = (tuple(position), tuple(normal), tuple(uv), tuple(color), influence)
+                key = (position, tuple(uv), tuple(color), influence)
                 vertex_index = vertex_lookup.get(key)
                 if vertex_index is None:
                     vertex_index = len(vertices)
                     vertex_lookup[key] = vertex_index
-                    vertices.append((tuple(position), tuple(normal), tuple(uv), tuple(color)))
+                    vertices.append((position, tuple(normal), tuple(uv), tuple(color)))
+                    normal_sums.append(normal.copy())
                     if bones:
                         skin.append(influence)
+                else:
+                    normal_sums[vertex_index] += normal
                 indices.append(vertex_index)
         count = len(indices) - first_index
         if count:
             sections.append((first_index, count, material_index))
+
+    for index, (position, normal, uv, color) in enumerate(vertices):
+        average = normal_sums[index]
+        if average.length_squared:
+            average.normalize()
+            vertices[index] = (position, tuple(average), uv, color)
 
     return vertices, indices, sections, material_records, bones, skin
 
@@ -475,8 +510,6 @@ def write_model(file, context, obj, export_path, texture_dir, apply_modifiers, b
     write_string(file, obj.name)
     source_materials = list(obj.data.materials) or [None]
     material_records = [material_record(material) for material in source_materials]
-    if bake_textures:
-        bake_materials(context, obj, source_materials, material_records, export_path, texture_dir)
     if apply_modifiers:
         evaluated = obj.evaluated_get(depsgraph)
         mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
@@ -488,6 +521,8 @@ def write_model(file, context, obj, export_path, texture_dir, apply_modifiers, b
             evaluated.to_mesh_clear()
     else:
         vertices, indices, sections, materials, bones, skin = mesh_payload(obj, obj.data, False, material_records)
+    if bake_textures:
+        bake_materials(context, obj, source_materials, material_records, export_path, texture_dir)
     file.write(struct.pack("<5I", len(vertices), len(indices), len(sections), len(materials), len(bones)))
     for position, normal, uv, color in vertices:
         file.write(struct.pack("<12f", *position, *normal, *uv, *color))

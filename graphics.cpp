@@ -737,30 +737,22 @@ namespace Sapphire::Graphics {
 				uint materialFlags = uint(uniforms.lightingParameters.x);
 				bool twoSided = (materialFlags & 32u) != 0u;
 				float3 normal = (materialFlags & 16u) != 0u ? float3(0.0) : normalize(input.worldNormal);
-				if ((materialFlags & 16u) == 0u && (materialFlags & 9u) != 0u) {
+				if ((materialFlags & 16u) == 0u && (materialFlags & 1u) != 0u) {
 					float3 dpdx = dfdx(input.worldPosition);
 					float3 dpdy = dfdy(input.worldPosition);
-					if ((materialFlags & 8u) != 0u) {
-						float3 geometricNormal = cross(dpdx, dpdy);
-						geometricNormal *= rsqrt(max(dot(geometricNormal, geometricNormal), 1e-20));
-						if (dot(geometricNormal, normal) < 0.0) geometricNormal = -geometricNormal;
-						normal = geometricNormal;
-					}
-					if ((materialFlags & 1u) != 0u) {
-						float2 duvdx = dfdx(input.uv);
-						float2 duvdy = dfdy(input.uv);
-						float determinant = duvdx.x * duvdy.y - duvdx.y * duvdy.x;
-						if (determinant * determinant > 1e-8 * dot(duvdx, duvdx) * dot(duvdy, duvdy)) {
-							float3 tangent = (dpdx * duvdy.y - dpdy * duvdx.y) / determinant;
-							float3 uvBitangent = (dpdy * duvdx.x - dpdx * duvdy.x) / determinant;
-							tangent -= normal * dot(normal, tangent);
-							tangent *= rsqrt(max(dot(tangent, tangent), 1e-20));
-							float3 bitangent = cross(normal, tangent);
-							if (dot(bitangent, uvBitangent) < 0.0) bitangent = -bitangent;
-							float3 mappedNormal = normalMap.sample(normalSampler, input.uv).xyz * 2.0 - 1.0;
-							mappedNormal.xy *= float2(uniforms.surfaceParameters.y, uniforms.surfaceParameters.y * uniforms.surfaceParameters.w);
-							normal = normalize(tangent * mappedNormal.x + bitangent * mappedNormal.y + normal * mappedNormal.z);
-						}
+					float2 duvdx = dfdx(input.uv);
+					float2 duvdy = dfdy(input.uv);
+					float determinant = duvdx.x * duvdy.y - duvdx.y * duvdy.x;
+					if (determinant * determinant > 1e-8 * dot(duvdx, duvdx) * dot(duvdy, duvdy)) {
+						float3 tangent = (dpdx * duvdy.y - dpdy * duvdx.y) / determinant;
+						float3 uvBitangent = (dpdy * duvdx.x - dpdx * duvdy.x) / determinant;
+						tangent -= normal * dot(normal, tangent);
+						tangent *= rsqrt(max(dot(tangent, tangent), 1e-20));
+						float3 bitangent = cross(normal, tangent);
+						if (dot(bitangent, uvBitangent) < 0.0) bitangent = -bitangent;
+						float3 mappedNormal = normalMap.sample(normalSampler, input.uv).xyz * 2.0 - 1.0;
+						mappedNormal.xy *= float2(uniforms.surfaceParameters.y, uniforms.surfaceParameters.y * uniforms.surfaceParameters.w);
+						normal = normalize(tangent * mappedNormal.x + bitangent * mappedNormal.y + normal * mappedNormal.z);
 					}
 				}
 				float4 texel = image.sample(imageSampler, input.uv);
