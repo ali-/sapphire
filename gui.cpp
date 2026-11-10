@@ -51,28 +51,6 @@ namespace Sapphire::GUI {
 		constexpr std::size_t maxVertices = 16384;
 		constexpr std::size_t headerSize = 20;
 
-		constexpr const char* vertexShaderSource = R"(
-			#include <metal_stdlib>
-			using namespace metal;
-			struct VertexInput { float2 position [[attribute(0)]]; float2 uv [[attribute(1)]]; };
-			struct VertexOutput { float4 position [[position]]; float2 uv; };
-			vertex VertexOutput main0(VertexInput input [[stage_in]], constant float2& scale [[buffer(0)]]) {
-				VertexOutput output;
-				output.position = float4(input.position * scale + float2(-1.0, 1.0), 0.0, 1.0);
-				output.uv = input.uv;
-				return output;
-			}
-		)";
-
-		constexpr const char* fragmentShaderSource = R"(
-			#include <metal_stdlib>
-			using namespace metal;
-			struct FragmentInput { float4 position [[position]]; float2 uv; };
-			fragment float4 main0(FragmentInput input [[stage_in]],
-				texture2d<float> image [[texture(0)]], sampler imageSampler [[sampler(0)]]) {
-				return image.sample(imageSampler, input.uv);
-			}
-		)";
 
 		std::uint16_t ReadU16(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
 			return static_cast<std::uint16_t>(bytes[offset] | (bytes[offset + 1] << 8));
@@ -133,8 +111,8 @@ namespace Sapphire::GUI {
 
 	bool Initialize(SDL_GPUDevice* device, SDL_Window* window) {
 		gpuDevice = device;
-		SDL_GPUShader* vertexShader = Graphics::CreateShader(gpuDevice, vertexShaderSource, SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 0, 1);
-		SDL_GPUShader* fragmentShader = Graphics::CreateShader(gpuDevice, fragmentShaderSource, SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 1);
+		SDL_GPUShader* vertexShader = Graphics::CreateShader(gpuDevice, Graphics::Shaders::guiVertexShaderSource, SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 0, 1);
+		SDL_GPUShader* fragmentShader = Graphics::CreateShader(gpuDevice, Graphics::Shaders::guiFragmentShaderSource, SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 1);
 
 		if (!vertexShader || !fragmentShader) {
 			if (vertexShader) SDL_ReleaseGPUShader(gpuDevice, vertexShader);
