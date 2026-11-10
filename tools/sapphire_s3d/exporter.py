@@ -1,4 +1,5 @@
 import bpy
+import hashlib
 import json
 import math
 import os
@@ -94,41 +95,7 @@ def export_objects(context, objects):
     return entries
 
 
-def material_image(material, socket_name):
-    if not material or not material.use_nodes or not material.node_tree:
-        return None
-    principled = next((node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
-    if not principled:
-        return None
-    socket = principled.inputs.get(socket_name)
-    if not socket or not socket.is_linked:
-        return None
-    pending = [link.from_node for link in socket.links]
-    visited = set()
-    while pending:
-        node = pending.pop()
-        if node in visited:
-            continue
-        visited.add(node)
-        if node.type == "TEX_IMAGE":
-            return node.image
-        pending.extend(link.from_node for input_socket in node.inputs for link in input_socket.links)
-    return None
-
-
-def image_path(image, export_path):
-    if not image or not image.filepath:
-        return ""
-    try:
-        path = bpy.path.abspath(image.filepath)
-    except Exception:
-        return ""
-    if not os.path.isfile(path):
-        return ""
-    return os.path.relpath(path, os.path.dirname(export_path)).replace(os.sep, "/")
-
-
-def material_record(material, export_path):
+def material_record(material):
     record = {
         "color": (1.0, 1.0, 1.0), "roughness": 1.0, "metallic": 0.0,
         "normal_scale": 1.0, "ao_strength": 1.0, "displacement_scale": 0.05,
@@ -155,9 +122,249 @@ def material_record(material, export_path):
                 record["roughness"] = float(roughness.default_value)
             if alpha:
                 record["opacity"] *= float(alpha.default_value)
-            images = [material_image(material, name) for name in ("Base Color", "Normal", "Roughness")]
-            record["textures"][:3] = [image_path(image, export_path) for image in images]
     return record
+
+
+def linked_input(node, name):
+    socket = node.inputs.get(name) if node else None
+    return socket if socket and socket.is_linked else None
+
+
+def bake_channels(material):
+    if not material or not material.use_nodes or not material.node_tree:
+        return set()
+    nodes = material.node_tree.nodes
+    principled = next((node for node in nodes if node.type == "BSDF_PRINCIPLED"), None)
+    output = next((node for node in nodes if node.type == "OUTPUT_MATERIAL" and node.is_active_output), None)
+    channels = set()
+    if linked_input(principled, "Base Color"):
+        channels.add("base")
+    if linked_input(principled, "Alpha"):
+        channels.add("alpha")
+        channels.add("base")
+    if linked_input(principled, "Normal"):
+        channels.add("normal")
+    if linked_input(principled, "Roughness"):
+        channels.add("roughness")
+    if any(node.type == "AMBIENT_OCCLUSION" for node in nodes):
+        channels.add("ao")
+    if linked_input(output, "Displacement"):
+        channels.add("displacement")
+    return channels
+
+
+def bake_size(material):
+    dimensions = [(node.image.size[0], node.image.size[1]) for node in material.node_tree.nodes if node.type == "TEX_IMAGE" and node.image and any(socket.is_linked for socket in node.outputs) and node.image.size[0] and node.image.size[1]]
+    return max(dimensions, key=lambda size: size[0] * size[1]) if dimensions else (1024, 1024)
+
+
+def emit_socket(material, channel):
+    tree = material.node_tree
+    nodes = tree.nodes
+    output = next((node for node in nodes if node.type == "OUTPUT_MATERIAL" and node.is_active_output), None)
+    principled = next((node for node in nodes if node.type == "BSDF_PRINCIPLED"), None)
+    if not output:
+        raise ValueError("Material has no active output: " + material.name)
+    if channel == "ao":
+        ao = next((node for node in nodes if node.type == "AMBIENT_OCCLUSION"), None)
+        source = ao.outputs.get("AO") if ao else None
+    elif channel == "displacement":
+        connection = linked_input(output, "Displacement")
+        displacement = connection.links[0].from_node if connection else None
+        if not displacement or displacement.type != "DISPLACEMENT":
+            raise ValueError("Unsupported displacement graph in " + material.name)
+        source = displacement.inputs.get("Height")
+        scale = displacement.inputs.get("Scale")
+        midlevel = displacement.inputs.get("Midlevel")
+        if not source or not scale or not midlevel:
+            raise ValueError("Invalid displacement node in " + material.name)
+        subtract = nodes.new("ShaderNodeMath")
+        subtract.operation = "SUBTRACT"
+        subtract.inputs[1].default_value = midlevel.default_value
+        if source.is_linked:
+            tree.links.new(source.links[0].from_socket, subtract.inputs[0])
+        else:
+            subtract.inputs[0].default_value = source.default_value
+        if midlevel.is_linked:
+            tree.links.new(midlevel.links[0].from_socket, subtract.inputs[1])
+        multiply = nodes.new("ShaderNodeMath")
+        multiply.operation = "MULTIPLY"
+        tree.links.new(subtract.outputs[0], multiply.inputs[0])
+        if scale.is_linked:
+            tree.links.new(scale.links[0].from_socket, multiply.inputs[1])
+        else:
+            multiply.inputs[1].default_value = scale.default_value
+        add = nodes.new("ShaderNodeMath")
+        add.operation = "ADD"
+        add.inputs[1].default_value = 0.5
+        tree.links.new(multiply.outputs[0], add.inputs[0])
+        source = add.outputs[0]
+    else:
+        socket_name = {"base": "Base Color", "alpha": "Alpha", "roughness": "Roughness"}[channel]
+        source = principled.inputs.get(socket_name) if principled else None
+    if not source:
+        raise ValueError("Material has no " + channel + " output: " + material.name)
+    emission = nodes.new("ShaderNodeEmission")
+    if source.is_output:
+        tree.links.new(source, emission.inputs[0])
+    elif source.is_linked:
+        tree.links.new(source.links[0].from_socket, emission.inputs[0])
+    else:
+        value = source.default_value
+        emission.inputs[0].default_value = (value, value, value, 1.0) if isinstance(value, float) else value
+    for link in list(output.inputs["Surface"].links):
+        tree.links.remove(link)
+    tree.links.new(emission.outputs[0], output.inputs["Surface"])
+    return emission
+
+
+def bake_materials(context, obj, materials, records, export_path, texture_dir):
+    channels = [bake_channels(material) for material in materials]
+    if not any(channels):
+        return
+    if not obj.data.uv_layers.active:
+        raise ValueError("Mesh needs a UV map for material baking: " + obj.name)
+    scene = context.scene
+    selected = list(context.selected_objects)
+    active = context.view_layer.objects.active
+    active_mode = active.mode if active else "OBJECT"
+    engine = scene.render.engine
+    original_mesh = obj.data
+    source_uv = original_mesh.uv_layers.active
+    minimum_u = min(loop.uv.x for loop in source_uv.data)
+    maximum_u = max(loop.uv.x for loop in source_uv.data)
+    minimum_v = min(loop.uv.y for loop in source_uv.data)
+    maximum_v = max(loop.uv.y for loop in source_uv.data)
+    if minimum_u == maximum_u or minimum_v == maximum_v:
+        raise ValueError("Mesh UV map has no area: " + obj.name)
+    images = []
+    base_images = {}
+    digest = hashlib.sha256(obj.name.encode("utf-8")).hexdigest()[:16]
+    prefix = bpy.path.clean_name(obj.name) + "_" + digest
+    os.makedirs(texture_dir, exist_ok=True)
+    temporary_mesh = original_mesh.copy()
+    try:
+        source_uv = temporary_mesh.uv_layers.active
+        render_uv = temporary_mesh.uv_layers.active_render
+        margin = 0.02
+        scale_u = (1.0 - margin * 2.0) / (maximum_u - minimum_u)
+        scale_v = (1.0 - margin * 2.0) / (maximum_v - minimum_v)
+        offset_u = margin - minimum_u * scale_u
+        offset_v = margin - minimum_v * scale_v
+        bake_uv = temporary_mesh.uv_layers.new(name="S3D Bake", do_init=True)
+        for loop in bake_uv.data:
+            loop.uv = (loop.uv.x * scale_u + offset_u, loop.uv.y * scale_v + offset_v)
+        source_uv.active = True
+        if render_uv:
+            render_uv.active_render = True
+        for index, record in enumerate(records):
+            if channels[index]:
+                record["uv_scale"] = (scale_u, scale_v)
+                record["uv_offset"] = (offset_u, 1.0 - scale_v - offset_v)
+        if active and active_mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        obj.data = temporary_mesh
+        for selected_obj in selected:
+            selected_obj.select_set(False)
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+        scene.render.engine = "CYCLES"
+        for channel in ("base", "alpha", "normal", "roughness", "ao", "displacement"):
+            if not any(channel in needed for needed in channels):
+                continue
+            temporary_materials = []
+            targets = []
+            try:
+                temporary_mesh.materials.clear()
+                for index, source in enumerate(materials):
+                    material = source.copy() if source else bpy.data.materials.new("S3D Bake")
+                    material.use_nodes = True
+                    temporary_materials.append(material)
+                    temporary_mesh.materials.append(material)
+                    width, height = bake_size(material) if source and channel in channels[index] else (1, 1)
+                    image = bpy.data.images.new("S3D " + channel, width=width, height=height, alpha=True)
+                    if channel != "base":
+                        image.colorspace_settings.name = "Non-Color"
+                    images.append(image)
+                    targets.append(image)
+                    target = material.node_tree.nodes.new("ShaderNodeTexImage")
+                    target.image = image
+                    if channel != "normal":
+                        if channel in channels[index]:
+                            emit_socket(material, channel)
+                        else:
+                            emit_socket_constant(material)
+                    for node in material.node_tree.nodes:
+                        node.select = False
+                    target.select = True
+                    material.node_tree.nodes.active = target
+                result = bpy.ops.object.bake(type="NORMAL" if channel == "normal" else "EMIT", use_clear=True, normal_space="TANGENT", uv_layer=bake_uv.name)
+                if "FINISHED" not in result:
+                    raise ValueError("Could not bake " + channel + " for " + obj.name)
+                for index, image in enumerate(targets):
+                    if channel not in channels[index]:
+                        continue
+                    if channel == "alpha":
+                        base = base_images[index]
+                        pixels = list(base.pixels[:])
+                        alpha_pixels = image.pixels[:]
+                        for offset in range(0, len(pixels), 4):
+                            pixels[offset + 3] = alpha_pixels[offset]
+                        base.pixels[:] = pixels
+                        records[index]["opacity"] = 1.0
+                        continue
+                    if channel == "base":
+                        base_images[index] = image
+                        records[index]["color"] = (1.0, 1.0, 1.0)
+                        if "alpha" in channels[index]:
+                            continue
+                    elif channel == "roughness":
+                        records[index]["roughness"] = 1.0
+                    elif channel == "normal":
+                        records[index]["normal_scale"] = 1.0
+                        records[index]["flip_normal_y"] = True
+                    elif channel == "displacement":
+                        records[index]["displacement_scale"] = 1.0
+                    path = os.path.join(texture_dir, f"{prefix}_{index}_{channel}.png")
+                    image.filepath_raw = path
+                    image.file_format = "PNG"
+                    image.save()
+                    slot = {"base": 0, "normal": 1, "roughness": 2, "ao": 3, "displacement": 4}[channel]
+                    records[index]["textures"][slot] = os.path.relpath(path, os.path.dirname(export_path)).replace(os.sep, "/")
+            finally:
+                temporary_mesh.materials.clear()
+                for material in temporary_materials:
+                    bpy.data.materials.remove(material)
+        for index, image in base_images.items():
+            if "alpha" not in channels[index]:
+                continue
+            path = os.path.join(texture_dir, f"{prefix}_{index}_base.png")
+            image.filepath_raw = path
+            image.file_format = "PNG"
+            image.save()
+            records[index]["textures"][0] = os.path.relpath(path, os.path.dirname(export_path)).replace(os.sep, "/")
+    finally:
+        obj.data = original_mesh
+        scene.render.engine = engine
+        for image in images:
+            bpy.data.images.remove(image)
+        bpy.data.meshes.remove(temporary_mesh)
+        for selected_obj in selected:
+            selected_obj.select_set(True)
+        context.view_layer.objects.active = active
+        if active and active_mode != "OBJECT":
+            bpy.ops.object.mode_set(mode=active_mode)
+
+
+def emit_socket_constant(material):
+    tree = material.node_tree
+    output = next(node for node in tree.nodes if node.type == "OUTPUT_MATERIAL" and node.is_active_output)
+    emission = tree.nodes.new("ShaderNodeEmission")
+    emission.name = "S3D Bake Emit"
+    for link in list(output.inputs["Surface"].links):
+        tree.links.remove(link)
+    tree.links.new(emission.outputs[0], output.inputs["Surface"])
+    return emission
 
 
 def write_material(file, record):
@@ -211,7 +418,7 @@ def vertex_weights(obj, vertex_index, bone_indices):
     return (tuple(index for index, _ in weights) + (0,) * (4 - len(weights)), tuple(quantized) + (0,) * (4 - len(weights)))
 
 
-def mesh_payload(obj, export_path, mesh, apply_modifiers):
+def mesh_payload(obj, mesh, apply_modifiers, material_records):
     mesh.calc_loop_triangles()
     materials = list(mesh.materials)
     if not materials:
@@ -227,10 +434,10 @@ def mesh_payload(obj, export_path, mesh, apply_modifiers):
     uv_layer = mesh.uv_layers.active
     color_layer = mesh.color_attributes.active_color if hasattr(mesh, "color_attributes") else None
     vertices = []
+    normal_sums = []
     indices = []
     skin = []
     sections = []
-    material_records = [material_record(material, export_path) for material in materials]
     vertex_lookup = {}
 
     for material_index, triangles in enumerate(used):
@@ -239,31 +446,40 @@ def mesh_payload(obj, export_path, mesh, apply_modifiers):
             for loop_index in triangle.loops:
                 loop = mesh.loops[loop_index]
                 source = mesh.vertices[loop.vertex_index]
-                position = source.co
+                position = tuple(source.co)
                 normal = mesh.corner_normals[loop_index].vector
-                uv = uv_layer.data[loop_index].uv if uv_layer else (0.0, 0.0)
+                uv = (uv_layer.data[loop_index].uv.x, 1.0 - uv_layer.data[loop_index].uv.y) if uv_layer else (0.0, 0.0)
                 color = (1.0, 1.0, 1.0, 1.0)
                 if color_layer:
                     color_value = color_layer.data[loop_index if color_layer.domain == "CORNER" else loop.vertex_index].color
                     color = tuple(color_value)
                 influence = vertex_weights(obj, loop.vertex_index, bone_indices) if bones else ((0, 0, 0, 0), (65535, 0, 0, 0))
-                key = (tuple(position), tuple(normal), tuple(uv), tuple(color), influence)
+                key = (position, tuple(uv), tuple(color), influence)
                 vertex_index = vertex_lookup.get(key)
                 if vertex_index is None:
                     vertex_index = len(vertices)
                     vertex_lookup[key] = vertex_index
-                    vertices.append((tuple(position), tuple(normal), tuple(uv), tuple(color)))
+                    vertices.append((position, tuple(normal), tuple(uv), tuple(color)))
+                    normal_sums.append(normal.copy())
                     if bones:
                         skin.append(influence)
+                else:
+                    normal_sums[vertex_index] += normal
                 indices.append(vertex_index)
         count = len(indices) - first_index
         if count:
             sections.append((first_index, count, material_index))
 
+    for index, (position, normal, uv, color) in enumerate(vertices):
+        average = normal_sums[index]
+        if average.length_squared:
+            average.normalize()
+            vertices[index] = (position, tuple(average), uv, color)
+
     return vertices, indices, sections, material_records, bones, skin
 
 
-def write_object(file, obj, parent, parameters, export_path, apply_modifiers, depsgraph):
+def write_object(file, obj, parent, parameters, source):
     is_light = obj.type == "LIGHT"
     write_string(file, obj.name)
     file.write(struct.pack("<BI", int(is_light), len(parameters)))
@@ -287,17 +503,26 @@ def write_object(file, obj, parent, parameters, export_path, apply_modifiers, de
         file.write(struct.pack("<B3f4fBf", light_type, *color, light.energy * 2.0 ** light.exposure, light.cutoff_distance if light.type != "SUN" else 1000.0, inner, outer, int(light.use_shadow), 0.02))
         return
 
+    write_string(file, source)
+
+
+def write_model(file, context, obj, export_path, texture_dir, apply_modifiers, bake_textures, depsgraph):
+    write_string(file, obj.name)
+    source_materials = list(obj.data.materials) or [None]
+    material_records = [material_record(material) for material in source_materials]
     if apply_modifiers:
         evaluated = obj.evaluated_get(depsgraph)
         mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
         try:
             if mesh is None:
                 raise ValueError("Could not evaluate mesh: " + obj.name)
-            vertices, indices, sections, materials, bones, skin = mesh_payload(obj, export_path, mesh, True)
+            vertices, indices, sections, materials, bones, skin = mesh_payload(obj, mesh, True, material_records)
         finally:
             evaluated.to_mesh_clear()
     else:
-        vertices, indices, sections, materials, bones, skin = mesh_payload(obj, export_path, obj.data, False)
+        vertices, indices, sections, materials, bones, skin = mesh_payload(obj, obj.data, False, material_records)
+    if bake_textures:
+        bake_materials(context, obj, source_materials, material_records, export_path, texture_dir)
     file.write(struct.pack("<5I", len(vertices), len(indices), len(sections), len(materials), len(bones)))
     for position, normal, uv, color in vertices:
         file.write(struct.pack("<12f", *position, *normal, *uv, *color))
@@ -318,6 +543,11 @@ def write_object(file, obj, parent, parameters, export_path, apply_modifiers, de
         file.write(struct.pack("<8H", *indices4, *weights4))
 
 
+def source_name(name):
+    root, separator, suffix = name.rpartition(".")
+    return root if separator and suffix and all("0" <= digit <= "9" for digit in suffix) else name
+
+
 class ExportSapphireS3D(bpy.types.Operator, ExportHelper):
     bl_idname = "export_scene.sapphire_s3d"
     bl_label = "Sapphire (.s3d)"
@@ -326,6 +556,8 @@ class ExportSapphireS3D(bpy.types.Operator, ExportHelper):
     filename_ext = ".s3d"
     filter_glob: StringProperty(default="*.s3d", options={"HIDDEN"})
     apply_modifiers: BoolProperty(name="Apply Modifiers", default=False)
+    bake_textures: BoolProperty(name="Bake Textures", default=False)
+    exported_textures_directory: StringProperty(name="Exported Textures Directory", default="")
 
     def execute(self, context):
         objects = [obj for obj in context.selected_objects if obj.type in {"MESH", "LIGHT"}]
@@ -335,15 +567,34 @@ class ExportSapphireS3D(bpy.types.Operator, ExportHelper):
         depsgraph = context.evaluated_depsgraph_get() if self.apply_modifiers else None
         try:
             entries = export_objects(context, objects)
+            meshes = {obj.name: obj for obj, _, _ in entries if obj.type == "MESH"}
+            sources = {name: source_name(name) for name in meshes}
+            for name, source in sources.items():
+                if source not in meshes:
+                    raise ValueError("Missing source mesh " + source + " for " + name)
+            models = [obj for obj, _, _ in entries if obj.type == "MESH" and sources[obj.name] == obj.name]
+            export_dir = os.path.dirname(os.path.abspath(self.filepath))
+            texture_dir = os.path.abspath(os.path.join(export_dir, os.path.expanduser(self.exported_textures_directory))) if self.bake_textures else ""
             with open(self.filepath, "wb") as file:
                 file.write(b"S3D\0")
+                file.write(struct.pack("<I", len(models)))
+                for obj in models:
+                    write_model(file, context, obj, self.filepath, texture_dir, self.apply_modifiers, self.bake_textures, depsgraph)
                 file.write(struct.pack("<I", len(entries)))
                 for obj, parent, parameters in entries:
-                    write_object(file, obj, parent, parameters, self.filepath, self.apply_modifiers, depsgraph)
-        except (OSError, ValueError, struct.error) as error:
+                    write_object(file, obj, parent, parameters, sources[obj.name] if obj.type == "MESH" else "")
+        except (OSError, ValueError, RuntimeError, struct.error) as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
         return {"FINISHED"}
+
+    def draw(self, context):
+        self.layout.prop(self, "apply_modifiers")
+        self.layout.prop(self, "bake_textures")
+        texture_options = self.layout.column()
+        texture_options.enabled = self.bake_textures
+        texture_options.label(text="Exported Textures Directory")
+        texture_options.prop(self, "exported_textures_directory", text="")
 
     def invoke(self, context, event):
         if not self.filepath:

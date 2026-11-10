@@ -737,30 +737,22 @@ namespace Sapphire::Graphics {
 				uint materialFlags = uint(uniforms.lightingParameters.x);
 				bool twoSided = (materialFlags & 32u) != 0u;
 				float3 normal = (materialFlags & 16u) != 0u ? float3(0.0) : normalize(input.worldNormal);
-				if ((materialFlags & 16u) == 0u && (materialFlags & 9u) != 0u) {
+				if ((materialFlags & 16u) == 0u && (materialFlags & 1u) != 0u) {
 					float3 dpdx = dfdx(input.worldPosition);
 					float3 dpdy = dfdy(input.worldPosition);
-					if ((materialFlags & 8u) != 0u) {
-						float3 geometricNormal = cross(dpdx, dpdy);
-						geometricNormal *= rsqrt(max(dot(geometricNormal, geometricNormal), 1e-20));
-						if (dot(geometricNormal, normal) < 0.0) geometricNormal = -geometricNormal;
-						normal = geometricNormal;
-					}
-					if ((materialFlags & 1u) != 0u) {
-						float2 duvdx = dfdx(input.uv);
-						float2 duvdy = dfdy(input.uv);
-						float determinant = duvdx.x * duvdy.y - duvdx.y * duvdy.x;
-						if (determinant * determinant > 1e-8 * dot(duvdx, duvdx) * dot(duvdy, duvdy)) {
-							float3 tangent = (dpdx * duvdy.y - dpdy * duvdx.y) / determinant;
-							float3 uvBitangent = (dpdy * duvdx.x - dpdx * duvdy.x) / determinant;
-							tangent -= normal * dot(normal, tangent);
-							tangent *= rsqrt(max(dot(tangent, tangent), 1e-20));
-							float3 bitangent = cross(normal, tangent);
-							if (dot(bitangent, uvBitangent) < 0.0) bitangent = -bitangent;
-							float3 mappedNormal = normalMap.sample(normalSampler, input.uv).xyz * 2.0 - 1.0;
-							mappedNormal.xy *= float2(uniforms.surfaceParameters.y, uniforms.surfaceParameters.y * uniforms.surfaceParameters.w);
-							normal = normalize(tangent * mappedNormal.x + bitangent * mappedNormal.y + normal * mappedNormal.z);
-						}
+					float2 duvdx = dfdx(input.uv);
+					float2 duvdy = dfdy(input.uv);
+					float determinant = duvdx.x * duvdy.y - duvdx.y * duvdy.x;
+					if (determinant * determinant > 1e-8 * dot(duvdx, duvdx) * dot(duvdy, duvdy)) {
+						float3 tangent = (dpdx * duvdy.y - dpdy * duvdx.y) / determinant;
+						float3 uvBitangent = (dpdy * duvdx.x - dpdx * duvdy.x) / determinant;
+						tangent -= normal * dot(normal, tangent);
+						tangent *= rsqrt(max(dot(tangent, tangent), 1e-20));
+						float3 bitangent = cross(normal, tangent);
+						if (dot(bitangent, uvBitangent) < 0.0) bitangent = -bitangent;
+						float3 mappedNormal = normalMap.sample(normalSampler, input.uv).xyz * 2.0 - 1.0;
+						mappedNormal.xy *= float2(uniforms.surfaceParameters.y, uniforms.surfaceParameters.y * uniforms.surfaceParameters.w);
+						normal = normalize(tangent * mappedNormal.x + bitangent * mappedNormal.y + normal * mappedNormal.z);
 					}
 				}
 				float4 texel = image.sample(imageSampler, input.uv);
@@ -976,7 +968,7 @@ namespace Sapphire::Graphics {
 				GetAxes(transform, axes);
 				Frustum frustum{
 					transform.position,
-					axes[0],
+				Scale(axes[0], -1.0f),
 					axes[2],
 					Scale(axes[1], -1.0f),
 					std::tan(camera.fieldOfView * Math::degreesToRadians * 0.5f),
@@ -2488,7 +2480,6 @@ namespace Sapphire::Graphics {
 			info.vertex_input_state.vertex_attributes = attributes;
 			info.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
 			info.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
-			info.rasterizer_state.front_face = SDL_GPU_FRONTFACE_CLOCKWISE;
 			info.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
 			info.depth_stencil_state.enable_depth_test = true;
 			info.depth_stencil_state.enable_depth_write = true;
@@ -2496,6 +2487,7 @@ namespace Sapphire::Graphics {
 			info.target_info.has_depth_stencil_target = true;
 			info.target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
 			for (int instanced = 0; instanced < 2; ++instanced) {
+				info.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
 				info.vertex_input_state.num_vertex_buffers = instanced ? 2 : 1;
 				info.vertex_input_state.num_vertex_attributes = instanced ? 8 : 4;
 				info.vertex_shader = vertex[instanced];
@@ -2525,6 +2517,7 @@ namespace Sapphire::Graphics {
 				color.blend_state.enable_blend = false;
 				info.depth_stencil_state.enable_depth_write = true;
 				info.vertex_shader = shadowVertex[instanced];
+				info.rasterizer_state.front_face = SDL_GPU_FRONTFACE_CLOCKWISE;
 				info.target_info.num_color_targets = 0;
 				info.target_info.color_target_descriptions = nullptr;
 				info.rasterizer_state.enable_depth_bias = true;
@@ -2546,6 +2539,7 @@ namespace Sapphire::Graphics {
 				info.vertex_input_state.num_vertex_attributes = 6;
 				info.vertex_input_state.vertex_attributes = skinnedAttributes;
 				info.vertex_shader = skinnedVertex;
+				info.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
 				info.depth_stencil_state.enable_depth_write = true;
 				info.rasterizer_state.enable_depth_bias = false;
 				info.target_info.num_color_targets = 1;
@@ -2573,6 +2567,7 @@ namespace Sapphire::Graphics {
 				color.blend_state.enable_blend = false;
 				info.depth_stencil_state.enable_depth_write = true;
 				info.vertex_shader = skinnedShadowVertex;
+				info.rasterizer_state.front_face = SDL_GPU_FRONTFACE_CLOCKWISE;
 				info.target_info.num_color_targets = 0;
 				info.target_info.color_target_descriptions = nullptr;
 				info.rasterizer_state.enable_depth_bias = true;
@@ -2714,7 +2709,6 @@ namespace Sapphire::Graphics {
 			pipelineInfo.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
 			pipelineInfo.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
 			pipelineInfo.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_BACK;
-			pipelineInfo.rasterizer_state.front_face = SDL_GPU_FRONTFACE_CLOCKWISE;
 			pipelineInfo.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
 			pipelineInfo.depth_stencil_state.enable_depth_test = true;
 			pipelineInfo.depth_stencil_state.enable_depth_write = true;
@@ -2724,6 +2718,7 @@ namespace Sapphire::Graphics {
 			pipelineInfo.target_info.has_depth_stencil_target = true;
 			pipelineInfo.target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
 			for (int instanced = 0; instanced < 2; ++instanced) {
+				pipelineInfo.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
 				pipelineInfo.vertex_shader = instanced ? instanceVertexShader : vertexShader;
 				pipelineInfo.vertex_input_state.num_vertex_buffers = instanced ? 2 : 1;
 				pipelineInfo.vertex_input_state.vertex_buffer_descriptions = instanced ? instanceDescriptions : &vertexBufferDescription;
@@ -2746,6 +2741,7 @@ namespace Sapphire::Graphics {
 			colorTarget.blend_state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
 			colorTarget.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
 			colorTarget.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
+			pipelineInfo.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
 			for (int instanced = 0; instanced < 2; ++instanced) {
 				pipelineInfo.vertex_shader = instanced ? instanceVertexShader : vertexShader;
 				pipelineInfo.vertex_input_state.num_vertex_buffers = instanced ? 2 : 1;
@@ -2759,6 +2755,7 @@ namespace Sapphire::Graphics {
 			}
 			pipelineInfo.depth_stencil_state.enable_depth_write = true;
 			pipelineInfo.vertex_shader = shadowVertexShader;
+			pipelineInfo.rasterizer_state.front_face = SDL_GPU_FRONTFACE_CLOCKWISE;
 			pipelineInfo.vertex_input_state.num_vertex_attributes = 4;
 			pipelineInfo.rasterizer_state.enable_depth_bias = true;
 			pipelineInfo.rasterizer_state.depth_bias_constant_factor = 2.0f;
@@ -2787,6 +2784,7 @@ namespace Sapphire::Graphics {
 			pipelineInfo.vertex_input_state.num_vertex_attributes = 6;
 			pipelineInfo.vertex_input_state.vertex_attributes = skinnedAttributes;
 			pipelineInfo.vertex_shader = skinnedVertexShader;
+			pipelineInfo.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
 			pipelineInfo.rasterizer_state.enable_depth_bias = false;
 			colorTarget.blend_state.enable_blend = false;
 			pipelineInfo.depth_stencil_state.enable_depth_write = true;
@@ -2814,6 +2812,7 @@ namespace Sapphire::Graphics {
 			}
 			pipelineInfo.depth_stencil_state.enable_depth_write = true;
 			pipelineInfo.vertex_shader = skinnedShadowVertexShader;
+			pipelineInfo.rasterizer_state.front_face = SDL_GPU_FRONTFACE_CLOCKWISE;
 			pipelineInfo.rasterizer_state.enable_depth_bias = true;
 			pipelineInfo.rasterizer_state.depth_bias_constant_factor = 2.0f;
 			pipelineInfo.rasterizer_state.depth_bias_slope_factor = shadowSlopeFactor;
@@ -3121,7 +3120,8 @@ namespace Sapphire::Graphics {
 		SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(commandBuffer, &colorInfo, 1, &depthInfo);
 		if (!pass) throw std::runtime_error(std::string("Begin main render pass: ") + SDL_GetError());
 		const Matrix4 view = scene.activeCamera ? ViewDirection(frustum.position, frustum.forward, frustum.up) : Identity();
-		const Matrix4 projection = scene.activeCamera ? Perspective(scene.activeCamera->fieldOfView, aspectRatio, scene.activeCamera->near, scene.activeCamera->far) : Identity();
+		Matrix4 projection = scene.activeCamera ? Perspective(scene.activeCamera->fieldOfView, aspectRatio, scene.activeCamera->near, scene.activeCamera->far) : Identity();
+		if (scene.activeCamera) projection.values[0] = -projection.values[0];
 		const Matrix4 viewProjection = Multiply(projection, view);
 		SortDraws();
 		SDL_GPUGraphicsPipeline* activePipeline = nullptr;
