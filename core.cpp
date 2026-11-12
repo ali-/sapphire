@@ -1191,6 +1191,10 @@ namespace Sapphire {
 			bool ambientLight = true;
 			Vector3 ambientLightColor{1.0f, 1.0f, 1.0f};
 			bool fogEnabled = false;
+			bool fogVolumetric = false;
+			float fogIntensity = 1.0f;
+			float fogHeight = 10.0f; // World-space height where density is defined.
+			float fogFalloff = 0.1f; // Exponential density falloff above fogHeight.
 			bool debugMode = false;
 			Vector3 fogColor;
 			Vector3 backgroundColor;
