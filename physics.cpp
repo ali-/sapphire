@@ -40,15 +40,15 @@ namespace Sapphire {
 			Vector3 localRotation;
 			Vector3 size{};
 	};
-	struct RaycastHit {
-		Object* object = nullptr;
-		Collider* collider = nullptr;
-		Vector3 point;
-		Vector3 normal;
-		float distance = 0.0f;
-	};
-
 	namespace Physics {
+		struct RaycastHit {
+			Object* object = nullptr;
+			Collider* collider = nullptr;
+			Vector3 point;
+			Vector3 normal;
+			float distance = 0.0f;
+		};
+
 		void EnsureMeshCollider(Object& object) {
 			if (!object.GetComponent<Collider>()) object.AddComponent<Collider>();
 		}
