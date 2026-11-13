@@ -17,6 +17,7 @@
 #include <string_view>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <SDL3/SDL.h>
@@ -47,6 +48,11 @@ namespace Sapphire::Graphics {
 		constexpr int shadowMapCount = 3;
 		constexpr int maxPointLights = 16;
 		constexpr float shadowSlopeFactor = 3.0f;
+		constexpr Uint32 fogSliceCount = 64;
+		constexpr Uint32 fogMaxGridWidth = 240;
+		constexpr Uint32 fogMaxGridHeight = 135;
+		constexpr Uint32 maxFogDensityInputs = 4;
+		constexpr std::uint64_t maxFogDensityGridSamples = 1'048'576;
 		Uint32 shadowMapResolution = 2048;
 		using CellKey = std::tuple<int, int, int>;
 
@@ -97,6 +103,13 @@ namespace Sapphire::Graphics {
 			float fogColor[4];
 			float fogParameters[4];
 			float fogHeightParameters[4];
+			float fogVolumeParameters[4];
+			float fogSliceParameters[4];
+			float fogScreenParameters[4];
+			float fogViewParameters[4];
+			float cameraRight[4];
+			float cameraUp[4];
+			float cameraForward[4];
 			float ambientLight[4];
 			float directionalDirection[4];
 			float directionalColor[4];
@@ -104,6 +117,30 @@ namespace Sapphire::Graphics {
 			float pointLightColorIntensity[maxPointLights][4];
 			float pointLightShadowInfo[maxPointLights][4];
 			float pointLightShadowBias[maxPointLights][4];
+		};
+
+		struct FogDensityInputUniforms {
+			float boundsMinimum[4];
+			float boundsMaximum[4];
+			float parameters[4];
+			float grid[4];
+		};
+
+		struct FogComputeUniforms {
+			FrameUniforms frame;
+			Uint32 densityInputCount[4];
+			FogDensityInputUniforms densityInputs[maxFogDensityInputs + 1];
+		};
+
+		struct CachedFogDensityTexture {
+			SDL_GPUTexture* texture = nullptr;
+			std::uint64_t revision = 0;
+			const float* samples = nullptr;
+			std::size_t sampleCount = 0;
+			Uint32 width = 0;
+			Uint32 height = 0;
+			Uint32 depth = 0;
+			Bounds bounds;
 		};
 
 		struct LightData {
@@ -246,6 +283,20 @@ namespace Sapphire::Graphics {
 
 		SDL_GPUDevice* gpuDevice = nullptr;
 		SDL_GPUTextureFormat pipelineColorFormat = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+		SDL_GPUComputePipeline* fogComputePipeline = nullptr;
+		SDL_GPUGraphicsPipeline* fogBackgroundPipeline = nullptr;
+		SDL_GPUSampler* fogSampler = nullptr;
+		SDL_GPUTexture* fogVolumeTexture = nullptr;
+		SDL_GPUTexture* emptyFogVolumeTexture = nullptr;
+		std::unordered_map<const FogDensitySource*, CachedFogDensityTexture> fogDensityTextures;
+		Uint32 fogGridWidth = 0;
+		Uint32 fogGridHeight = 0;
+		Uint32 fogGridSlices = 0;
+		bool fogDensityGridSupported = false;
+		bool fogDensityLimitReported = false;
+		bool fogDensityFormatReported = false;
+		bool fogDensityUploadFailureReported = false;
+		bool volumetricFogSupported = false;
 		SDL_GPUGraphicsPipeline* colliderDebugPipeline = nullptr;
 		SDL_GPUBuffer* colliderDebugBuffer = nullptr;
 		Uint32 colliderDebugCapacity = 0;
@@ -413,6 +464,113 @@ namespace Sapphire::Graphics {
 			if (!uploadPass) uploadPass = SDL_BeginGPUCopyPass(uploadCommandBuffer);
 			if (!uploadPass) throw std::runtime_error(std::string("Begin upload copy pass: ") + SDL_GetError());
 			return uploadPass;
+		}
+
+		SDL_GPUTexture* UploadFogDensityGrid(const FogDensityInput& input) {
+			if (!fogDensityGridSupported || input.width == 0 || input.heightSamples == 0 || input.depth == 0) return nullptr;
+			std::uint64_t sampleCount = input.width;
+			if (sampleCount > maxFogDensityGridSamples || input.heightSamples > maxFogDensityGridSamples / sampleCount) return nullptr;
+			sampleCount *= input.heightSamples;
+			if (input.depth > maxFogDensityGridSamples / sampleCount) return nullptr;
+			sampleCount *= input.depth;
+			if (sampleCount != input.samples.size()) return nullptr;
+			const std::uint64_t byteCount = sampleCount * sizeof(float);
+			if (byteCount > std::numeric_limits<Uint32>::max()) return nullptr;
+			SDL_GPUTextureCreateInfo textureInfo{};
+			textureInfo.type = SDL_GPU_TEXTURETYPE_3D;
+			textureInfo.format = SDL_GPU_TEXTUREFORMAT_R32_FLOAT;
+			textureInfo.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+			textureInfo.width = input.width;
+			textureInfo.height = input.heightSamples;
+			textureInfo.layer_count_or_depth = input.depth;
+			textureInfo.num_levels = 1;
+			textureInfo.sample_count = SDL_GPU_SAMPLECOUNT_1;
+			SDL_GPUTexture* texture = CreateTextureResource(gpuDevice, textureInfo);
+			SDL_GPUTransferBuffer* transfer = nullptr;
+			try {
+				if (uploadBytes + byteCount > 32 * 1024 * 1024) FlushUploads();
+				uploadBytes += static_cast<std::size_t>(byteCount);
+				RecordUpload(static_cast<Uint32>(byteCount));
+				peakUploadBytes = std::max(peakUploadBytes, uploadBytes);
+				transfer = CreateTransferBuffer(gpuDevice, static_cast<Uint32>(byteCount));
+				void* mapped = SDL_MapGPUTransferBuffer(gpuDevice, transfer, false);
+				if (!mapped) throw std::runtime_error(std::string("Map fog density transfer buffer: ") + SDL_GetError());
+				std::memcpy(mapped, input.samples.data(), static_cast<std::size_t>(byteCount));
+				SDL_UnmapGPUTransferBuffer(gpuDevice, transfer);
+				SDL_GPUTextureTransferInfo source{};
+				source.transfer_buffer = transfer;
+				source.pixels_per_row = input.width;
+				source.rows_per_layer = input.heightSamples;
+				SDL_GPUTextureRegion destination{};
+				destination.texture = texture;
+				destination.w = input.width;
+				destination.h = input.heightSamples;
+				destination.d = input.depth;
+				SDL_UploadToGPUTexture(BeginUploads(), &source, &destination, false);
+				try { uploadTransfers.push_back(transfer); }
+				catch (...) {
+					ReleaseTransferBuffer(gpuDevice, transfer);
+					transfer = nullptr;
+					throw;
+				}
+				transfer = nullptr;
+				return texture;
+			}
+			catch (...) {
+				if (transfer) ReleaseTransferBuffer(gpuDevice, transfer);
+				ReleaseTexture(gpuDevice, texture);
+				throw;
+			}
+		}
+
+		bool ValidFogDensityBounds(const Bounds& bounds) {
+			return std::isfinite(bounds.minimum.x) && std::isfinite(bounds.minimum.y) && std::isfinite(bounds.minimum.z) &&
+				std::isfinite(bounds.maximum.x) && std::isfinite(bounds.maximum.y) && std::isfinite(bounds.maximum.z) &&
+				bounds.maximum.x > bounds.minimum.x && bounds.maximum.y > bounds.minimum.y && bounds.maximum.z > bounds.minimum.z;
+		}
+
+		bool SameFogDensityBounds(const Bounds& first, const Bounds& second) {
+			return first.minimum.x == second.minimum.x && first.minimum.y == second.minimum.y && first.minimum.z == second.minimum.z &&
+				first.maximum.x == second.maximum.x && first.maximum.y == second.maximum.y && first.maximum.z == second.maximum.z;
+		}
+
+		bool ValidFogDensityInput(const FogDensityInput& input) {
+			if (input.encoding == FogDensityInput::Encoding::ExponentialHeight) {
+				return std::isfinite(input.density) && input.density >= 0.0f && std::isfinite(input.height) &&
+					std::isfinite(input.falloff) && input.falloff >= 0.0f && std::isfinite(input.endDistance) && input.endDistance > 0.0f;
+			}
+			if (input.encoding != FogDensityInput::Encoding::SampledGrid || !ValidFogDensityBounds(input.bounds) || !input.width || !input.heightSamples || !input.depth) return false;
+			std::uint64_t sampleCount = input.width;
+			if (sampleCount > maxFogDensityGridSamples || input.heightSamples > maxFogDensityGridSamples / sampleCount) return false;
+			sampleCount *= input.heightSamples;
+			if (input.depth > maxFogDensityGridSamples / sampleCount) return false;
+			sampleCount *= input.depth;
+			return sampleCount == input.samples.size();
+		}
+
+		SDL_GPUTexture* GetFogDensityTexture(const FogDensitySource* source, const FogDensityInput& input) {
+			auto cached = fogDensityTextures.find(source);
+			if (cached != fogDensityTextures.end() && cached->second.revision == input.revision && cached->second.samples == input.samples.data() && cached->second.sampleCount == input.samples.size() && cached->second.width == input.width && cached->second.height == input.heightSamples && cached->second.depth == input.depth && SameFogDensityBounds(cached->second.bounds, input.bounds)) return cached->second.texture;
+			if (!fogDensityGridSupported) {
+				if (!fogDensityFormatReported) SDL_Log("Sampled fog density inputs unavailable: R32_FLOAT 3D textures are unsupported");
+				fogDensityFormatReported = true;
+				return nullptr;
+			}
+			for (const float density : input.samples) if (!std::isfinite(density) || density < 0.0f) return nullptr;
+			SDL_GPUTexture* texture = nullptr;
+			try { texture = UploadFogDensityGrid(input); }
+			catch (const std::exception& error) {
+				if (!fogDensityUploadFailureReported) SDL_Log("Sampled fog density input upload failed: %s", error.what());
+				fogDensityUploadFailureReported = true;
+				return nullptr;
+			}
+			if (!texture) return nullptr;
+			if (cached != fogDensityTextures.end()) {
+				if (cached->second.texture) ReleaseTexture(gpuDevice, cached->second.texture);
+				cached->second = {texture, input.revision, input.samples.data(), input.samples.size(), input.width, input.heightSamples, input.depth, input.bounds};
+			}
+			else fogDensityTextures.emplace(source, CachedFogDensityTexture{texture, input.revision, input.samples.data(), input.samples.size(), input.width, input.heightSamples, input.depth, input.bounds});
+			return texture;
 		}
 
 		std::uint64_t Hash(std::uint64_t hash, const void* data, std::size_t size) {
@@ -1260,6 +1418,33 @@ namespace Sapphire::Graphics {
 			return CreateTextureResource(gpuDevice, textureInfo);
 		}
 
+		bool EnsureFogVolumeTexture(Uint32 width, Uint32 height, Uint32 slices) {
+			if (fogVolumeTexture && width == fogGridWidth && height == fogGridHeight && slices == fogGridSlices) return true;
+			SDL_GPUTextureCreateInfo textureInfo{};
+			textureInfo.type = SDL_GPU_TEXTURETYPE_3D;
+			textureInfo.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+			textureInfo.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE;
+			textureInfo.width = width;
+			textureInfo.height = height;
+			textureInfo.layer_count_or_depth = slices;
+			textureInfo.num_levels = 1;
+			textureInfo.sample_count = SDL_GPU_SAMPLECOUNT_1;
+			try {
+				SDL_GPUTexture* nextTexture = CreateTextureResource(gpuDevice, textureInfo);
+				if (fogVolumeTexture) ReleaseTexture(gpuDevice, fogVolumeTexture);
+				fogVolumeTexture = nextTexture;
+				fogGridWidth = width;
+				fogGridHeight = height;
+				fogGridSlices = slices;
+				return true;
+			}
+			catch (const std::exception& error) {
+				SDL_Log("Volumetric fog texture unavailable: %s", error.what());
+				volumetricFogSupported = false;
+				return false;
+			}
+		}
+
 		SDL_GPUTexture* CreateShadowTexture(Uint32 resolution) {
 			SDL_GPUTextureCreateInfo textureInfo{};
 			textureInfo.type = SDL_GPU_TEXTURETYPE_2D;
@@ -2061,6 +2246,38 @@ namespace Sapphire::Graphics {
 		return pipeline;
 	}
 
+	void PrepareFogBackgroundPipeline() {
+		if (fogBackgroundPipeline) return;
+		SDL_GPUShader* vertex = CreateShader(gpuDevice, fogBackgroundVertexShaderSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL);
+		SDL_GPUShader* fragment = CreateShader(gpuDevice, fogBackgroundFragmentShaderSource.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 1, 2);
+		if (!vertex || !fragment) {
+			if (vertex) SDL_ReleaseGPUShader(gpuDevice, vertex);
+			if (fragment) SDL_ReleaseGPUShader(gpuDevice, fragment);
+			throw std::runtime_error(std::string("Create volumetric fog background shaders: ") + SDL_GetError());
+		}
+		SDL_GPUColorTargetDescription colorTarget{};
+		colorTarget.format = pipelineColorFormat;
+		SDL_GPUGraphicsPipelineCreateInfo info{};
+		info.vertex_shader = vertex;
+		info.fragment_shader = fragment;
+		info.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+		info.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+		info.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+		info.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
+		info.target_info.num_color_targets = 1;
+		info.target_info.color_target_descriptions = &colorTarget;
+		info.target_info.has_depth_stencil_target = true;
+		info.target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+		try { fogBackgroundPipeline = CreatePipeline(gpuDevice, info); }
+		catch (...) {
+			SDL_ReleaseGPUShader(gpuDevice, vertex);
+			SDL_ReleaseGPUShader(gpuDevice, fragment);
+			throw;
+		}
+		SDL_ReleaseGPUShader(gpuDevice, vertex);
+		SDL_ReleaseGPUShader(gpuDevice, fragment);
+	}
+
 	void PrepareColliderDebugPipeline() {
 		if (colliderDebugPipeline) return;
 		SDL_GPUShader* vertex = CreateShader(gpuDevice, vertexSource, SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 0, 1);
@@ -2125,7 +2342,7 @@ namespace Sapphire::Graphics {
 			}
 			for (int masked = 0; masked < 2; ++masked) {
 				const std::string prefix = masked ? "#define ALPHA_MASKED 1\n" : "#define ALPHA_MASKED 0\n";
-				fragment[masked] = CreateShader(gpuDevice, (prefix + fragmentShaderSource).c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 8, 2);
+				fragment[masked] = CreateShader(gpuDevice, (prefix + fragmentShaderSource).c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 9, 2);
 				shadowFragment[masked] = CreateShader(gpuDevice, (prefix + shadowFragmentShaderSource).c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, masked ? 1 : 0);
 				if (!fragment[masked] || !shadowFragment[masked]) throw std::runtime_error(std::string("Compile modifier pipeline fragment shader: ") + SDL_GetError());
 			}
@@ -2275,7 +2492,7 @@ namespace Sapphire::Graphics {
 			const std::string define = masked ? "#define ALPHA_MASKED 1\n" : "#define ALPHA_MASKED 0\n";
 			const std::string source = define + fragmentShaderSource;
 			const std::string shadowSource = define + shadowFragmentShaderSource;
-			fragmentShaders[masked] = CreateShader(gpuDevice, source.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 8, 2);
+			fragmentShaders[masked] = CreateShader(gpuDevice, source.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 9, 2);
 			shadowFragmentShaders[masked] = CreateShader(gpuDevice, shadowSource.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, masked ? 1 : 0);
 		}
 		const auto releaseShaders = [&]() {
@@ -2332,6 +2549,57 @@ namespace Sapphire::Graphics {
 		skinnedAttributes[4] = {4, 1, SDL_GPU_VERTEXELEMENTFORMAT_USHORT4, offsetof(SkinInfluence, boneIndices)};
 		skinnedAttributes[5] = {5, 1, SDL_GPU_VERTEXELEMENTFORMAT_USHORT4_NORM, offsetof(SkinInfluence, weights)};
 		try {
+			try {
+				const SDL_GPUTextureUsageFlags samplerUsage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+				const SDL_GPUTextureUsageFlags fogTextureUsage = samplerUsage | SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE;
+				fogDensityGridSupported = SDL_GPUTextureSupportsFormat(gpuDevice, SDL_GPU_TEXTUREFORMAT_R32_FLOAT, SDL_GPU_TEXTURETYPE_3D, samplerUsage);
+				if (SDL_GPUTextureSupportsFormat(gpuDevice, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, SDL_GPU_TEXTURETYPE_3D, samplerUsage)) {
+					SDL_GPUSamplerCreateInfo fogSamplerInfo{};
+					fogSamplerInfo.min_filter = SDL_GPU_FILTER_LINEAR;
+					fogSamplerInfo.mag_filter = SDL_GPU_FILTER_LINEAR;
+					fogSamplerInfo.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
+					fogSamplerInfo.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+					fogSamplerInfo.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+					fogSamplerInfo.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+					fogSampler = CreateSampler(gpuDevice, fogSamplerInfo);
+					SDL_GPUTextureCreateInfo emptyFogInfo{};
+					emptyFogInfo.type = SDL_GPU_TEXTURETYPE_3D;
+					emptyFogInfo.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+					emptyFogInfo.usage = samplerUsage;
+					emptyFogInfo.width = emptyFogInfo.height = emptyFogInfo.layer_count_or_depth = 1;
+					emptyFogInfo.num_levels = 1;
+					emptyFogInfo.sample_count = SDL_GPU_SAMPLECOUNT_1;
+					emptyFogVolumeTexture = CreateTextureResource(gpuDevice, emptyFogInfo);
+					if (SDL_GPUTextureSupportsFormat(gpuDevice, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, SDL_GPU_TEXTURETYPE_3D, fogTextureUsage)) {
+						SDL_GPUComputePipelineCreateInfo computeInfo{};
+						computeInfo.code_size = fogComputeShaderSource.size() + 1;
+						computeInfo.code = reinterpret_cast<const Uint8*>(fogComputeShaderSource.c_str());
+						computeInfo.entrypoint = "main0";
+						computeInfo.format = SDL_GPU_SHADERFORMAT_MSL;
+						computeInfo.num_samplers = maxFogDensityInputs;
+						computeInfo.num_readwrite_storage_textures = 1;
+						computeInfo.num_uniform_buffers = 1;
+						computeInfo.threadcount_x = 8;
+						computeInfo.threadcount_y = 8;
+						computeInfo.threadcount_z = 1;
+						fogComputePipeline = SDL_CreateGPUComputePipeline(gpuDevice, &computeInfo);
+						volumetricFogSupported = fogComputePipeline != nullptr;
+						if (!fogComputePipeline) SDL_Log("Volumetric fog compute pipeline unavailable: %s", SDL_GetError());
+					}
+					else SDL_Log("Volumetric fog storage format unavailable");
+				}
+				else SDL_Log("Volumetric fog sampling format unavailable");
+			}
+			catch (const std::exception& error) {
+				SDL_Log("Volumetric fog initialization unavailable: %s", error.what());
+				if (fogComputePipeline) SDL_ReleaseGPUComputePipeline(gpuDevice, fogComputePipeline);
+				fogComputePipeline = nullptr;
+				if (fogSampler) SDL_ReleaseGPUSampler(gpuDevice, fogSampler);
+				fogSampler = nullptr;
+				if (emptyFogVolumeTexture) ReleaseTexture(gpuDevice, emptyFogVolumeTexture);
+				emptyFogVolumeTexture = nullptr;
+				volumetricFogSupported = false;
+			}
 			const std::uint8_t whitePixel[4] = {255, 255, 255, 255};
 			whiteTexture = CreateTexture(gpuDevice, 1, 1, whitePixel);
 			SDL_GPUSamplerCreateInfo samplerInfo{};
@@ -2358,6 +2626,8 @@ namespace Sapphire::Graphics {
 			SDL_GPUColorTargetDescription colorTarget{};
 			colorTarget.format = window ? SDL_GetGPUSwapchainTextureFormat(gpuDevice, window) : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
 		pipelineColorFormat = colorTarget.format;
+		try { PrepareFogBackgroundPipeline(); }
+		catch (const std::exception& error) { SDL_Log("Volumetric fog background pass unavailable: %s", error.what()); }
 			SDL_GPUGraphicsPipelineCreateInfo pipelineInfo{};
 			pipelineInfo.vertex_shader = vertexShader;
 			pipelineInfo.vertex_input_state.num_vertex_buffers = 1;
@@ -2723,12 +2993,91 @@ namespace Sapphire::Graphics {
 		frame.fogColor[1] = scene.fogColor.y;
 		frame.fogColor[2] = scene.fogColor.z;
 		const float farClip = scene.activeCamera ? std::max(scene.activeCamera->far, 0.01f) : 1000.0f;
-		frame.fogParameters[1] = farClip;
+		const float nearClip = scene.activeCamera ? std::min(std::max(scene.activeCamera->near, 0.01f), farClip * 0.5f) : 0.1f;
+		const float fogQuality = std::isfinite(scene.fogQuality) && scene.fogQuality > 0.0f ? std::min(scene.fogQuality, 4.0f) : 1.0f;
+		bool volumetricFogActive = scene.fogEnabled && scene.fogVolumetric && scene.activeCamera && volumetricFogSupported && fogComputePipeline && fogBackgroundPipeline && fogSampler && emptyFogVolumeTexture;
+		Uint32 frameFogWidth = 1;
+		Uint32 frameFogHeight = 1;
+		Uint32 frameFogSlices = fogSliceCount;
+		if (volumetricFogActive) {
+			const Uint32 baseWidth = std::min(fogMaxGridWidth, std::max(1u, (width + 7) / 8));
+			const Uint32 baseHeight = std::min(fogMaxGridHeight, std::max(1u, (height + 7) / 8));
+			frameFogWidth = std::max(1u, static_cast<Uint32>(std::ceil(baseWidth * fogQuality)));
+			frameFogHeight = std::max(1u, static_cast<Uint32>(std::ceil(baseHeight * fogQuality)));
+			frameFogSlices = std::max(1u, static_cast<Uint32>(std::ceil(fogSliceCount * fogQuality)));
+			volumetricFogActive = EnsureFogVolumeTexture(frameFogWidth, frameFogHeight, frameFogSlices);
+		}
+		std::array<const FogDensityInput*, maxFogDensityInputs> densityInputs{};
+		std::array<SDL_GPUTexture*, maxFogDensityInputs> densityTextures{};
+		Uint32 densityInputCount = 0;
+		if (volumetricFogActive) {
+			std::unordered_set<const FogDensitySource*> activeDensitySources;
+			for (const auto& object : scene.Objects()) {
+				auto* source = dynamic_cast<const FogDensitySource*>(object.get());
+				if (!source) continue;
+				const FogDensityInput& input = source->GetFogDensityInput();
+				if (!ValidFogDensityInput(input)) continue;
+				if (densityInputCount >= maxFogDensityInputs) {
+					if (!fogDensityLimitReported) SDL_Log("Volumetric fog supports up to %u sampled density inputs", maxFogDensityInputs);
+					fogDensityLimitReported = true;
+					continue;
+				}
+				SDL_GPUTexture* densityTexture = nullptr;
+				if (input.encoding == FogDensityInput::Encoding::SampledGrid) {
+					densityTexture = GetFogDensityTexture(source, input);
+					if (!densityTexture) continue;
+				}
+				else if (auto cached = fogDensityTextures.find(source); cached != fogDensityTextures.end()) {
+					if (cached->second.texture) ReleaseTexture(gpuDevice, cached->second.texture);
+					fogDensityTextures.erase(cached);
+				}
+				activeDensitySources.insert(source);
+				densityInputs[densityInputCount] = &input;
+				densityTextures[densityInputCount] = densityTexture;
+				++densityInputCount;
+			}
+			for (auto cached = fogDensityTextures.begin(); cached != fogDensityTextures.end();) {
+				if (activeDensitySources.find(cached->first) != activeDensitySources.end()) {
+					++cached;
+					continue;
+				}
+				if (cached->second.texture) ReleaseTexture(gpuDevice, cached->second.texture);
+				cached = fogDensityTextures.erase(cached);
+			}
+		}
+		else {
+			for (auto& [source, cached] : fogDensityTextures) if (cached.texture) ReleaseTexture(gpuDevice, cached.texture);
+			fogDensityTextures.clear();
+		}
+		const float fogEndDistance = volumetricFogActive ? farClip * 0.9f : farClip;
+		frame.fogParameters[1] = fogEndDistance;
 		frame.fogParameters[2] = scene.fogEnabled ? 1.0f : 0.0f;
-		frame.fogHeightParameters[0] = 0.35f / farClip;
-		frame.fogHeightParameters[1] = 0.1f;
-		frame.fogHeightParameters[2] = 10.0f;
+		frame.fogHeightParameters[0] = 0.35f / fogEndDistance;
+		frame.fogHeightParameters[1] = std::isfinite(scene.fogFalloff) ? std::max(scene.fogFalloff, 0.0f) : 0.1f;
+		frame.fogHeightParameters[2] = std::isfinite(scene.fogHeight) ? scene.fogHeight : 10.0f;
 		frame.fogHeightParameters[3] = linearOutput ? 1.0f : 0.0f;
+		frame.fogVolumeParameters[0] = volumetricFogActive ? 1.0f : 0.0f;
+		frame.fogVolumeParameters[1] = std::isfinite(scene.fogIntensity) ? std::max(scene.fogIntensity, 0.0f) : 0.0f;
+		frame.fogVolumeParameters[2] = static_cast<float>(frameFogWidth);
+		frame.fogVolumeParameters[3] = static_cast<float>(frameFogHeight);
+		frame.fogSliceParameters[0] = static_cast<float>(frameFogSlices);
+		frame.fogScreenParameters[0] = static_cast<float>(width);
+		frame.fogScreenParameters[1] = static_cast<float>(height);
+		frame.fogScreenParameters[2] = static_cast<float>(frameFogWidth);
+		frame.fogScreenParameters[3] = static_cast<float>(frameFogHeight);
+		frame.fogViewParameters[0] = frustum.tanHalfFov;
+		frame.fogViewParameters[1] = aspectRatio;
+		frame.fogViewParameters[2] = nearClip;
+		frame.fogViewParameters[3] = farClip;
+		frame.cameraRight[0] = frustum.right.x;
+		frame.cameraRight[1] = frustum.right.y;
+		frame.cameraRight[2] = frustum.right.z;
+		frame.cameraUp[0] = frustum.up.x;
+		frame.cameraUp[1] = frustum.up.y;
+		frame.cameraUp[2] = frustum.up.z;
+		frame.cameraForward[0] = frustum.forward.x;
+		frame.cameraForward[1] = frustum.forward.y;
+		frame.cameraForward[2] = frustum.forward.z;
 		frame.ambientLight[0] = scene.ambientLightColor.x;
 		frame.ambientLight[1] = scene.ambientLightColor.y;
 		frame.ambientLight[2] = scene.ambientLightColor.z;
@@ -2757,6 +3106,65 @@ namespace Sapphire::Graphics {
 			frame.pointLightShadowInfo[index][3] = pointLights[index].dynamicShadowValid ? 1.0f : 0.0f;
 			frame.pointLightShadowBias[index][0] = std::max(pointLights[index].shadowBias, 0.0f);
 		}
+		frame.fogParameters[0] = static_cast<float>(pointLights.size());
+		const Matrix4 view = scene.activeCamera ? ViewDirection(frustum.position, frustum.forward, frustum.up) : Identity();
+		Matrix4 projection = scene.activeCamera ? Perspective(scene.activeCamera->fieldOfView, aspectRatio, scene.activeCamera->near, scene.activeCamera->far) : Identity();
+		if (scene.activeCamera) projection.values[0] = -projection.values[0];
+		const Matrix4 viewProjection = Multiply(projection, view);
+		FogComputeUniforms fogComputeUniforms{};
+		fogComputeUniforms.frame = frame;
+		fogComputeUniforms.densityInputCount[0] = densityInputCount;
+		auto setExponentialInput = [](FogDensityInputUniforms& target, float density, float height, float falloff, float endDistance) {
+			target.parameters[0] = static_cast<float>(FogDensityInput::Encoding::ExponentialHeight);
+			target.parameters[1] = density;
+			target.parameters[2] = falloff;
+			target.parameters[3] = height;
+			target.grid[3] = endDistance;
+		};
+		setExponentialInput(fogComputeUniforms.densityInputs[0], frame.fogHeightParameters[0], frame.fogHeightParameters[2], frame.fogHeightParameters[1], frame.fogParameters[1]);
+		for (Uint32 index = 0; index < densityInputCount; ++index) {
+			const FogDensityInput& input = *densityInputs[index];
+			FogDensityInputUniforms& target = fogComputeUniforms.densityInputs[index + 1];
+			if (input.encoding == FogDensityInput::Encoding::ExponentialHeight) {
+				setExponentialInput(target, input.density, input.height, input.falloff, input.endDistance);
+				continue;
+			}
+			target.parameters[0] = static_cast<float>(FogDensityInput::Encoding::SampledGrid);
+			target.boundsMinimum[0] = input.bounds.minimum.x;
+			target.boundsMinimum[1] = input.bounds.minimum.y;
+			target.boundsMinimum[2] = input.bounds.minimum.z;
+			target.boundsMaximum[0] = input.bounds.maximum.x;
+			target.boundsMaximum[1] = input.bounds.maximum.y;
+			target.boundsMaximum[2] = input.bounds.maximum.z;
+			target.grid[0] = static_cast<float>(input.width);
+			target.grid[1] = static_cast<float>(input.heightSamples);
+			target.grid[2] = static_cast<float>(input.depth);
+		}
+		if (volumetricFogActive) {
+			FlushUploads();
+			SDL_GPUStorageTextureReadWriteBinding fogWrite{};
+			fogWrite.texture = fogVolumeTexture;
+			fogWrite.mip_level = 0;
+			fogWrite.layer = 0;
+			SDL_PushGPUComputeUniformData(commandBuffer, 0, &fogComputeUniforms, sizeof(fogComputeUniforms));
+			SDL_GPUComputePass* fogPass = SDL_BeginGPUComputePass(commandBuffer, &fogWrite, 1, nullptr, 0);
+			if (fogPass) {
+				SDL_BindGPUComputePipeline(fogPass, fogComputePipeline);
+				SDL_GPUTextureSamplerBinding densityBindings[maxFogDensityInputs]{};
+				for (Uint32 index = 0; index < maxFogDensityInputs; ++index) densityBindings[index] = {densityTextures[index] ? densityTextures[index] : emptyFogVolumeTexture, fogSampler};
+				SDL_BindGPUComputeSamplers(fogPass, 0, densityBindings, maxFogDensityInputs);
+				SDL_DispatchGPUCompute(fogPass, (frameFogWidth + 7) / 8, (frameFogHeight + 7) / 8, 1);
+				SDL_EndGPUComputePass(fogPass);
+			}
+			else {
+				SDL_Log("Volumetric fog compute pass unavailable: %s", SDL_GetError());
+				volumetricFogActive = false;
+				frame.fogVolumeParameters[0] = 0.0f;
+				frame.fogParameters[1] = farClip;
+				frame.fogHeightParameters[0] = 0.35f / farClip;
+				volumetricFogSupported = false;
+			}
+		}
 		SDL_PushGPUFragmentUniformData(commandBuffer, 1, &frame, sizeof(frame));
 		SDL_GPUColorTargetInfo colorInfo{};
 		colorInfo.texture = colorTarget;
@@ -2777,13 +3185,18 @@ namespace Sapphire::Graphics {
 		depthInfo.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
 		SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(commandBuffer, &colorInfo, 1, &depthInfo);
 		if (!pass) throw std::runtime_error(std::string("Begin main render pass: ") + SDL_GetError());
-		const Matrix4 view = scene.activeCamera ? ViewDirection(frustum.position, frustum.forward, frustum.up) : Identity();
-		Matrix4 projection = scene.activeCamera ? Perspective(scene.activeCamera->fieldOfView, aspectRatio, scene.activeCamera->near, scene.activeCamera->far) : Identity();
-		if (scene.activeCamera) projection.values[0] = -projection.values[0];
-		const Matrix4 viewProjection = Multiply(projection, view);
+		if (volumetricFogActive) {
+			struct BackgroundUniforms { float color[4]; } backgroundUniforms{{scene.backgroundColor.x, scene.backgroundColor.y, scene.backgroundColor.z, 1.0f}};
+			SDL_PushGPUFragmentUniformData(commandBuffer, 0, &backgroundUniforms, sizeof(backgroundUniforms));
+			SDL_BindGPUGraphicsPipeline(pass, fogBackgroundPipeline);
+			SDL_GPUTextureSamplerBinding fogBinding{fogVolumeTexture, fogSampler};
+			SDL_BindGPUFragmentSamplers(pass, 0, &fogBinding, 1);
+			SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
+			++drawCallCount;
+		}
 		SortDraws();
 		SDL_GPUGraphicsPipeline* activePipeline = nullptr;
-		std::array<SDL_GPUTexture*, 8> activeTextures{};
+		std::array<SDL_GPUTexture*, 9> activeTextures{};
 		GpuMaterial* activeMaterial = nullptr;
 		BufferBindings buffers;
 		SkeletonBindings skeletonBindings;
@@ -2846,7 +3259,7 @@ namespace Sapphire::Graphics {
 				SDL_GPUBufferBinding instanceBinding{gpuMesh.instanceBuffer, 0};
 				SDL_BindGPUVertexBuffers(pass, 1, &instanceBinding, 1);
 			}
-			SDL_GPUTextureSamplerBinding bindings[8]{};
+			SDL_GPUTextureSamplerBinding bindings[9]{};
 			bindings[0] = {activeGpuMaterial->textures[0], sampler};
 			bindings[1] = {enabled[0] ? detail->texture : emptyShadowTexture, shadowSampler};
 			bindings[2] = {enabled[1] ? fallbackShadowTexture : emptyShadowTexture, shadowSampler};
@@ -2855,12 +3268,13 @@ namespace Sapphire::Graphics {
 			bindings[5] = {activeGpuMaterial->textures[1], sampler};
 			bindings[6] = {activeGpuMaterial->textures[2], sampler};
 			bindings[7] = {activeGpuMaterial->textures[3], sampler};
+			bindings[8] = {volumetricFogActive ? fogVolumeTexture : emptyFogVolumeTexture, fogSampler ? fogSampler : sampler};
 			bool texturesChanged = false;
 			for (std::size_t index = 0; index < activeTextures.size(); ++index) {
 				texturesChanged = texturesChanged || activeTextures[index] != bindings[index].texture;
 				activeTextures[index] = bindings[index].texture;
 			}
-			if (texturesChanged) SDL_BindGPUFragmentSamplers(pass, 0, bindings, 8);
+			if (texturesChanged) SDL_BindGPUFragmentSamplers(pass, 0, bindings, 9);
 			SDL_GPUTextureSamplerBinding vertexBindings[2] = {{activeGpuMaterial->textures[4], sampler}, {activeGpuMaterial->textures[5], sampler}};
 			if (activeMaterial != activeGpuMaterial) SDL_BindGPUVertexSamplers(pass, 0, vertexBindings, 2);
 			activeMaterial = activeGpuMaterial;
@@ -2913,6 +3327,26 @@ namespace Sapphire::Graphics {
 	}
 
 	void Shutdown() {
+		if (fogComputePipeline) SDL_ReleaseGPUComputePipeline(gpuDevice, fogComputePipeline);
+		fogComputePipeline = nullptr;
+		if (fogBackgroundPipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, fogBackgroundPipeline);
+		fogBackgroundPipeline = nullptr;
+		if (fogSampler) SDL_ReleaseGPUSampler(gpuDevice, fogSampler);
+		fogSampler = nullptr;
+		if (fogVolumeTexture) ReleaseTexture(gpuDevice, fogVolumeTexture);
+		if (emptyFogVolumeTexture) ReleaseTexture(gpuDevice, emptyFogVolumeTexture);
+		for (auto& entry : fogDensityTextures) if (entry.second.texture) ReleaseTexture(gpuDevice, entry.second.texture);
+		fogDensityTextures.clear();
+		fogVolumeTexture = nullptr;
+		emptyFogVolumeTexture = nullptr;
+		fogGridWidth = 0;
+		fogGridHeight = 0;
+		fogGridSlices = 0;
+		fogDensityGridSupported = false;
+		fogDensityLimitReported = false;
+		fogDensityFormatReported = false;
+		fogDensityUploadFailureReported = false;
+		volumetricFogSupported = false;
 		if (colliderDebugPipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, colliderDebugPipeline);
 		colliderDebugPipeline = nullptr;
 		ReleaseBuffer(gpuDevice, colliderDebugBuffer);

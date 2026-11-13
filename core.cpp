@@ -310,7 +310,7 @@ namespace Sapphire {
 			float innerSpotAngle = 25.0f;
 			float outerSpotAngle = 30.0f;
 			bool castShadows = true;
-			float shadowBias = 0.02f;
+			float shadowBias = 0.04f;
 	};
 
 	struct Bone {
@@ -834,6 +834,27 @@ namespace Sapphire {
 			std::vector<Object*> children;
 	};
 
+	struct FogDensityInput {
+		enum class Encoding : std::uint32_t { ExponentialHeight, SampledGrid };
+		Encoding encoding = Encoding::SampledGrid;
+		Math::Bounds bounds;
+		float density = 0.0f;
+		float height = 0.0f;
+		float falloff = 0.0f;
+		float endDistance = 0.0f;
+		std::uint32_t width = 0;
+		std::uint32_t heightSamples = 0;
+		std::uint32_t depth = 0;
+		std::vector<float> samples;
+		std::uint64_t revision = 0;
+	};
+
+	class FogDensitySource {
+		public:
+			virtual const FogDensityInput& GetFogDensityInput() const = 0;
+			virtual ~FogDensitySource() = default;
+	};
+
 	class WorldPartitioner {
 		using CellKey = std::tuple<int, int, int>;
 		std::map<CellKey, std::vector<Object*>> cells;
@@ -1191,6 +1212,11 @@ namespace Sapphire {
 			bool ambientLight = true;
 			Vector3 ambientLightColor{1.0f, 1.0f, 1.0f};
 			bool fogEnabled = false;
+			bool fogVolumetric = false;
+			float fogQuality = 1.0f;
+			float fogIntensity = 1.0f;
+			float fogHeight = 10.0f;
+			float fogFalloff = 0.1f;
 			bool debugMode = false;
 			Vector3 fogColor;
 			Vector3 backgroundColor;
@@ -1537,7 +1563,9 @@ namespace Sapphire {
 					record.light.type = static_cast<Light::Type>(type);
 					record.light.color = reader.Vector();
 					record.light.intensity = reader.Read<float>(); record.light.range = reader.Read<float>(); record.light.innerSpotAngle = reader.Read<float>(); record.light.outerSpotAngle = reader.Read<float>();
-					record.light.castShadows = reader.Read<std::uint8_t>() != 0; record.light.shadowBias = reader.Read<float>();
+					record.light.castShadows = reader.Read<std::uint8_t>() != 0;
+					reader.Read<float>(); // Consume the stored bias; loaded lights use the current Light default.
+					record.light.shadowBias = Light{}.shadowBias;
 				}
 				else throw std::runtime_error("Invalid S3D object type");
 				records.push_back(std::move(record));

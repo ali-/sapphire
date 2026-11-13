@@ -85,12 +85,146 @@ namespace Sapphire::Graphics::Shaders {
 		}
 	)";
 
-	inline constexpr const char* fragmentShaderSource = R"(
+	inline const std::string fogCommonShaderSource = R"(
 		#include <metal_stdlib>
 		using namespace metal;
+		struct FrameUniforms {
+			float4 cameraPosition; float4 fogColor; float4 fogParameters; float4 fogHeightParameters;
+			float4 fogVolumeParameters; float4 fogSliceParameters; float4 fogScreenParameters; float4 fogViewParameters;
+			float4 cameraRight; float4 cameraUp; float4 cameraForward;
+			float4 ambientLight; float4 directionalDirection; float4 directionalColor;
+			float4 pointLightPositionRange[16]; float4 pointLightColorIntensity[16];
+			float4 pointLightShadowInfo[16]; float4 pointLightShadowBias[16];
+		};
+		float HeightFogProfile(float3 position, constant FrameUniforms& frame, float4 profile) {
+			float3 ray = position - frame.cameraPosition.xyz;
+			float rayLength = length(ray);
+			float endDistance = min(rayLength, profile.w);
+			float verticalDirection = ray.z / max(rayLength, 0.000001);
+			float startHeight = frame.cameraPosition.z;
+			float endHeight = frame.cameraPosition.z + verticalDirection * endDistance;
+			float falloff = profile.y;
+			float density = profile.x * exp2(clamp(-falloff * (min(startHeight, endHeight) - profile.z), -80.0, 80.0));
+			float heightChange = falloff * abs(endHeight - startHeight) * 0.69314718056;
+			float integral = heightChange < 0.01 ? 1.0 - heightChange * 0.5 + heightChange * heightChange / 6.0 : (1.0 - exp2(-heightChange * 1.44269504089)) / heightChange;
+			float distance = min(rayLength / profile.w, 1.0);
+			float distanceSquared = distance * distance;
+			float distanceFourth = distanceSquared * distanceSquared;
+			float opticalDepth = min(density * endDistance * integral + 4.6 * distanceFourth * distanceFourth, 80.0);
+			return 1.0 - exp2(-opticalDepth * 1.44269504089);
+		}
+		float HeightFog(float3 position, constant FrameUniforms& frame) {
+			if (frame.fogParameters.z < 0.5) return 0.0;
+			return HeightFogProfile(position, frame, float4(frame.fogHeightParameters.x, frame.fogHeightParameters.y, frame.fogHeightParameters.z, frame.fogParameters.y));
+		}
+		float3 EncodeColor(float3 color, constant FrameUniforms& frame, float2 pixelPosition) {
+			color = max(color, float3(0.0));
+			if (frame.fogHeightParameters.w < 0.5) color = select(1.055 * pow(color, float3(1.0 / 2.4)) - 0.055, color * 12.92, color <= 0.0031308);
+			uint2 pixel = uint2(pixelPosition);
+			uint noiseBits = pixel.x * 0x8da6b343u ^ pixel.y * 0xd8163841u;
+			noiseBits ^= noiseBits >> 16;
+			noiseBits *= 0x7feb352du;
+			noiseBits ^= noiseBits >> 15;
+			float dither = (float(noiseBits & 0x00ffffffu) / 16777216.0 - 0.5) / 510.0;
+			return max(color + dither, float3(0.0));
+		}
+	)";
+
+	inline const std::string fogComputeShaderSource = fogCommonShaderSource + R"(
+		struct FogDensityInputUniforms { float4 boundsMinimum; float4 boundsMaximum; float4 parameters; float4 grid; };
+		struct FogComputeUniforms { FrameUniforms frame; uint4 densityInputCount; FogDensityInputUniforms densityInputs[5]; };
+		kernel void main0(uint2 gid [[thread_position_in_grid]], constant FogComputeUniforms& uniforms [[buffer(0)]], texture3d<float> densityMap0 [[texture(0)]], sampler densitySampler0 [[sampler(0)]], texture3d<float> densityMap1 [[texture(1)]], sampler densitySampler1 [[sampler(1)]], texture3d<float> densityMap2 [[texture(2)]], sampler densitySampler2 [[sampler(2)]], texture3d<float> densityMap3 [[texture(3)]], sampler densitySampler3 [[sampler(3)]], texture3d<float, access::write> fogOutput [[texture(4)]]) {
+			constant FrameUniforms& frame = uniforms.frame;
+			uint2 gridSize = uint2(frame.fogVolumeParameters.zw);
+			if (gid.x >= gridSize.x || gid.y >= gridSize.y) return;
+			float2 uv = (float2(gid) + 0.5) / float2(gridSize);
+			float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+			float3 ray = normalize(frame.cameraForward.xyz + frame.cameraRight.xyz * ndc.x * frame.fogViewParameters.x * frame.fogViewParameters.y + frame.cameraUp.xyz * ndc.y * frame.fogViewParameters.x);
+			float nearClip = frame.fogViewParameters.z;
+			float farClip = frame.fogViewParameters.w;
+			uint sliceCount = max(uint(frame.fogSliceParameters.x), 1u);
+			float logRange = log(farClip / nearClip);
+			float previousDistance = nearClip;
+			float previousFog[5] = {0.0};
+			float transmittance = 1.0;
+			float3 scattering = float3(0.0);
+			for (uint slice = 0; slice < sliceCount; ++slice) {
+				float distance = nearClip * exp(logRange * (float(slice) + 0.5) / float(sliceCount));
+				float3 position = frame.cameraPosition.xyz + ray * distance;
+				float segmentTransmittance = 1.0;
+				for (uint sourceIndex = 0; sourceIndex <= uniforms.densityInputCount.x; ++sourceIndex) {
+					FogDensityInputUniforms source = uniforms.densityInputs[sourceIndex];
+					if (source.parameters.x < 0.5) {
+						float fog = HeightFogProfile(position, frame, float4(source.parameters.y, source.parameters.z, source.parameters.w, source.grid.w));
+						float previousTransmittance = 1.0 - previousFog[sourceIndex];
+						segmentTransmittance *= clamp((1.0 - fog) / max(previousTransmittance, 0.000001), 0.0, 1.0);
+						previousFog[sourceIndex] = fog;
+					}
+					else {
+						float3 extent = source.boundsMaximum.xyz - source.boundsMinimum.xyz;
+						float3 coordinate = (position - source.boundsMinimum.xyz) / max(extent, float3(0.000001));
+						if (all(coordinate >= float3(0.0)) && all(coordinate <= float3(1.0))) {
+							float density = 0.0;
+							if (sourceIndex == 1) density = densityMap0.sample(densitySampler0, coordinate).r;
+							else if (sourceIndex == 2) density = densityMap1.sample(densitySampler1, coordinate).r;
+							else if (sourceIndex == 3) density = densityMap2.sample(densitySampler2, coordinate).r;
+							else if (sourceIndex == 4) density = densityMap3.sample(densitySampler3, coordinate).r;
+							segmentTransmittance *= exp(-max(density, 0.0) * max(distance - previousDistance, 0.0));
+						}
+					}
+				}
+				segmentTransmittance = clamp(segmentTransmittance, 0.0, 1.0);
+				float segmentScattering = transmittance * (1.0 - segmentTransmittance) * frame.fogVolumeParameters.y;
+				float3 lighting = frame.ambientLight.rgb * frame.ambientLight.a;
+				float directionalIntensity = frame.directionalDirection.w;
+				if (directionalIntensity > 0.0) lighting += frame.directionalColor.rgb * directionalIntensity;
+				uint lightCount = min(uint(frame.fogParameters.x), 16u);
+				for (uint light = 0; light < lightCount; ++light) {
+					float4 positionRange = frame.pointLightPositionRange[light];
+					float4 colorIntensity = frame.pointLightColorIntensity[light];
+					if (positionRange.w <= 0.0 || colorIntensity.w <= 0.0) continue;
+					float3 toLight = positionRange.xyz - position;
+					float distanceSquared = dot(toLight, toLight);
+					if (distanceSquared >= positionRange.w * positionRange.w) continue;
+					float rangeFade = clamp(1.0 - sqrt(distanceSquared) / positionRange.w, 0.0, 1.0);
+					lighting += colorIntensity.rgb * colorIntensity.w * rangeFade * rangeFade / max(distanceSquared, 1.0);
+				}
+				scattering += frame.fogColor.rgb * lighting * segmentScattering;
+				transmittance *= segmentTransmittance;
+				previousDistance = distance;
+				fogOutput.write(float4(scattering, transmittance), uint3(gid, slice));
+			}
+		}
+	)";
+
+	inline const std::string fogBackgroundVertexShaderSource = R"(
+		#include <metal_stdlib>
+		using namespace metal;
+		struct VertexOutput { float4 position [[position]]; };
+		vertex VertexOutput main0(uint vertexId [[vertex_id]]) {
+			float2 positions[3] = {float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0)};
+			VertexOutput output;
+			output.position = float4(positions[vertexId], 1.0, 1.0);
+			return output;
+		}
+	)";
+
+	inline const std::string fogBackgroundFragmentShaderSource = fogCommonShaderSource + R"(
+		struct BackgroundUniforms { float4 color; };
+		fragment float4 main0(float4 position [[position]], constant BackgroundUniforms& background [[buffer(0)]], constant FrameUniforms& frame [[buffer(1)]], texture3d<float> fogVolumeMap [[texture(0)]], sampler fogVolumeSampler [[sampler(0)]]) {
+			float2 screenUV = position.xy / frame.fogScreenParameters.xy;
+			float sliceCount = max(frame.fogSliceParameters.x, 1.0);
+			float3 fogCoordinate = float3(screenUV, (sliceCount - 0.5) / sliceCount);
+			float4 integratedFog = fogVolumeMap.sample(fogVolumeSampler, fogCoordinate);
+			float3 color = background.color.rgb * integratedFog.a + integratedFog.rgb;
+			color = EncodeColor(color, frame, position.xy);
+			return float4(color, 1.0);
+		}
+	)";
+
+	inline const std::string fragmentShaderSource = fogCommonShaderSource + R"(
 		struct FragmentInput { float4 position [[position]]; float2 uv; float4 color; float3 worldPosition; float3 worldNormal; float4 shadowPosition0; float4 shadowPosition1; float4 shadowPosition2; };
 		struct FragmentUniforms { float4 shadowParameters[3]; float4 lightingParameters; float4 baseColor; float4 surfaceParameters; uint4 pointLightIndices[4]; };
-		struct FrameUniforms { float4 cameraPosition; float4 fogColor; float4 fogParameters; float4 fogHeightParameters; float4 ambientLight; float4 directionalDirection; float4 directionalColor; float4 pointLightPositionRange[16]; float4 pointLightColorIntensity[16]; float4 pointLightShadowInfo[16]; float4 pointLightShadowBias[16]; };
 		float ShadowCoverage(float4 position, float4 parameters) {
 			if (parameters.x < 0.5) return 0.0;
 			float3 projected = position.xyz / position.w;
@@ -175,30 +309,8 @@ namespace Sapphire::Graphics::Shaders {
 			return (diffuse + distribution * visibility * fresnel) * nDotL;
 		}
 
-		float3 EncodeColor(float3 color, constant FrameUniforms& frame) {
-			if (frame.fogHeightParameters.w > 0.5) return color;
-			color = max(color, float3(0.0));
-			return select(1.055 * pow(color, float3(1.0 / 2.4)) - 0.055, color * 12.92, color <= 0.0031308);
-		}
-		float HeightFog(float3 position, constant FrameUniforms& frame) {
-			if (frame.fogParameters.z < 0.5) return 0.0;
-			float3 ray = position - frame.cameraPosition.xyz;
-			float rayLength = length(ray);
-			float endDistance = min(rayLength, frame.fogParameters.y);
-			float verticalDirection = ray.z / max(rayLength, 0.000001);
-			float startHeight = frame.cameraPosition.z;
-			float endHeight = frame.cameraPosition.z + verticalDirection * endDistance;
-			float falloff = frame.fogHeightParameters.y;
-			float density = frame.fogHeightParameters.x * exp2(clamp(-falloff * (min(startHeight, endHeight) - frame.fogHeightParameters.z), -80.0, 80.0));
-			float heightChange = falloff * abs(endHeight - startHeight) * 0.69314718056;
-			float integral = heightChange < 0.01 ? 1.0 - heightChange * 0.5 + heightChange * heightChange / 6.0 : (1.0 - exp2(-heightChange * 1.44269504089)) / heightChange;
-			float distance = min(rayLength / frame.fogParameters.y, 1.0);
-			float distanceSquared = distance * distance;
-			float distanceFourth = distanceSquared * distanceSquared;
-			float opticalDepth = min(density * endDistance * integral + 4.6 * distanceFourth * distanceFourth, 80.0);
-			return 1.0 - exp2(-opticalDepth * 1.44269504089);
-		}
-		fragment float4 main0(FragmentInput input [[stage_in]], constant FragmentUniforms& uniforms [[buffer(0)]], constant FrameUniforms& frame [[buffer(1)]], texture2d<float> image [[texture(0)]], sampler imageSampler [[sampler(0)]], depth2d<float> detailMap [[texture(1)]], sampler detailSampler [[sampler(1)]], depth2d<float> fallbackMap [[texture(2)]], sampler fallbackSampler [[sampler(2)]], depth2d<float> dynamicMap [[texture(3)]], sampler dynamicSampler [[sampler(3)]], depth2d_array<float> pointShadowMap [[texture(4)]], sampler pointShadowSampler [[sampler(4)]], texture2d<float> normalMap [[texture(5)]], sampler normalSampler [[sampler(5)]], texture2d<float> roughnessMap [[texture(6)]], sampler roughnessSampler [[sampler(6)]], texture2d<float> aoMap [[texture(7)]], sampler aoSampler [[sampler(7)]]) {
+
+		fragment float4 main0(FragmentInput input [[stage_in]], constant FragmentUniforms& uniforms [[buffer(0)]], constant FrameUniforms& frame [[buffer(1)]], texture2d<float> image [[texture(0)]], sampler imageSampler [[sampler(0)]], depth2d<float> detailMap [[texture(1)]], sampler detailSampler [[sampler(1)]], depth2d<float> fallbackMap [[texture(2)]], sampler fallbackSampler [[sampler(2)]], depth2d<float> dynamicMap [[texture(3)]], sampler dynamicSampler [[sampler(3)]], depth2d_array<float> pointShadowMap [[texture(4)]], sampler pointShadowSampler [[sampler(4)]], texture2d<float> normalMap [[texture(5)]], sampler normalSampler [[sampler(5)]], texture2d<float> roughnessMap [[texture(6)]], sampler roughnessSampler [[sampler(6)]], texture2d<float> aoMap [[texture(7)]], sampler aoSampler [[sampler(7)]], texture3d<float> fogVolumeMap [[texture(8)]], sampler fogVolumeSampler [[sampler(8)]]) {
 			uint materialFlags = uint(uniforms.lightingParameters.x);
 			bool twoSided = (materialFlags & 32u) != 0u;
 			float3 normal = (materialFlags & 16u) != 0u ? float3(0.0) : normalize(input.worldNormal);
@@ -225,11 +337,26 @@ namespace Sapphire::Graphics::Shaders {
 			if (texel.a < 0.5) discard_fragment();
 			#endif
 			float fog = HeightFog(input.worldPosition, frame);
+			float3 fogScattering = float3(0.0);
+			float fogTransmittance = 1.0 - fog;
+			if (frame.fogVolumeParameters.x > 0.5) {
+				float nearClip = frame.fogViewParameters.z;
+				float farClip = frame.fogViewParameters.w;
+				float rayLength = length(input.worldPosition - frame.cameraPosition.xyz);
+				float depth = clamp(log(max(rayLength, nearClip) / nearClip) / log(farClip / nearClip), 0.0, 1.0);
+				float sliceCount = max(frame.fogSliceParameters.x, 1.0);
+				float sliceCoordinate = depth * ((sliceCount - 1.0) / sliceCount) + (0.5 / sliceCount);
+				float2 screenUV = input.position.xy / frame.fogScreenParameters.xy;
+				float4 integratedFog = fogVolumeMap.sample(fogVolumeSampler, float3(screenUV, sliceCoordinate));
+				fogScattering = integratedFog.rgb;
+				fogTransmittance = integratedFog.a;
+			}
 			float opacity = input.color.a * texel.a * uniforms.lightingParameters.y;
-			if (fog >= 1.0) return float4(EncodeColor(frame.fogColor.rgb, frame), opacity);
+			if (fog >= 1.0 && frame.fogVolumeParameters.x < 0.5) return float4(EncodeColor(frame.fogColor.rgb, frame, input.position.xy), opacity);
 			if ((materialFlags & 16u) != 0u) {
 				float3 tint = input.color.rgb * uniforms.baseColor.rgb * texel.rgb;
-				return float4(EncodeColor(mix(tint, frame.fogColor.rgb, fog), frame), opacity);
+				float3 color = frame.fogVolumeParameters.x > 0.5 ? tint * fogTransmittance + fogScattering : mix(tint, frame.fogColor.rgb, fog);
+				return float4(EncodeColor(color, frame, input.position.xy), opacity);
 			}
 			float3 albedo = input.color.rgb * texel.rgb * uniforms.baseColor.rgb;
 			float roughness = clamp(uniforms.surfaceParameters.x * ((materialFlags & 2u) != 0u ? roughnessMap.sample(roughnessSampler, input.uv).r : 1.0), 0.045, 1.0);
@@ -273,7 +400,8 @@ namespace Sapphire::Graphics::Shaders {
 			}
 			float3 ambient = frame.ambientLight.a > 0.5 ? frame.ambientLight.rgb : float3(0.0);
 			float3 color = albedo * ambient * ao * (1.0 - metallic) + direct + pointLighting;
-			return float4(EncodeColor(mix(color, frame.fogColor.rgb, fog), frame), opacity);
+			color = frame.fogVolumeParameters.x > 0.5 ? color * fogTransmittance + fogScattering : mix(color, frame.fogColor.rgb, fog);
+			return float4(EncodeColor(color, frame, input.position.xy), opacity);
 		}
 	)";
 
