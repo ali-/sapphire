@@ -310,7 +310,7 @@ namespace Sapphire {
 			float innerSpotAngle = 25.0f;
 			float outerSpotAngle = 30.0f;
 			bool castShadows = true;
-			float shadowBias = 0.02f;
+			float shadowBias = 0.04f;
 	};
 
 	struct Bone {
@@ -1563,7 +1563,9 @@ namespace Sapphire {
 					record.light.type = static_cast<Light::Type>(type);
 					record.light.color = reader.Vector();
 					record.light.intensity = reader.Read<float>(); record.light.range = reader.Read<float>(); record.light.innerSpotAngle = reader.Read<float>(); record.light.outerSpotAngle = reader.Read<float>();
-					record.light.castShadows = reader.Read<std::uint8_t>() != 0; record.light.shadowBias = reader.Read<float>();
+					record.light.castShadows = reader.Read<std::uint8_t>() != 0;
+					reader.Read<float>(); // Consume the stored bias; loaded lights use the current Light default.
+					record.light.shadowBias = Light{}.shadowBias;
 				}
 				else throw std::runtime_error("Invalid S3D object type");
 				records.push_back(std::move(record));

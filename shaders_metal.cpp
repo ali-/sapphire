@@ -117,6 +117,17 @@ namespace Sapphire::Graphics::Shaders {
 			if (frame.fogParameters.z < 0.5) return 0.0;
 			return HeightFogProfile(position, frame, float4(frame.fogHeightParameters.x, frame.fogHeightParameters.y, frame.fogHeightParameters.z, frame.fogParameters.y));
 		}
+		float3 EncodeColor(float3 color, constant FrameUniforms& frame, float2 pixelPosition) {
+			color = max(color, float3(0.0));
+			if (frame.fogHeightParameters.w < 0.5) color = select(1.055 * pow(color, float3(1.0 / 2.4)) - 0.055, color * 12.92, color <= 0.0031308);
+			uint2 pixel = uint2(pixelPosition);
+			uint noiseBits = pixel.x * 0x8da6b343u ^ pixel.y * 0xd8163841u;
+			noiseBits ^= noiseBits >> 16;
+			noiseBits *= 0x7feb352du;
+			noiseBits ^= noiseBits >> 15;
+			float dither = (float(noiseBits & 0x00ffffffu) / 16777216.0 - 0.5) / 510.0;
+			return max(color + dither, float3(0.0));
+		}
 	)";
 
 	inline const std::string fogComputeShaderSource = fogCommonShaderSource + R"(
@@ -206,8 +217,7 @@ namespace Sapphire::Graphics::Shaders {
 			float3 fogCoordinate = float3(screenUV, (sliceCount - 0.5) / sliceCount);
 			float4 integratedFog = fogVolumeMap.sample(fogVolumeSampler, fogCoordinate);
 			float3 color = background.color.rgb * integratedFog.a + integratedFog.rgb;
-			color = max(color, float3(0.0));
-			if (frame.fogHeightParameters.w < 0.5) color = select(1.055 * pow(color, float3(1.0 / 2.4)) - 0.055, color * 12.92, color <= 0.0031308);
+			color = EncodeColor(color, frame, position.xy);
 			return float4(color, 1.0);
 		}
 	)";
@@ -299,11 +309,7 @@ namespace Sapphire::Graphics::Shaders {
 			return (diffuse + distribution * visibility * fresnel) * nDotL;
 		}
 
-		float3 EncodeColor(float3 color, constant FrameUniforms& frame) {
-			if (frame.fogHeightParameters.w > 0.5) return color;
-			color = max(color, float3(0.0));
-			return select(1.055 * pow(color, float3(1.0 / 2.4)) - 0.055, color * 12.92, color <= 0.0031308);
-		}
+
 		fragment float4 main0(FragmentInput input [[stage_in]], constant FragmentUniforms& uniforms [[buffer(0)]], constant FrameUniforms& frame [[buffer(1)]], texture2d<float> image [[texture(0)]], sampler imageSampler [[sampler(0)]], depth2d<float> detailMap [[texture(1)]], sampler detailSampler [[sampler(1)]], depth2d<float> fallbackMap [[texture(2)]], sampler fallbackSampler [[sampler(2)]], depth2d<float> dynamicMap [[texture(3)]], sampler dynamicSampler [[sampler(3)]], depth2d_array<float> pointShadowMap [[texture(4)]], sampler pointShadowSampler [[sampler(4)]], texture2d<float> normalMap [[texture(5)]], sampler normalSampler [[sampler(5)]], texture2d<float> roughnessMap [[texture(6)]], sampler roughnessSampler [[sampler(6)]], texture2d<float> aoMap [[texture(7)]], sampler aoSampler [[sampler(7)]], texture3d<float> fogVolumeMap [[texture(8)]], sampler fogVolumeSampler [[sampler(8)]]) {
 			uint materialFlags = uint(uniforms.lightingParameters.x);
 			bool twoSided = (materialFlags & 32u) != 0u;
@@ -346,11 +352,11 @@ namespace Sapphire::Graphics::Shaders {
 				fogTransmittance = integratedFog.a;
 			}
 			float opacity = input.color.a * texel.a * uniforms.lightingParameters.y;
-			if (fog >= 1.0 && frame.fogVolumeParameters.x < 0.5) return float4(EncodeColor(frame.fogColor.rgb, frame), opacity);
+			if (fog >= 1.0 && frame.fogVolumeParameters.x < 0.5) return float4(EncodeColor(frame.fogColor.rgb, frame, input.position.xy), opacity);
 			if ((materialFlags & 16u) != 0u) {
 				float3 tint = input.color.rgb * uniforms.baseColor.rgb * texel.rgb;
 				float3 color = frame.fogVolumeParameters.x > 0.5 ? tint * fogTransmittance + fogScattering : mix(tint, frame.fogColor.rgb, fog);
-				return float4(EncodeColor(color, frame), opacity);
+				return float4(EncodeColor(color, frame, input.position.xy), opacity);
 			}
 			float3 albedo = input.color.rgb * texel.rgb * uniforms.baseColor.rgb;
 			float roughness = clamp(uniforms.surfaceParameters.x * ((materialFlags & 2u) != 0u ? roughnessMap.sample(roughnessSampler, input.uv).r : 1.0), 0.045, 1.0);
@@ -395,7 +401,7 @@ namespace Sapphire::Graphics::Shaders {
 			float3 ambient = frame.ambientLight.a > 0.5 ? frame.ambientLight.rgb : float3(0.0);
 			float3 color = albedo * ambient * ao * (1.0 - metallic) + direct + pointLighting;
 			color = frame.fogVolumeParameters.x > 0.5 ? color * fogTransmittance + fogScattering : mix(color, frame.fogColor.rgb, fog);
-			return float4(EncodeColor(color, frame), opacity);
+			return float4(EncodeColor(color, frame, input.position.xy), opacity);
 		}
 	)";
 
