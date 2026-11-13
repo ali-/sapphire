@@ -1303,7 +1303,8 @@ namespace Sapphire {
 			float lifetime = 1.0f;
 			float speed = 1.0f;
 			float spread = 0.0f;
-			float size = 0.15f;
+			float sizeStart = 0.1f;
+			float sizeEnd = 0.1f;
 			std::size_t maxParticles = 256;
 			Vector3 direction{0.0f, 0.0f, 1.0f};
 			Vector3 startColor{1.0f, 1.0f, 1.0f};
@@ -1343,7 +1344,11 @@ namespace Sapphire {
 						continue;
 					}
 					mesh.instances[index].position += particle.velocity * deltaTime;
-					mesh.instances[index].customData = particle.age / lifetime;
+					const float age = particle.age / lifetime;
+					const float particleSize = sizeStart + (sizeEnd - sizeStart) * age;
+					mesh.instances[index].scale.x = particleSize;
+					mesh.instances[index].scale.y = particleSize;
+					mesh.instances[index].customData = age;
 					++index;
 					changed = true;
 				}
@@ -1360,7 +1365,7 @@ namespace Sapphire {
 					if (spread > 0.0f) travel = Math::Normalize(Math::Add(travel, {deviation(random), deviation(random), deviation(random)}));
 					particles.push_back({Math::Scale(travel, speed), 0.0f});
 					MeshInstance instance{};
-					instance.scale = {size, size, size};
+					instance.scale = {sizeStart, sizeStart, sizeStart};
 					mesh.instances.push_back(instance);
 					changed = true;
 				}
