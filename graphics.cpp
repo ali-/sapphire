@@ -29,7 +29,7 @@ namespace Sapphire::Graphics {
 	SDL_GPUTexture* CreateTexture(SDL_GPUDevice* gpuDevice, int width, int height, const std::uint8_t* pixels);
 	SDL_GPUTexture* CreateTexture(SDL_GPUDevice* gpuDevice, int width, int height, const std::uint8_t* pixels, bool srgb);
 	SDL_GPUTexture* UploadTexture(SDL_GPUDevice* gpuDevice, int width, int height, const void* pixels, SDL_GPUTextureFormat format, Uint32 stride, Uint32 rowPitch = 0, bool mipmaps = false, bool masked = false, bool blended = false);
-	SDL_GPUTexture* LoadTexture(std::string_view fileName, bool srgb, bool mipmaps, bool blended);
+	SDL_GPUTexture* LoadTexture(std::string_view fileName, bool srgb, bool mipmaps, bool blended, bool singleChannel = false);
 	inline bool linearOutput = false;
 	SDL_GPUTexture* LoadTexture(std::string_view fileName);
 	SDL_GPUTexture* LoadTexture(std::string_view fileName, bool srgb);
@@ -1091,7 +1091,7 @@ namespace Sapphire::Graphics {
 			if (inserted) {
 				gpu.source = &entry->first;
 				for (std::size_t index = 0; index < gpu.textures.size(); ++index) {
-					SDL_GPUTexture* texture = entry->first[index].empty() ? nullptr : LoadTexture(entry->first[index], index == 0, index < 4, index == 0 && material.transparent);
+					SDL_GPUTexture* texture = entry->first[index].empty() ? nullptr : LoadTexture(entry->first[index], index == 0, index < 4, index == 0 && material.transparent, index >= 2);
 					gpu.textures[index] = texture ? texture : whiteTexture;
 					if (texture && index > 0 && index < 5) gpu.flags |= 1u << (index - 1);
 				}
@@ -1976,7 +1976,7 @@ namespace Sapphire::Graphics {
 		if (SDL_CalculateGPUTextureFormatSize(format, static_cast<Uint32>(width), 1, 1) != checkedRowBytes) throw std::invalid_argument("Texture stride does not match format");
 		if (checkedRowBytes > std::numeric_limits<Uint32>::max() || (rowPitch && rowPitch < checkedRowBytes)) throw std::length_error("Texture row exceeds GPU upload size");
 		if (mipmaps && (masked || blended) && (stride != 4 || (format != SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM && format != SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB))) throw std::invalid_argument("CPU alpha mipmaps require RGBA pixels");
-		const bool generateOnGpu = mipmaps && !masked && !blended;
+		const bool generateOnGpu = mipmaps && !masked && !blended && stride == 4;
 		SDL_GPUTextureCreateInfo textureInfo{};
 		textureInfo.type = SDL_GPU_TEXTURETYPE_2D;
 		textureInfo.format = format;
@@ -2049,6 +2049,18 @@ namespace Sapphire::Graphics {
 				const int previousWidth = std::max(1, width >> (level - 1));
 				const int previousHeight = std::max(1, height >> (level - 1));
 				const auto* sourcePixels = mappedPixels + previousOffset;
+				if (stride == 1) {
+					for (int y = 0; y < levelHeight; ++y) for (int x = 0; x < levelWidth; ++x) {
+						Uint32 sum = 0, samples = 0;
+						for (int sampleY = static_cast<std::int64_t>(y) * previousHeight / levelHeight; sampleY < (static_cast<std::int64_t>(y) + 1) * previousHeight / levelHeight; ++sampleY)
+							for (int sampleX = static_cast<std::int64_t>(x) * previousWidth / levelWidth; sampleX < (static_cast<std::int64_t>(x) + 1) * previousWidth / levelWidth; ++sampleX) {
+								sum += sourcePixels[static_cast<std::size_t>(sampleY) * previousWidth + sampleX];
+								++samples;
+							}
+						destinationPixels[static_cast<std::size_t>(y) * levelWidth + x] = static_cast<std::uint8_t>((sum + samples / 2) / samples);
+					}
+				}
+				else {
 				std::array<Uint32, 256> histogram{};
 				for (int y = 0; y < levelHeight; ++y) {
 					for (int x = 0; x < levelWidth; ++x) {
@@ -2085,6 +2097,7 @@ namespace Sapphire::Graphics {
 						else high = scale;
 					}
 					for (std::size_t pixel = 0; pixel < static_cast<std::size_t>(levelWidth) * levelHeight; ++pixel) destinationPixels[pixel * 4 + 3] = static_cast<std::uint8_t>(std::min(255.0f, std::round(destinationPixels[pixel * 4 + 3] * bestScale)));
+				}
 				}
 			}
 			previousOffset = offset;
@@ -2137,9 +2150,9 @@ namespace Sapphire::Graphics {
 
 	SDL_GPUTexture* LoadTexture(std::string_view fileName, bool srgb, bool mipmaps) { return LoadTexture(fileName, srgb, mipmaps, false); }
 
-	SDL_GPUTexture* LoadTexture(std::string_view fileName, bool srgb, bool mipmaps, bool blended) {
+	SDL_GPUTexture* LoadTexture(std::string_view fileName, bool srgb, bool mipmaps, bool blended, bool singleChannel) {
 		const std::string path = ResourcePath(fileName).string();
-		const std::string key = std::string(srgb ? "color:" : "data:") + (mipmaps ? "mips:" : "single:") + (blended ? "blended:" : "masked:") + path;
+		const std::string key = std::string(srgb ? "color:" : "data:") + (mipmaps ? "mips:" : "single:") + (blended ? "blended:" : "masked:") + (singleChannel ? "r8:" : "rgba8:") + path;
 		if (auto found = textures.find(key); found != textures.end()) {
 			++textureReferences[found->second];
 			return found->second;
@@ -2154,7 +2167,7 @@ namespace Sapphire::Graphics {
 			throw std::invalid_argument("Invalid texture surface pitch");
 		}
 		bool masked = false;
-		for (int row = 0; row < rgbaSurface->h && !masked; ++row) {
+		for (int row = 0; row < rgbaSurface->h && !masked && !singleChannel; ++row) {
 			const auto* pixels = static_cast<const std::uint8_t*>(rgbaSurface->pixels) + row * rgbaSurface->pitch;
 			for (int column = 0; column < rgbaSurface->w; ++column) if (pixels[column * 4 + 3] < 128) {
 				masked = true;
@@ -2162,7 +2175,17 @@ namespace Sapphire::Graphics {
 			}
 		}
 		SDL_GPUTexture* texture = nullptr;
-		try { texture = UploadTexture(gpuDevice, rgbaSurface->w, rgbaSurface->h, rgbaSurface->pixels, srgb ? SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, 4, static_cast<Uint32>(rgbaSurface->pitch), mipmaps, srgb && masked && !blended, srgb && blended); }
+		try {
+			if (singleChannel) {
+				std::vector<std::uint8_t> red(static_cast<std::size_t>(rgbaSurface->w) * rgbaSurface->h);
+				for (int row = 0; row < rgbaSurface->h; ++row) {
+					const auto* pixels = static_cast<const std::uint8_t*>(rgbaSurface->pixels) + static_cast<std::size_t>(row) * rgbaSurface->pitch;
+					for (int column = 0; column < rgbaSurface->w; ++column) red[static_cast<std::size_t>(row) * rgbaSurface->w + column] = pixels[column * 4];
+				}
+				texture = UploadTexture(gpuDevice, rgbaSurface->w, rgbaSurface->h, red.data(), SDL_GPU_TEXTUREFORMAT_R8_UNORM, 1, static_cast<Uint32>(rgbaSurface->w), mipmaps);
+			}
+			else texture = UploadTexture(gpuDevice, rgbaSurface->w, rgbaSurface->h, rgbaSurface->pixels, srgb ? SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, 4, static_cast<Uint32>(rgbaSurface->pitch), mipmaps, srgb && masked && !blended, srgb && blended);
+		}
 		catch (...) { SDL_DestroySurface(rgbaSurface); throw; }
 		SDL_DestroySurface(rgbaSurface);
 		if (texture) {
