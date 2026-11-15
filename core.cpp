@@ -1210,6 +1210,7 @@ namespace Sapphire {
 			bool shadowsEnabled = true;
 			float shadowFar = 10.0f;
 			int shadowResolution = 2048;
+			int anisotropy = 0;
 			bool ambientLight = true;
 			Vector3 ambientLightColor{1.0f, 1.0f, 1.0f};
 			bool fogEnabled = false;

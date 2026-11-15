@@ -337,6 +337,7 @@ namespace Sapphire::Graphics {
 		Vector3 staticShadowDirection{};
 		SDL_GPUTexture* whiteTexture = nullptr;
 		SDL_GPUSampler* sampler = nullptr;
+		int samplerAnisotropy = 0;
 		SDL_GPUSampler* shadowSampler = nullptr;
 		Uint32 depthWidth = 0;
 		Uint32 depthHeight = 0;
@@ -2263,6 +2264,20 @@ namespace Sapphire::Graphics {
 		return sampler;
 	}
 
+	SDL_GPUSampler* CreateMaterialSampler(int anisotropy) {
+		SDL_GPUSamplerCreateInfo info{};
+		info.min_filter = SDL_GPU_FILTER_LINEAR;
+		info.mag_filter = SDL_GPU_FILTER_LINEAR;
+		info.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
+		info.max_lod = 32.0f;
+		info.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+		info.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+		info.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+		info.enable_anisotropy = anisotropy > 0;
+		info.max_anisotropy = static_cast<float>(std::max(anisotropy, 1));
+		return CreateSampler(gpuDevice, info);
+	}
+
 	SDL_GPUGraphicsPipeline* CreatePipeline(SDL_GPUDevice* gpuDevice, const SDL_GPUGraphicsPipelineCreateInfo& pipelineInfo) {
 		auto* pipeline = SDL_CreateGPUGraphicsPipeline(gpuDevice, &pipelineInfo);
 		if (!pipeline) throw std::runtime_error(std::string("Create GPU pipeline: ") + SDL_GetError());
@@ -2625,15 +2640,7 @@ namespace Sapphire::Graphics {
 			}
 			const std::uint8_t whitePixel[4] = {255, 255, 255, 255};
 			whiteTexture = CreateTexture(gpuDevice, 1, 1, whitePixel);
-			SDL_GPUSamplerCreateInfo samplerInfo{};
-			samplerInfo.min_filter = SDL_GPU_FILTER_LINEAR;
-			samplerInfo.mag_filter = SDL_GPU_FILTER_LINEAR;
-			samplerInfo.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
-			samplerInfo.max_lod = 32.0f;
-			samplerInfo.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
-			samplerInfo.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
-			samplerInfo.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
-			sampler = CreateSampler(gpuDevice, samplerInfo);
+			sampler = CreateMaterialSampler(0);
 			SDL_GPUSamplerCreateInfo shadowSamplerInfo{};
 			shadowSamplerInfo.min_filter = SDL_GPU_FILTER_LINEAR;
 			shadowSamplerInfo.mag_filter = SDL_GPU_FILTER_LINEAR;
@@ -2866,6 +2873,13 @@ namespace Sapphire::Graphics {
 
 	void Render(Scene& scene, SDL_GPUCommandBuffer* commandBuffer, SDL_GPUTexture* colorTarget, Uint32 width, Uint32 height) {
 		if (!colorTarget || !width || !height) return;
+		const int anisotropy = std::clamp(scene.anisotropy, 0, 16);
+		if (anisotropy != samplerAnisotropy) {
+			SDL_GPUSampler* nextSampler = CreateMaterialSampler(anisotropy);
+			SDL_ReleaseGPUSampler(gpuDevice, sampler);
+			sampler = nextSampler;
+			samplerAnisotropy = anisotropy;
+		}
 		const Uint64 renderStart = SDL_GetTicksNS();
 		UpdateSceneResources(scene);
 		EnsureShadowResolution(scene.shadowResolution);
@@ -3472,6 +3486,7 @@ namespace Sapphire::Graphics {
 		slowFrameTime = 0.0f;
 		whiteTexture = nullptr;
 		sampler = nullptr;
+		samplerAnisotropy = 0;
 		shadowSampler = nullptr;
 		gpuDevice = nullptr;
 	}

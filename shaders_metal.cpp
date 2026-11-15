@@ -187,7 +187,9 @@ namespace Sapphire::Graphics::Shaders {
 					float distanceSquared = dot(toLight, toLight);
 					if (distanceSquared >= positionRange.w * positionRange.w) continue;
 					float rangeFade = clamp(1.0 - sqrt(distanceSquared) / positionRange.w, 0.0, 1.0);
-					lighting += colorIntensity.rgb * colorIntensity.w * rangeFade * rangeFade / max(distanceSquared, 1.0);
+					float coreRadius = max(2.0, positionRange.w * 0.25);
+					float attenuation = rangeFade * rangeFade / (distanceSquared + coreRadius * coreRadius);
+					lighting += colorIntensity.rgb * colorIntensity.w * attenuation;
 				}
 				scattering += frame.fogColor.rgb * lighting * segmentScattering;
 				transmittance *= segmentTransmittance;
