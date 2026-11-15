@@ -1204,6 +1204,7 @@ namespace Sapphire {
 			Camera* activeCamera = nullptr;
 			Vector3 gravity{0.0f, 0.0f, -9.81f};
 			int cellSize = 20;
+			bool worldPartition = true;
 			int partitionSize = 200;
 			float partitionBuffer = 1.50f;
 			bool shadowsEnabled = true;
@@ -1259,7 +1260,7 @@ namespace Sapphire {
 			void UpdateWorldPartition() {
 				UpdateTransforms();
 				const float range = activeCamera ? activeCamera->far * std::max(partitionBuffer, 0.0f) : 0.0f;
-				worldPartitioner.Update(objects, activeCamera, partitionSize, range);
+				worldPartitioner.Update(objects, activeCamera, worldPartition ? partitionSize : 0, range);
 			}
 
 			void UpdateTransforms() {
