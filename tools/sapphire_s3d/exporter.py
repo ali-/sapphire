@@ -1,11 +1,11 @@
 import bpy
-import hashlib
 import json
 import math
 import os
 import struct
+from array import array
 from collections.abc import Mapping, Sequence
-from bpy.props import BoolProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, StringProperty
 from bpy_extras.io_utils import ExportHelper
 
 
@@ -101,7 +101,7 @@ def material_record(material):
         "normal_scale": 1.0, "ao_strength": 1.0, "displacement_scale": 0.05,
         "uv_scale": (1.0, 1.0), "uv_offset": (0.0, 0.0), "flip_normal_y": False,
         "transparent": False, "unlit": False, "opacity": 1.0,
-        "textures": ["", "", "", "", "", ""], "modifier": "",
+        "textures": ["", "", "", "", "", ""], "base_alpha": False, "modifier": "",
     }
     if not material:
         return record
@@ -153,9 +153,266 @@ def bake_channels(material):
     return channels
 
 
-def bake_size(material):
+def material_is_baked(material):
+    if not material:
+        return False
+    values = [owner["isBaked"] for owner in (material, material.node_tree) if owner and "isBaked" in owner]
+    if any(not isinstance(value, bool) for value in values):
+        raise ValueError("isBaked must be boolean on material " + material.name)
+    return any(values)
+
+
+def limited_size(width, height, maximum):
+    if not maximum or max(width, height) <= maximum:
+        return width, height
+    ratio = maximum / max(width, height)
+    return max(1, round(width * ratio)), max(1, round(height * ratio))
+
+
+def bake_size(material, maximum):
     dimensions = [(node.image.size[0], node.image.size[1]) for node in material.node_tree.nodes if node.type == "TEX_IMAGE" and node.image and any(socket.is_linked for socket in node.outputs) and node.image.size[0] and node.image.size[1]]
-    return max(dimensions, key=lambda size: size[0] * size[1]) if dimensions else (1024, 1024)
+    width, height = max(dimensions, key=lambda size: size[0] * size[1]) if dimensions else (1024, 1024)
+    return limited_size(width, height, maximum)
+
+
+def save_png(image, path, scene, channel, alpha=False, red_only=False):
+    scalar = channel in {"roughness", "ao", "displacement", "displacement_mask"}
+    settings = scene.render.image_settings
+    original_mode = settings.color_mode
+    temporary = None
+    try:
+        if scalar and red_only:
+            width, height = image.size
+            pixels = array("f", [0.0]) * (width * height * 4)
+            image.pixels.foreach_get(pixels)
+            red = pixels[::4]
+            pixels[1::4] = red
+            pixels[2::4] = red
+            pixels[3::4] = array("f", [1.0]) * (width * height)
+            temporary = bpy.data.images.new("S3D Grayscale", width=width, height=height, alpha=False, float_buffer=True)
+            temporary.colorspace_settings.name = "Non-Color"
+            temporary.pixels.foreach_set(pixels)
+            temporary.update()
+        mode = "BW" if scalar else "RGBA" if channel == "base" and alpha else "RGB"
+        settings.color_mode = mode
+        (temporary or image).save_render(path, scene=scene)
+        if png_info(path)[2] != {"BW": 0, "RGB": 2, "RGBA": 6}[mode]:
+            raise ValueError("PNG channel format was not saved correctly: " + path)
+    finally:
+        settings.color_mode = original_mode
+        if temporary:
+            bpy.data.images.remove(temporary)
+
+
+def png_info(path):
+    with open(path, "rb") as file:
+        header = file.read(26)
+    if len(header) != 26 or header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
+        raise ValueError("Invalid PNG texture: " + path)
+    return *struct.unpack(">II", header[16:24]), header[25]
+
+
+def normalize_references(records, export_path, maximum, scene):
+    normalized = set()
+    for record in records:
+        for index, reference in enumerate(record["textures"]):
+            if not reference or not reference.lower().endswith(".png"):
+                continue
+            source = os.path.abspath(os.path.join(os.path.dirname(export_path), reference))
+            if source not in normalized:
+                width, height, color_type = png_info(source)
+                target_width, target_height = limited_size(width, height, maximum)
+                channel = ("base", "normal", "roughness", "ao", "displacement", "displacement_mask")[index]
+                expected_type = 0 if channel in {"roughness", "ao", "displacement", "displacement_mask"} else 6 if channel == "base" and record["base_alpha"] else 2
+                if (target_width, target_height) != (width, height) or color_type != expected_type:
+                    image = bpy.data.images.load(source, check_existing=False)
+                    try:
+                        if (target_width, target_height) != (width, height):
+                            image.scale(target_width, target_height)
+                        save_png(image, source, scene, channel, alpha=expected_type == 6, red_only=True)
+                    finally:
+                        bpy.data.images.remove(image)
+                normalized.add(source)
+            record["textures"][index] = texture_reference(source, export_path)
+
+
+def texture_path(material, channel, texture_dir):
+    return os.path.join(texture_dir, f"{bpy.path.clean_name(material.name)}_{channel}.png")
+
+
+def texture_reference(path, export_path):
+    return os.path.relpath(path, os.path.dirname(os.path.abspath(export_path))).replace(os.sep, "/")
+
+
+def bake_uv_transform(mesh):
+    source_uv = mesh.uv_layers.active
+    if not source_uv or not source_uv.data:
+        raise ValueError("Mesh needs a UV map for material baking")
+    minimum_u = min(loop.uv.x for loop in source_uv.data)
+    maximum_u = max(loop.uv.x for loop in source_uv.data)
+    minimum_v = min(loop.uv.y for loop in source_uv.data)
+    maximum_v = max(loop.uv.y for loop in source_uv.data)
+    if minimum_u == maximum_u or minimum_v == maximum_v:
+        raise ValueError("Mesh UV map has no area")
+    margin = 0.02
+    scale_u = (1.0 - margin * 2.0) / (maximum_u - minimum_u)
+    scale_v = (1.0 - margin * 2.0) / (maximum_v - minimum_v)
+    offset_u = margin - minimum_u * scale_u
+    offset_v = margin - minimum_v * scale_v
+    return scale_u, scale_v, offset_u, offset_v
+
+
+def reuse_baked_materials(obj, materials, records, export_path, texture_dir):
+    channels = [bake_channels(material) for material in materials]
+    existing = {index for index, (material, record) in enumerate(zip(materials, records))
+                if any(record["textures"]) or (material and material.use_nodes and material.node_tree
+                and any(node.type == "TEX_IMAGE" and node.image for node in material.node_tree.nodes))}
+    available = [(index, channel, texture_path(materials[index], channel, texture_dir))
+                 for index, needed in enumerate(channels) if index not in existing for channel in needed if channel != "alpha"]
+    available = [(index, channel, path) for index, channel, path in available if os.path.isfile(path)]
+    if not available:
+        return False
+    scale_u, scale_v, offset_u, offset_v = bake_uv_transform(obj.data)
+    for index, channel, path in available:
+        record = records[index]
+        record["uv_scale"] = (scale_u, scale_v)
+        record["uv_offset"] = (offset_u, 1.0 - scale_v - offset_v)
+        slot = {"base": 0, "normal": 1, "roughness": 2, "ao": 3, "displacement": 4}[channel]
+        record["textures"][slot] = texture_reference(path, export_path)
+        if channel == "base":
+            record["color"] = (1.0, 1.0, 1.0)
+            if "alpha" in channels[index]:
+                record["opacity"] = 1.0
+                record["base_alpha"] = True
+        elif channel == "roughness":
+            record["roughness"] = 1.0
+        elif channel == "normal":
+            record["normal_scale"] = 1.0
+            record["flip_normal_y"] = True
+        elif channel == "displacement":
+            record["displacement_scale"] = 1.0
+    return True
+
+
+def source_link(socket):
+    while socket and len(socket.links) == 1:
+        link = socket.links[0]
+        if link.from_node.type != "REROUTE":
+            return link
+        socket = link.from_node.inputs[0]
+    return None
+
+
+def direct_image(socket):
+    link = source_link(socket)
+    if not link or link.from_node.type != "TEX_IMAGE" or link.from_socket.name != "Color" or not link.from_node.image:
+        return None
+    return link.from_node.image
+
+
+def node_image(node):
+    return node.image if node.type == "TEX_IMAGE" else None
+
+
+def export_direct_image(image, material, channel, export_path, texture_dir, maximum, scene, alpha=False):
+    width, height = image.size
+    if width < 1 or height < 1:
+        raise ValueError("Image has no pixels: " + image.name)
+    target_width, target_height = limited_size(width, height, maximum)
+    os.makedirs(texture_dir, exist_ok=True)
+    destination = texture_path(material, channel, texture_dir)
+    if (target_width, target_height) != (width, height):
+        resized = image.copy()
+        try:
+            if image.is_dirty:
+                pixels = array("f", [0.0]) * (width * height * 4)
+                image.pixels.foreach_get(pixels)
+                resized.pixels.foreach_set(pixels)
+                resized.update()
+            resized.scale(target_width, target_height)
+            save_png(resized, destination, scene, channel, alpha=alpha, red_only=True)
+        finally:
+            bpy.data.images.remove(resized)
+    else:
+        save_png(image, destination, scene, channel, alpha=alpha, red_only=True)
+    return texture_reference(destination, export_path)
+
+
+def reference_direct_images(materials, records, export_path, texture_dir, maximum, scene):
+    for index, material in enumerate(materials):
+        if not material or not material.use_nodes or not material.node_tree:
+            continue
+        named = {}
+        referenced = set()
+        extra_index = 1
+        def reference(image, channel, alpha=False):
+            nonlocal extra_index
+            pointer = image.as_pointer()
+            if channel in named and named[channel][0] != pointer:
+                while "image" + str(extra_index) in named:
+                    extra_index += 1
+                channel = "image" + str(extra_index)
+                extra_index += 1
+            if channel not in named:
+                path = export_direct_image(image, material, channel, export_path, texture_dir, maximum, scene, alpha=alpha)
+                named[channel] = (pointer, path)
+            referenced.add(pointer)
+            return named[channel][1]
+        principled = next((node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
+        if principled:
+            base = linked_input(principled, "Base Color")
+            alpha = linked_input(principled, "Alpha")
+            base_link = source_link(base)
+            alpha_link = source_link(alpha)
+            base_alpha = bool(base_link and alpha_link and base_link.from_node == alpha_link.from_node and alpha_link.from_socket.name == "Alpha")
+            for socket_name, slot, channel in (("Base Color", 0, "base"), ("Roughness", 2, "roughness")):
+                image = direct_image(linked_input(principled, socket_name))
+                if image:
+                    records[index]["textures"][slot] = reference(image, channel, alpha=base_alpha if channel == "base" else False)
+                    records[index]["color" if slot == 0 else "roughness"] = (1.0, 1.0, 1.0) if slot == 0 else 1.0
+            if base_alpha and records[index]["textures"][0]:
+                records[index]["opacity"] = 1.0
+                records[index]["base_alpha"] = True
+            normal = linked_input(principled, "Normal")
+            if normal:
+                link = source_link(normal)
+                normal_node = link.from_node if link else None
+                if normal_node:
+                    strength = normal_node.inputs.get("Strength") if normal_node.type == "NORMAL_MAP" else None
+                    color = linked_input(normal_node, "Color") if strength and not strength.is_linked else None
+                    image = direct_image(color) if strength else direct_image(normal)
+                    if image:
+                        records[index]["textures"][1] = reference(image, "normal")
+                        records[index]["normal_scale"] = float(strength.default_value) if strength else 1.0
+                        records[index]["flip_normal_y"] = True
+        output = next((node for node in material.node_tree.nodes if node.type == "OUTPUT_MATERIAL" and node.is_active_output), None)
+        displacement = linked_input(output, "Displacement")
+        if displacement:
+            node = displacement.links[0].from_node
+            height = linked_input(node, "Height") if node.type == "DISPLACEMENT" else None
+            scale = node.inputs.get("Scale") if height else None
+            midlevel = node.inputs.get("Midlevel") if height else None
+            image = direct_image(height)
+            if image and scale and not scale.is_linked and midlevel and not midlevel.is_linked and abs(midlevel.default_value - 0.5) <= 0.0001:
+                records[index]["textures"][4] = reference(image, "displacement")
+                records[index]["displacement_scale"] = float(scale.default_value)
+        for node in material.node_tree.nodes:
+            image = node_image(node)
+            if not image:
+                continue
+            label = (node.label or node.name).strip().lower().replace("_", " ")
+            if label in {"ao", "ambient occlusion"}:
+                records[index]["textures"][3] = reference(image, "ao")
+            elif label in {"displacement mask", "height mask"}:
+                records[index]["textures"][5] = reference(image, "displacement_mask")
+            elif image.as_pointer() not in referenced:
+                channel = bpy.path.clean_name(node.label.strip()).lower() if node.label.strip() else ""
+                if not channel or channel in named:
+                    while "image" + str(extra_index) in named:
+                        extra_index += 1
+                    channel = "image" + str(extra_index)
+                    extra_index += 1
+                reference(image, channel)
 
 
 def emit_socket(material, channel):
@@ -218,7 +475,7 @@ def emit_socket(material, channel):
     return emission
 
 
-def bake_materials(context, obj, materials, records, export_path, texture_dir):
+def bake_materials(context, obj, materials, records, export_path, texture_dir, maximum):
     channels = [bake_channels(material) for material in materials]
     if not any(channels):
         return
@@ -230,27 +487,14 @@ def bake_materials(context, obj, materials, records, export_path, texture_dir):
     active_mode = active.mode if active else "OBJECT"
     engine = scene.render.engine
     original_mesh = obj.data
-    source_uv = original_mesh.uv_layers.active
-    minimum_u = min(loop.uv.x for loop in source_uv.data)
-    maximum_u = max(loop.uv.x for loop in source_uv.data)
-    minimum_v = min(loop.uv.y for loop in source_uv.data)
-    maximum_v = max(loop.uv.y for loop in source_uv.data)
-    if minimum_u == maximum_u or minimum_v == maximum_v:
-        raise ValueError("Mesh UV map has no area: " + obj.name)
+    scale_u, scale_v, offset_u, offset_v = bake_uv_transform(original_mesh)
     images = []
     base_images = {}
-    digest = hashlib.sha256(obj.name.encode("utf-8")).hexdigest()[:16]
-    prefix = bpy.path.clean_name(obj.name) + "_" + digest
     os.makedirs(texture_dir, exist_ok=True)
     temporary_mesh = original_mesh.copy()
     try:
         source_uv = temporary_mesh.uv_layers.active
         render_uv = temporary_mesh.uv_layers.active_render
-        margin = 0.02
-        scale_u = (1.0 - margin * 2.0) / (maximum_u - minimum_u)
-        scale_v = (1.0 - margin * 2.0) / (maximum_v - minimum_v)
-        offset_u = margin - minimum_u * scale_u
-        offset_v = margin - minimum_v * scale_v
         bake_uv = temporary_mesh.uv_layers.new(name="S3D Bake", do_init=True)
         for loop in bake_uv.data:
             loop.uv = (loop.uv.x * scale_u + offset_u, loop.uv.y * scale_v + offset_v)
@@ -281,7 +525,7 @@ def bake_materials(context, obj, materials, records, export_path, texture_dir):
                     material.use_nodes = True
                     temporary_materials.append(material)
                     temporary_mesh.materials.append(material)
-                    width, height = bake_size(material) if source and channel in channels[index] else (1, 1)
+                    width, height = bake_size(material, maximum) if source and channel in channels[index] else (1, 1)
                     image = bpy.data.images.new("S3D " + channel, width=width, height=height, alpha=True)
                     if channel != "base":
                         image.colorspace_settings.name = "Non-Color"
@@ -317,6 +561,7 @@ def bake_materials(context, obj, materials, records, export_path, texture_dir):
                         base_images[index] = image
                         records[index]["color"] = (1.0, 1.0, 1.0)
                         if "alpha" in channels[index]:
+                            records[index]["base_alpha"] = True
                             continue
                     elif channel == "roughness":
                         records[index]["roughness"] = 1.0
@@ -325,12 +570,10 @@ def bake_materials(context, obj, materials, records, export_path, texture_dir):
                         records[index]["flip_normal_y"] = True
                     elif channel == "displacement":
                         records[index]["displacement_scale"] = 1.0
-                    path = os.path.join(texture_dir, f"{prefix}_{index}_{channel}.png")
-                    image.filepath_raw = path
-                    image.file_format = "PNG"
-                    image.save()
+                    path = texture_path(materials[index], channel, texture_dir)
+                    save_png(image, path, scene, channel, alpha=channel == "base" and "alpha" in channels[index])
                     slot = {"base": 0, "normal": 1, "roughness": 2, "ao": 3, "displacement": 4}[channel]
-                    records[index]["textures"][slot] = os.path.relpath(path, os.path.dirname(export_path)).replace(os.sep, "/")
+                    records[index]["textures"][slot] = texture_reference(path, export_path)
             finally:
                 temporary_mesh.materials.clear()
                 for material in temporary_materials:
@@ -338,11 +581,9 @@ def bake_materials(context, obj, materials, records, export_path, texture_dir):
         for index, image in base_images.items():
             if "alpha" not in channels[index]:
                 continue
-            path = os.path.join(texture_dir, f"{prefix}_{index}_base.png")
-            image.filepath_raw = path
-            image.file_format = "PNG"
-            image.save()
-            records[index]["textures"][0] = os.path.relpath(path, os.path.dirname(export_path)).replace(os.sep, "/")
+            path = texture_path(materials[index], "base", texture_dir)
+            save_png(image, path, scene, "base", alpha=True)
+            records[index]["textures"][0] = texture_reference(path, export_path)
     finally:
         obj.data = original_mesh
         scene.render.engine = engine
@@ -506,7 +747,7 @@ def write_object(file, obj, parent, parameters, source):
     write_string(file, source)
 
 
-def write_model(file, context, obj, export_path, texture_dir, apply_modifiers, bake_textures, depsgraph):
+def write_model(file, context, obj, export_path, texture_dir, apply_modifiers, depsgraph, maximum):
     write_string(file, obj.name)
     source_materials = list(obj.data.materials) or [None]
     material_records = [material_record(material) for material in source_materials]
@@ -521,8 +762,12 @@ def write_model(file, context, obj, export_path, texture_dir, apply_modifiers, b
             evaluated.to_mesh_clear()
     else:
         vertices, indices, sections, materials, bones, skin = mesh_payload(obj, obj.data, False, material_records)
-    if bake_textures:
-        bake_materials(context, obj, source_materials, material_records, export_path, texture_dir)
+    baked_materials = [material if material_is_baked(material) else None for material in source_materials]
+    direct_materials = [material if baked is None else None for material, baked in zip(source_materials, baked_materials)]
+    reference_direct_images(direct_materials, material_records, export_path, texture_dir, maximum, context.scene)
+    reuse_baked_materials(obj, direct_materials, material_records, export_path, texture_dir)
+    bake_materials(context, obj, baked_materials, material_records, export_path, texture_dir, maximum)
+    normalize_references(material_records, export_path, maximum, context.scene)
     file.write(struct.pack("<5I", len(vertices), len(indices), len(sections), len(materials), len(bones)))
     for position, normal, uv, color in vertices:
         file.write(struct.pack("<12f", *position, *normal, *uv, *color))
@@ -556,8 +801,8 @@ class ExportSapphireS3D(bpy.types.Operator, ExportHelper):
     filename_ext = ".s3d"
     filter_glob: StringProperty(default="*.s3d", options={"HIDDEN"})
     apply_modifiers: BoolProperty(name="Apply Modifiers", default=False)
-    bake_textures: BoolProperty(name="Bake Textures", default=False)
     exported_textures_directory: StringProperty(name="Exported Textures Directory", default="")
+    max_texture_size: EnumProperty(name="Size", items=[("NONE", "None", "No size limit")] + [(str(size), str(size), f"Limit longest side to {size} pixels") for size in (4096, 2048, 1024, 512, 256, 128)], default="NONE")
 
     def execute(self, context):
         objects = [obj for obj in context.selected_objects if obj.type in {"MESH", "LIGHT"}]
@@ -574,15 +819,24 @@ class ExportSapphireS3D(bpy.types.Operator, ExportHelper):
                     raise ValueError("Missing source mesh " + source + " for " + name)
             models = [obj for obj, _, _ in entries if obj.type == "MESH" and sources[obj.name] == obj.name]
             export_dir = os.path.dirname(os.path.abspath(self.filepath))
-            texture_dir = os.path.abspath(os.path.join(export_dir, os.path.expanduser(self.exported_textures_directory))) if self.bake_textures else ""
-            with open(self.filepath, "wb") as file:
-                file.write(b"S3D\0")
-                file.write(struct.pack("<I", len(models)))
-                for obj in models:
-                    write_model(file, context, obj, self.filepath, texture_dir, self.apply_modifiers, self.bake_textures, depsgraph)
-                file.write(struct.pack("<I", len(entries)))
-                for obj, parent, parameters in entries:
-                    write_object(file, obj, parent, parameters, sources[obj.name] if obj.type == "MESH" else "")
+            texture_dir = os.path.abspath(os.path.join(export_dir, os.path.expanduser(self.exported_textures_directory)))
+            settings = context.scene.render.image_settings
+            original_settings = (settings.file_format, settings.color_mode, settings.color_depth, settings.compression)
+            try:
+                settings.file_format = "PNG"
+                settings.color_depth = "8"
+                settings.compression = 0
+                maximum = 0 if self.max_texture_size == "NONE" else int(self.max_texture_size)
+                with open(self.filepath, "wb") as file:
+                    file.write(b"S3D\0")
+                    file.write(struct.pack("<I", len(models)))
+                    for obj in models:
+                        write_model(file, context, obj, self.filepath, texture_dir, self.apply_modifiers, depsgraph, maximum)
+                    file.write(struct.pack("<I", len(entries)))
+                    for obj, parent, parameters in entries:
+                        write_object(file, obj, parent, parameters, sources[obj.name] if obj.type == "MESH" else "")
+            finally:
+                settings.file_format, settings.color_mode, settings.color_depth, settings.compression = original_settings
         except (OSError, ValueError, RuntimeError, struct.error) as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
@@ -590,11 +844,10 @@ class ExportSapphireS3D(bpy.types.Operator, ExportHelper):
 
     def draw(self, context):
         self.layout.prop(self, "apply_modifiers")
-        self.layout.prop(self, "bake_textures")
         texture_options = self.layout.column()
-        texture_options.enabled = self.bake_textures
         texture_options.label(text="Exported Textures Directory")
         texture_options.prop(self, "exported_textures_directory", text="")
+        self.layout.prop(self, "max_texture_size")
 
     def invoke(self, context, event):
         if not self.filepath:

@@ -588,6 +588,7 @@ namespace Sapphire {
 		std::string displacementTexturePath;
 		std::string displacementMaskTexturePath;
 		std::string vertexModifierSource;
+		std::string fragmentNormalSource;
 		float roughness = 1.0f;
 		float metallic = 0.0f;
 		float normalScale = 1.0f;
@@ -601,7 +602,7 @@ namespace Sapphire {
 		float opacity = 1.0f;
 
 		auto Key() const {
-			return std::tie(baseTexturePath, normalTexturePath, roughnessTexturePath, aoTexturePath, displacementTexturePath, displacementMaskTexturePath, vertexModifierSource, baseColor.x, baseColor.y, baseColor.z, roughness, metallic, normalScale, aoStrength, displacementScale, uvScale[0], uvScale[1], uvOffset[0], uvOffset[1], flipNormalY, transparent, unlit, opacity);
+			return std::tie(baseTexturePath, normalTexturePath, roughnessTexturePath, aoTexturePath, displacementTexturePath, displacementMaskTexturePath, vertexModifierSource, fragmentNormalSource, baseColor.x, baseColor.y, baseColor.z, roughness, metallic, normalScale, aoStrength, displacementScale, uvScale[0], uvScale[1], uvOffset[0], uvOffset[1], flipNormalY, transparent, unlit, opacity);
 		}
 
 		bool operator<(const Material& other) const { return Key() < other.Key(); }
@@ -1204,11 +1205,13 @@ namespace Sapphire {
 			Camera* activeCamera = nullptr;
 			Vector3 gravity{0.0f, 0.0f, -9.81f};
 			int cellSize = 20;
+			bool worldPartition = true;
 			int partitionSize = 200;
 			float partitionBuffer = 1.50f;
 			bool shadowsEnabled = true;
 			float shadowFar = 10.0f;
 			int shadowResolution = 2048;
+			int anisotropy = 0;
 			bool ambientLight = true;
 			Vector3 ambientLightColor{1.0f, 1.0f, 1.0f};
 			bool fogEnabled = false;
@@ -1259,7 +1262,7 @@ namespace Sapphire {
 			void UpdateWorldPartition() {
 				UpdateTransforms();
 				const float range = activeCamera ? activeCamera->far * std::max(partitionBuffer, 0.0f) : 0.0f;
-				worldPartitioner.Update(objects, activeCamera, partitionSize, range);
+				worldPartitioner.Update(objects, activeCamera, worldPartition ? partitionSize : 0, range);
 			}
 
 			void UpdateTransforms() {
@@ -1303,7 +1306,8 @@ namespace Sapphire {
 			float lifetime = 1.0f;
 			float speed = 1.0f;
 			float spread = 0.0f;
-			float size = 0.15f;
+			float sizeStart = 0.1f;
+			float sizeEnd = 0.1f;
 			std::size_t maxParticles = 256;
 			Vector3 direction{0.0f, 0.0f, 1.0f};
 			Vector3 startColor{1.0f, 1.0f, 1.0f};
@@ -1343,7 +1347,11 @@ namespace Sapphire {
 						continue;
 					}
 					mesh.instances[index].position += particle.velocity * deltaTime;
-					mesh.instances[index].customData = particle.age / lifetime;
+					const float age = particle.age / lifetime;
+					const float particleSize = sizeStart + (sizeEnd - sizeStart) * age;
+					mesh.instances[index].scale.x = particleSize;
+					mesh.instances[index].scale.y = particleSize;
+					mesh.instances[index].customData = age;
 					++index;
 					changed = true;
 				}
@@ -1360,7 +1368,7 @@ namespace Sapphire {
 					if (spread > 0.0f) travel = Math::Normalize(Math::Add(travel, {deviation(random), deviation(random), deviation(random)}));
 					particles.push_back({Math::Scale(travel, speed), 0.0f});
 					MeshInstance instance{};
-					instance.scale = {size, size, size};
+					instance.scale = {sizeStart, sizeStart, sizeStart};
 					mesh.instances.push_back(instance);
 					changed = true;
 				}
