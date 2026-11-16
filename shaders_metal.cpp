@@ -356,9 +356,9 @@ namespace Sapphire::Graphics::Shaders {
 			#if ALPHA_MASKED
 			if (texel.a < 0.5) discard_fragment();
 			#endif
-			float fog = HeightFog(input.worldPosition, frame);
+			float fog = 0.0;
 			float3 fogScattering = float3(0.0);
-			float fogTransmittance = 1.0 - fog;
+			float fogTransmittance = 1.0;
 			if (frame.fogVolumeParameters.x > 0.5) {
 				float nearClip = frame.fogViewParameters.z;
 				float farClip = frame.fogViewParameters.w;
@@ -370,6 +370,10 @@ namespace Sapphire::Graphics::Shaders {
 				float4 integratedFog = fogVolumeMap.sample(fogVolumeSampler, float3(screenUV, sliceCoordinate));
 				fogScattering = integratedFog.rgb;
 				fogTransmittance = integratedFog.a;
+			}
+			else {
+				fog = HeightFog(input.worldPosition, frame);
+				fogTransmittance = 1.0 - fog;
 			}
 			float opacity = input.color.a * texel.a * uniforms.lightingParameters.y;
 			if (fog >= 1.0 && frame.fogVolumeParameters.x < 0.5) return float4(EncodeColor(frame.fogColor.rgb, frame, input.position.xy), opacity);
