@@ -37,7 +37,11 @@ namespace Sapphire::Graphics::Shaders {
 		float3 instancePosition [[attribute(4)]]; float3 instanceRotation [[attribute(5)]]; float3 instanceScale [[attribute(6)]]; float instanceData [[attribute(7)]];
 		#endif
 		};
-		struct VertexOutput { float4 position [[position]]; float2 uv; float4 color; float3 worldPosition; float3 worldNormal; float4 shadowPosition0; float4 shadowPosition1; float4 shadowPosition2; };
+		struct VertexOutput { float4 position [[position]]; float2 uv; float4 color; float3 worldPosition; float3 worldNormal; float4 shadowPosition0; float4 shadowPosition1; float4 shadowPosition2;
+		#if CUSTOM_FRAGMENT_NORMAL
+		float3 baseWorldPosition;
+		#endif
+		};
 		struct ObjectUniforms { float4x4 mvp; float4x4 model; float4x4 normal; float4 displacementParameters; float4 uvTransform; float4 modifierTime; float4x4 shadowMvp[3]; float4 shadowState; };
 		vertex VertexOutput main0(VertexInput input [[stage_in]], constant ObjectUniforms& uniforms [[buffer(0)]],
 		#if SKINNED
@@ -65,6 +69,9 @@ namespace Sapphire::Graphics::Shaders {
 			localNormal = InstanceNormal(localNormal, input.instanceScale, input.instanceRotation);
 			#endif
 			float3 position = Deform(localPosition, localNormal, uv, color, uniforms.model, uniforms.displacementParameters, heightMap, heightSampler, maskMap, maskSampler);
+			#if CUSTOM_FRAGMENT_NORMAL
+			output.baseWorldPosition = (uniforms.model * float4(position, 1.0)).xyz;
+			#endif
 			float instanceData = 0.0;
 			#if INSTANCED
 			instanceData = input.instanceData;
@@ -89,7 +96,7 @@ namespace Sapphire::Graphics::Shaders {
 		#include <metal_stdlib>
 		using namespace metal;
 		struct FrameUniforms {
-			float4 cameraPosition; float4 fogColor; float4 fogParameters; float4 fogHeightParameters;
+			float4 cameraPosition; float4 modifierTime; float4 fogColor; float4 fogParameters; float4 fogHeightParameters;
 			float4 fogVolumeParameters; float4 fogSliceParameters; float4 fogScreenParameters; float4 fogViewParameters;
 			float4 cameraRight; float4 cameraUp; float4 cameraForward;
 			float4 ambientLight; float4 directionalDirection; float4 directionalColor;
@@ -225,8 +232,15 @@ namespace Sapphire::Graphics::Shaders {
 	)";
 
 	inline const std::string fragmentShaderSource = fogCommonShaderSource + R"(
-		struct FragmentInput { float4 position [[position]]; float2 uv; float4 color; float3 worldPosition; float3 worldNormal; float4 shadowPosition0; float4 shadowPosition1; float4 shadowPosition2; };
+		struct FragmentInput { float4 position [[position]]; float2 uv; float4 color; float3 worldPosition; float3 worldNormal; float4 shadowPosition0; float4 shadowPosition1; float4 shadowPosition2;
+		#if CUSTOM_FRAGMENT_NORMAL
+		float3 baseWorldPosition;
+		#endif
+		};
 		struct FragmentUniforms { float4 shadowParameters[3]; float4 lightingParameters; float4 baseColor; float4 surfaceParameters; uint4 pointLightIndices[4]; };
+		#ifndef CUSTOM_FRAGMENT_NORMAL
+		void ModifyFragmentNormal(thread float3& normal, float3 baseWorldPosition, float3 worldPosition, float2 uv, float time) {}
+		#endif
 		float ShadowCoverage(float4 position, float4 parameters) {
 			if (parameters.x < 0.5) return 0.0;
 			float3 projected = position.xyz / position.w;
@@ -334,6 +348,10 @@ namespace Sapphire::Graphics::Shaders {
 					normal = normalize(tangent * mappedNormal.x + bitangent * mappedNormal.y + normal * mappedNormal.z);
 				}
 			}
+			#if CUSTOM_FRAGMENT_NORMAL
+			if ((materialFlags & 16u) == 0u) ModifyFragmentNormal(normal, input.baseWorldPosition, input.worldPosition, input.uv, frame.modifierTime.x);
+			normal = normalize(normal);
+			#endif
 			float4 texel = image.sample(imageSampler, input.uv);
 			#if ALPHA_MASKED
 			if (texel.a < 0.5) discard_fragment();

@@ -588,6 +588,7 @@ namespace Sapphire {
 		std::string displacementTexturePath;
 		std::string displacementMaskTexturePath;
 		std::string vertexModifierSource;
+		std::string fragmentNormalSource;
 		float roughness = 1.0f;
 		float metallic = 0.0f;
 		float normalScale = 1.0f;
@@ -601,7 +602,7 @@ namespace Sapphire {
 		float opacity = 1.0f;
 
 		auto Key() const {
-			return std::tie(baseTexturePath, normalTexturePath, roughnessTexturePath, aoTexturePath, displacementTexturePath, displacementMaskTexturePath, vertexModifierSource, baseColor.x, baseColor.y, baseColor.z, roughness, metallic, normalScale, aoStrength, displacementScale, uvScale[0], uvScale[1], uvOffset[0], uvOffset[1], flipNormalY, transparent, unlit, opacity);
+			return std::tie(baseTexturePath, normalTexturePath, roughnessTexturePath, aoTexturePath, displacementTexturePath, displacementMaskTexturePath, vertexModifierSource, fragmentNormalSource, baseColor.x, baseColor.y, baseColor.z, roughness, metallic, normalScale, aoStrength, displacementScale, uvScale[0], uvScale[1], uvOffset[0], uvOffset[1], flipNormalY, transparent, unlit, opacity);
 		}
 
 		bool operator<(const Material& other) const { return Key() < other.Key(); }

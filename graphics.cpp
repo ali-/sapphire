@@ -100,6 +100,7 @@ namespace Sapphire::Graphics {
 
 		struct FrameUniforms {
 			float cameraPosition[4];
+			float modifierTime[4];
 			float fogColor[4];
 			float fogParameters[4];
 			float fogHeightParameters[4];
@@ -316,8 +317,8 @@ namespace Sapphire::Graphics {
 			SDL_GPUGraphicsPipeline* skinnedTransparent[2]{};
 			SDL_GPUGraphicsPipeline* skinnedShadow[2][2]{};
 		};
-		std::map<std::pair<std::string, bool>, ModifierPipelines> modifierPipelines;
-		ModifierPipelines& GetModifierPipelines(const std::string& source, bool skinned = false);
+		std::map<std::tuple<std::string, std::string, bool>, ModifierPipelines> modifierPipelines;
+		ModifierPipelines& GetModifierPipelines(const Material& material, bool skinned = false);
 		SDL_GPUGraphicsPipeline* instanceShadowPipelines[2][2]{};
 		SDL_GPUTexture* depthTexture = nullptr;
 		SDL_GPUTexture* emptyShadowTexture = nullptr;
@@ -1698,9 +1699,9 @@ namespace Sapphire::Graphics {
 			const auto signature = MeshSignature(object, *mesh);
 			if (!inserted && source.signature == signature && !instancesChanged && (!rebuildAll || !source.batched)) return &source;
 			if (mesh->materials.empty()) {
-				if (!mesh->material.vertexModifierSource.empty()) GetModifierPipelines(mesh->material.vertexModifierSource, mesh->IsSkinned());
+				if (!mesh->material.vertexModifierSource.empty() || !mesh->material.fragmentNormalSource.empty()) GetModifierPipelines(mesh->material, mesh->IsSkinned());
 			}
-			else for (const auto& material : mesh->materials) if (!material.vertexModifierSource.empty()) GetModifierPipelines(material.vertexModifierSource, mesh->IsSkinned());
+			else for (const auto& material : mesh->materials) if (!material.vertexModifierSource.empty() || !material.fragmentNormalSource.empty()) GetModifierPipelines(material, mesh->IsSkinned());
 			const auto spatialSignature = SpatialSignature(object, *mesh);
 			const auto shadowSignature = ShadowSignature(object, *mesh);
 			const bool shadowChanged = inserted || source.shadowSignature != shadowSignature || instancesChanged;
@@ -1825,8 +1826,8 @@ namespace Sapphire::Graphics {
 				GpuMeshMaterial& gpuMeshMaterial = gpuMesh.materials.at(item.materialIndex);
 				GpuMaterial* activeGpuMaterial = gpuMeshMaterial.material;
 				SDL_GPUGraphicsPipeline* meshPipeline = nullptr;
-				if (item.skeleton) meshPipeline = material.vertexModifierSource.empty() ? skinnedShadowPipelines[activeGpuMaterial->masked ? 1 : 0][cullBackfaces && mesh->cullBackfaces ? 1 : 0] : GetModifierPipelines(material.vertexModifierSource, true).skinnedShadow[activeGpuMaterial->masked ? 1 : 0][cullBackfaces && mesh->cullBackfaces ? 1 : 0];
-				else meshPipeline = material.vertexModifierSource.empty() ? (mesh->instanced ? instanceShadowPipelines : shadowPipelines)[activeGpuMaterial->masked ? 1 : 0][cullBackfaces && mesh->cullBackfaces ? 1 : 0] : GetModifierPipelines(material.vertexModifierSource).shadow[mesh->instanced ? 1 : 0][activeGpuMaterial->masked ? 1 : 0][cullBackfaces && mesh->cullBackfaces ? 1 : 0];
+				if (item.skeleton) meshPipeline = material.vertexModifierSource.empty() ? skinnedShadowPipelines[activeGpuMaterial->masked ? 1 : 0][cullBackfaces && mesh->cullBackfaces ? 1 : 0] : GetModifierPipelines(material, true).skinnedShadow[activeGpuMaterial->masked ? 1 : 0][cullBackfaces && mesh->cullBackfaces ? 1 : 0];
+				else meshPipeline = material.vertexModifierSource.empty() ? (mesh->instanced ? instanceShadowPipelines : shadowPipelines)[activeGpuMaterial->masked ? 1 : 0][cullBackfaces && mesh->cullBackfaces ? 1 : 0] : GetModifierPipelines(material).shadow[mesh->instanced ? 1 : 0][activeGpuMaterial->masked ? 1 : 0][cullBackfaces && mesh->cullBackfaces ? 1 : 0];
 				if (meshPipeline != activePipeline) {
 					SDL_BindGPUGraphicsPipeline(shadowPass, meshPipeline);
 					activePipeline = meshPipeline;
@@ -2343,8 +2344,10 @@ namespace Sapphire::Graphics {
 	}
 
 	namespace {
-	ModifierPipelines& GetModifierPipelines(const std::string& source, bool skinned) {
-		auto [entry, inserted] = modifierPipelines.try_emplace(std::make_pair(source, skinned));
+	ModifierPipelines& GetModifierPipelines(const Material& material, bool skinned) {
+		const std::string& vertexSource = material.vertexModifierSource;
+		const std::string& normalSource = material.fragmentNormalSource;
+		auto [entry, inserted] = modifierPipelines.try_emplace(std::make_tuple(vertexSource, normalSource, skinned));
 		if (!inserted) return entry->second;
 		auto& family = entry->second;
 		SDL_GPUShader* vertex[2]{};
@@ -2363,24 +2366,25 @@ namespace Sapphire::Graphics {
 		};
 		try {
 			for (int instanced = 0; instanced < 2; ++instanced) {
-				const std::string prefix = std::string(instanced ? "#define INSTANCED 1\n" : "") + "#define CUSTOM_MODIFIER 1\n";
-				const std::string mainSource = prefix + deformationShaderSource + source + vertexShaderSource.substr(deformationShaderSource.size());
-				const std::string shadowSource = prefix + deformationShaderSource + source + shadowVertexShaderSource.substr(deformationShaderSource.size());
+				const std::string prefix = std::string(instanced ? "#define INSTANCED 1\n" : "") + (vertexSource.empty() ? "" : "#define CUSTOM_MODIFIER 1\n") + (normalSource.empty() ? "" : "#define CUSTOM_FRAGMENT_NORMAL 1\n");
+				const std::string mainSource = prefix + deformationShaderSource + vertexSource + vertexShaderSource.substr(deformationShaderSource.size());
+				const std::string shadowSource = prefix + deformationShaderSource + vertexSource + shadowVertexShaderSource.substr(deformationShaderSource.size());
 				vertex[instanced] = CreateShader(gpuDevice, mainSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
 				shadowVertex[instanced] = CreateShader(gpuDevice, shadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
 				if (!vertex[instanced] || !shadowVertex[instanced]) throw std::runtime_error(std::string("Compile vertex modifier: ") + SDL_GetError());
 			}
 			if (skinned) {
-				const std::string skinnedPrefix = "#define SKINNED 1\n#define CUSTOM_MODIFIER 1\n";
-				const std::string skinnedMainSource = skinnedPrefix + deformationShaderSource + source + vertexShaderSource.substr(deformationShaderSource.size());
-				const std::string skinnedShadowSource = skinnedPrefix + deformationShaderSource + source + shadowVertexShaderSource.substr(deformationShaderSource.size());
+				const std::string skinnedPrefix = std::string("#define SKINNED 1\n") + (vertexSource.empty() ? "" : "#define CUSTOM_MODIFIER 1\n") + (normalSource.empty() ? "" : "#define CUSTOM_FRAGMENT_NORMAL 1\n");
+				const std::string skinnedMainSource = skinnedPrefix + deformationShaderSource + vertexSource + vertexShaderSource.substr(deformationShaderSource.size());
+				const std::string skinnedShadowSource = skinnedPrefix + deformationShaderSource + vertexSource + shadowVertexShaderSource.substr(deformationShaderSource.size());
 				skinnedVertex = CreateShader(gpuDevice, skinnedMainSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1, 1);
 				skinnedShadowVertex = CreateShader(gpuDevice, skinnedShadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1, 1);
 				if (!skinnedVertex || !skinnedShadowVertex) throw std::runtime_error(std::string("Compile skinned vertex modifier: ") + SDL_GetError());
 			}
 			for (int masked = 0; masked < 2; ++masked) {
-				const std::string prefix = masked ? "#define ALPHA_MASKED 1\n" : "#define ALPHA_MASKED 0\n";
-				fragment[masked] = CreateShader(gpuDevice, (prefix + fragmentShaderSource).c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 9, 2);
+				const std::string prefix = std::string(masked ? "#define ALPHA_MASKED 1\n" : "#define ALPHA_MASKED 0\n") + (normalSource.empty() ? "" : "#define CUSTOM_FRAGMENT_NORMAL 1\n");
+				const std::string mainSource = prefix + fogCommonShaderSource + normalSource + fragmentShaderSource.substr(fogCommonShaderSource.size());
+				fragment[masked] = CreateShader(gpuDevice, mainSource.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 9, 2);
 				shadowFragment[masked] = CreateShader(gpuDevice, (prefix + shadowFragmentShaderSource).c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, masked ? 1 : 0);
 				if (!fragment[masked] || !shadowFragment[masked]) throw std::runtime_error(std::string("Compile modifier pipeline fragment shader: ") + SDL_GetError());
 			}
@@ -3026,6 +3030,7 @@ namespace Sapphire::Graphics {
 		frame.cameraPosition[0] = cameraTransform.position.x;
 		frame.cameraPosition[1] = cameraTransform.position.y;
 		frame.cameraPosition[2] = cameraTransform.position.z;
+		frame.modifierTime[0] = frameTime;
 		frame.fogColor[0] = scene.fogColor.x;
 		frame.fogColor[1] = scene.fogColor.y;
 		frame.fogColor[2] = scene.fogColor.z;
@@ -3250,8 +3255,10 @@ namespace Sapphire::Graphics {
 			GpuMeshMaterial& gpuMeshMaterial = gpuMesh.materials.at(item.materialIndex);
 			GpuMaterial* activeGpuMaterial = gpuMeshMaterial.material;
 			SDL_GPUGraphicsPipeline* meshPipeline = nullptr;
-			if (item.skeleton) meshPipeline = material.vertexModifierSource.empty() ? (material.transparent ? skinnedTransparentPipelines[mesh->cullBackfaces ? 1 : 0] : skinnedPipelines[activeGpuMaterial->masked ? 1 : 0][mesh->cullBackfaces ? 1 : 0]) : (material.transparent ? GetModifierPipelines(material.vertexModifierSource, true).skinnedTransparent[mesh->cullBackfaces ? 1 : 0] : GetModifierPipelines(material.vertexModifierSource, true).skinnedMain[activeGpuMaterial->masked ? 1 : 0][mesh->cullBackfaces ? 1 : 0]);
-			else meshPipeline = material.vertexModifierSource.empty() ? (material.transparent ? (mesh->instanced ? instanceTransparentPipelines : transparentPipelines)[mesh->cullBackfaces ? 1 : 0] : (mesh->instanced ? instancePipelines : pipelines)[activeGpuMaterial->masked ? 1 : 0][mesh->cullBackfaces ? 1 : 0]) : (material.transparent ? GetModifierPipelines(material.vertexModifierSource).transparent[mesh->instanced ? 1 : 0][mesh->cullBackfaces ? 1 : 0] : GetModifierPipelines(material.vertexModifierSource).main[mesh->instanced ? 1 : 0][activeGpuMaterial->masked ? 1 : 0][mesh->cullBackfaces ? 1 : 0]);
+			const bool modified = !material.vertexModifierSource.empty() || !material.fragmentNormalSource.empty();
+			ModifierPipelines* modifiers = modified ? &GetModifierPipelines(material, item.skeleton != nullptr) : nullptr;
+			if (item.skeleton) meshPipeline = modified ? (material.transparent ? modifiers->skinnedTransparent[mesh->cullBackfaces ? 1 : 0] : modifiers->skinnedMain[activeGpuMaterial->masked ? 1 : 0][mesh->cullBackfaces ? 1 : 0]) : (material.transparent ? skinnedTransparentPipelines[mesh->cullBackfaces ? 1 : 0] : skinnedPipelines[activeGpuMaterial->masked ? 1 : 0][mesh->cullBackfaces ? 1 : 0]);
+			else meshPipeline = modified ? (material.transparent ? modifiers->transparent[mesh->instanced ? 1 : 0][mesh->cullBackfaces ? 1 : 0] : modifiers->main[mesh->instanced ? 1 : 0][activeGpuMaterial->masked ? 1 : 0][mesh->cullBackfaces ? 1 : 0]) : (material.transparent ? (mesh->instanced ? instanceTransparentPipelines : transparentPipelines)[mesh->cullBackfaces ? 1 : 0] : (mesh->instanced ? instancePipelines : pipelines)[activeGpuMaterial->masked ? 1 : 0][mesh->cullBackfaces ? 1 : 0]);
 			if (meshPipeline != activePipeline) {
 				SDL_BindGPUGraphicsPipeline(pass, meshPipeline);
 				activePipeline = meshPipeline;
