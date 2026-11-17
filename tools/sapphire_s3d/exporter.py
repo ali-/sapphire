@@ -153,15 +153,6 @@ def bake_channels(material):
     return channels
 
 
-def material_is_baked(material):
-    if not material:
-        return False
-    values = [owner["isBaked"] for owner in (material, material.node_tree) if owner and "isBaked" in owner]
-    if any(not isinstance(value, bool) for value in values):
-        raise ValueError("isBaked must be boolean on material " + material.name)
-    return any(values)
-
-
 def limited_size(width, height, maximum):
     if not maximum or max(width, height) <= maximum:
         return width, height
@@ -762,11 +753,7 @@ def write_model(file, context, obj, export_path, texture_dir, apply_modifiers, d
             evaluated.to_mesh_clear()
     else:
         vertices, indices, sections, materials, bones, skin = mesh_payload(obj, obj.data, False, material_records)
-    baked_materials = [material if material_is_baked(material) else None for material in source_materials]
-    direct_materials = [material if baked is None else None for material, baked in zip(source_materials, baked_materials)]
-    reference_direct_images(direct_materials, material_records, export_path, texture_dir, maximum, context.scene)
-    reuse_baked_materials(obj, direct_materials, material_records, export_path, texture_dir)
-    bake_materials(context, obj, baked_materials, material_records, export_path, texture_dir, maximum)
+    bake_materials(context, obj, source_materials, material_records, export_path, texture_dir, maximum)
     normalize_references(material_records, export_path, maximum, context.scene)
     file.write(struct.pack("<5I", len(vertices), len(indices), len(sections), len(materials), len(bones)))
     for position, normal, uv, color in vertices:
