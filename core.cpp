@@ -1290,6 +1290,119 @@ namespace Sapphire {
 			WorldPartitioner worldPartitioner;
 	};
 
+	class WaterController : public Object {
+		const std::string waveParameters = R"(
+			constant float4 oceanWaves[8] = {
+					float4( 0.928,  0.372, 0.170, 0.55),
+					float4( 0.811,  0.585, 0.273, 0.34),
+					float4( 0.994, -0.110, 0.419, 0.22),
+					float4( 0.601,  0.799, 0.628, 0.14),
+					float4( 0.955,  0.297, 0.982, 0.08),
+					float4(-0.381,  0.925, 1.532, 0.045),
+					float4( 0.733, -0.680, 2.244, 0.020),
+					float4( 0.246,  0.969, 2.856, 0.010)
+				};
+			constant float oceanSpeeds[8] = {1.29, 1.64, 2.03, 2.48, 3.11, 3.88, 4.69, 5.29};
+			constant float oceanPhases[8] = {0.0, 1.7, 4.1, 2.8, 5.2, 0.9, 3.5, 5.8};
+			constant float oceanSpeed = WAVE_SPEED;
+			constant float oceanHeight = WAVE_HEIGHT;
+			constant float oceanAmplitude = WAVE_AMPLITUDE;
+		)";
+		const std::string waveModifier = waveParameters + R"(
+			void ModifyVertex(thread float3& position, thread float3& normal, thread float4& color, float instanceData, float time, float4x4 model) {
+				float2 world = (model * float4(position, 1.0)).xy;
+				float height = 0.0;
+				float amplitudeSum = 0.0;
+				float2 horizontal = float2(0.0);
+				for (int i = 0; i < 8; ++i) {
+					float2 direction = oceanWaves[i].xy;
+					float waveNumber = oceanWaves[i].z;
+					float amplitude = oceanWaves[i].w;
+					float phase = dot(world, direction) * waveNumber - time * oceanSpeed * oceanSpeeds[i] + oceanPhases[i];
+					float crest = sin(phase);
+					float flank = cos(phase);
+					height += amplitude * crest;
+					amplitudeSum += amplitude;
+					horizontal += direction * (0.45 * amplitude * flank);
+				}
+				float2 horizontalScale = float2(length(model[0].xyz), length(model[1].xyz));
+				position.xy += horizontal / horizontalScale;
+				position.z += 0.5 + 0.5 * oceanAmplitude * height / amplitudeSum;
+				}
+		)";
+		const std::string waveNormalModifier = waveParameters + R"(
+			void ModifyFragmentNormal(thread float3& normal, float3 baseWorldPosition, float3 worldPosition, float2 uv, float time) {
+				float3 tangentX = float3(1.0, 0.0, 0.0);
+				float3 tangentY = float3(0.0, 1.0, 0.0);
+				float amplitudeSum = 0.0;
+				for (int i = 0; i < 8; ++i) {
+					float2 direction = oceanWaves[i].xy;
+					float waveNumber = oceanWaves[i].z;
+					float amplitude = oceanWaves[i].w;
+					amplitudeSum += amplitude;
+					float phase = dot(baseWorldPosition.xy, direction) * waveNumber - time * oceanSpeed * oceanSpeeds[i] + oceanPhases[i];
+					float verticalSlope = amplitude * waveNumber * cos(phase);
+					float horizontalSlope = -0.45 * amplitude * waveNumber * sin(phase);
+					tangentX += float3(horizontalSlope * direction.x * direction, verticalSlope * direction.x);
+					tangentY += float3(horizontalSlope * direction.y * direction, verticalSlope * direction.y);
+				}
+				tangentX.z *= oceanHeight * oceanAmplitude / (2.0 * amplitudeSum);
+				tangentY.z *= oceanHeight * oceanAmplitude / (2.0 * amplitudeSum);
+				normal = normalize(cross(tangentX, tangentY));
+			}
+		)";
+
+		public:
+			using Object::Object;
+			int subdivisions = 512;
+			float speed = 1.0f;
+			float amplitude = 1.0f;
+			Vector3 color{0.01f, 0.06f, 0.18f};
+			float alpha = 0.5f;
+
+			void Initialize() override {
+				if (subdivisions < 1 || subdivisions > 1024) throw std::out_of_range("Ocean subdivisions must be between 1 and 1024");
+				if (transform.scale.z < 0.0f) throw std::out_of_range("Water height scale must be nonnegative");
+				if (!std::isfinite(amplitude) || amplitude < 0.0f) throw std::out_of_range("Water wave amplitude must be finite and nonnegative");
+				const float opacity = std::clamp(alpha, 0.0f, 1.0f);
+				const int rowSize = subdivisions + 1;
+				MeshData data;
+				data.vertices.reserve(static_cast<std::size_t>(rowSize) * rowSize);
+				data.indices.reserve(static_cast<std::size_t>(subdivisions) * subdivisions * 6);
+				for (int y = 0; y <= subdivisions; ++y) {
+					for (int x = 0; x <= subdivisions; ++x) {
+						const float u = static_cast<float>(x) / subdivisions;
+						const float v = static_cast<float>(y) / subdivisions;
+						data.vertices.push_back({{u - 0.5f, v - 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {u, v}, {color.x, color.y, color.z, opacity}});
+					}
+				}
+				for (int y = 0; y < subdivisions; ++y) {
+					for (int x = 0; x < subdivisions; ++x) {
+						const std::uint32_t first = y * rowSize + x;
+						const std::uint32_t next = first + rowSize;
+						data.indices.insert(data.indices.end(), {first, next + 1, next, first, first + 1, next + 1});
+					}
+				}
+				auto& mesh = AddComponent<Mesh>();
+				mesh.data = std::move(data);
+				mesh.material.transparent = opacity < 1.0f;
+				mesh.material.roughness = 0.22f;
+				mesh.material.vertexModifierSource = waveModifier;
+				mesh.material.fragmentNormalSource = waveNormalModifier;
+				for (std::string* source : {&mesh.material.vertexModifierSource, &mesh.material.fragmentNormalSource}) {
+					const auto marker = source->find("WAVE_SPEED");
+					source->replace(marker, sizeof("WAVE_SPEED") - 1, std::to_string(speed));
+					const auto heightMarker = source->find("WAVE_HEIGHT");
+					source->replace(heightMarker, sizeof("WAVE_HEIGHT") - 1, std::to_string(transform.scale.z));
+					const auto amplitudeMarker = source->find("WAVE_AMPLITUDE");
+					source->replace(amplitudeMarker, sizeof("WAVE_AMPLITUDE") - 1, std::to_string(amplitude));
+				}
+				mesh.vertexAnimated = true;
+				mesh.vertexBoundsPadding = {0.65f / std::max(std::abs(transform.scale.x), 0.0001f), 0.65f / std::max(std::abs(transform.scale.y), 0.0001f), 1.0f};
+				mesh.castShadows = false;
+			}
+	};
+
 	class ParticleEmitter : public Object {
 		struct Particle {
 			Vector3 velocity;
