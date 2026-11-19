@@ -58,13 +58,13 @@ namespace Sapphire {
 					Object* object = scene.Objects()[index].get();
 					if (object->initializedForApp) continue;
 					object->UpdateWorldTransform();
-					if (auto* skeleton = object->GetComponent<Skeleton>()) {
+					Skeleton* skeleton = object->GetComponent<Skeleton>();
+					if (skeleton) {
 						skeleton->Validate();
 						skeleton->InitializePose();
 					}
 					if (auto* mesh = object->GetComponent<Mesh>(); mesh && mesh->IsSkinned()) {
 						if (mesh->instanced) throw std::invalid_argument("Skinned meshes cannot be instanced");
-						Skeleton* skeleton = object->GetComponent<Skeleton>();
 						if (!skeleton) throw std::invalid_argument("Skinned meshes require a skeleton on the same object");
 						mesh->ValidateSkeleton(*skeleton);
 					}
@@ -79,6 +79,7 @@ namespace Sapphire {
 			scene.SelectFirstCamera();
 			Physics::Initialize(scene);
 			Graphics::PrepareScene(scene);
+			const Uint32 windowID = SDL_GetWindowID(window);
 			Uint64 previous_time = SDL_GetTicksNS();
 			while (running) {
 				const Uint64 frameStart = SDL_GetTicksNS();
@@ -88,18 +89,17 @@ namespace Sapphire {
 				while (SDL_PollEvent(&event)) {
 					Input::ProcessEvent(event);
 					if (event.type == SDL_EVENT_QUIT) running = false;
-					if (event.type == SDL_EVENT_WINDOW_RESIZED && event.window.windowID == SDL_GetWindowID(window)) {
+					if (event.type == SDL_EVENT_WINDOW_RESIZED && event.window.windowID == windowID) {
 						Screen::width = event.window.data1;
 						Screen::height = event.window.data2;
 					}
 				}
 				Input::EndEvents();
 
-				const Uint64 current_time = frameStart;
-				const Uint64 frame_time_ns = current_time - previous_time;
+				const Uint64 frame_time_ns = frameStart - previous_time;
 				Time::deltaTime = static_cast<float>(frame_time_ns) / 1'000'000'000.0f;
 				accumulator += std::min(frame_time_ns, fixedStepNs * 8);
-				previous_time = current_time;
+				previous_time = frameStart;
 				initializeObjects();
 				while (accumulator >= fixedStepNs) {
 					const std::size_t phaseCount = scene.Objects().size();

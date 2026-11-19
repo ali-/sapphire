@@ -120,28 +120,11 @@ namespace Sapphire::GUI {
 			return false;
 		}
 
-		SDL_GPUVertexBufferDescription vertexBufferDescription{};
-		vertexBufferDescription.slot = 0;
-		vertexBufferDescription.pitch = sizeof(Vertex);
-		vertexBufferDescription.input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX;
-		SDL_GPUVertexAttribute vertexAttributes[2]{};
-		vertexAttributes[0].location = 0;
-		vertexAttributes[0].buffer_slot = 0;
-		vertexAttributes[0].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2;
-		vertexAttributes[0].offset = offsetof(Vertex, position);
-		vertexAttributes[1].location = 1;
-		vertexAttributes[1].buffer_slot = 0;
-		vertexAttributes[1].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2;
-		vertexAttributes[1].offset = offsetof(Vertex, uv);
+		SDL_GPUVertexBufferDescription vertexBufferDescription{0, sizeof(Vertex), SDL_GPU_VERTEXINPUTRATE_VERTEX, 0};
+		SDL_GPUVertexAttribute vertexAttributes[2]{{0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, offsetof(Vertex, position)}, {1, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, offsetof(Vertex, uv)}};
 		SDL_GPUColorTargetDescription colorTarget{};
 		colorTarget.format = SDL_GetGPUSwapchainTextureFormat(gpuDevice, window);
-		colorTarget.blend_state.enable_blend = true;
-		colorTarget.blend_state.src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA;
-		colorTarget.blend_state.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
-		colorTarget.blend_state.color_blend_op = SDL_GPU_BLENDOP_ADD;
-		colorTarget.blend_state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
-		colorTarget.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
-		colorTarget.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
+		colorTarget.blend_state = Graphics::StraightAlphaBlendState();
 		SDL_GPUGraphicsPipelineCreateInfo pipelineInfo{};
 		pipelineInfo.vertex_shader = vertexShader;
 		pipelineInfo.fragment_shader = fragmentShader;
@@ -206,13 +189,11 @@ namespace Sapphire::GUI {
 				y += fontAtlas.cellHeight;
 				continue;
 			}
-			if (character == ' ') {
-				x += fontAtlas.advance;
-				continue;
+			if (character != ' ') {
+				const int index = character >= fontAtlas.firstCharacter && character < endCharacter ? character - fontAtlas.firstCharacter : fallback;
+				const auto& uv = fontAtlas.glyphs[index];
+				QueueQuad(fontAtlas.texture, static_cast<float>(x), static_cast<float>(y), static_cast<float>(fontAtlas.cellWidth), static_cast<float>(fontAtlas.cellHeight), uv[0], uv[1], uv[2], uv[3]);
 			}
-			const int index = character >= fontAtlas.firstCharacter && character < endCharacter ? character - fontAtlas.firstCharacter : fallback;
-			const auto& uv = fontAtlas.glyphs[index];
-			QueueQuad(fontAtlas.texture, static_cast<float>(x), static_cast<float>(y), static_cast<float>(fontAtlas.cellWidth), static_cast<float>(fontAtlas.cellHeight), uv[0], uv[1], uv[2], uv[3]);
 			x += fontAtlas.advance;
 		}
 	}

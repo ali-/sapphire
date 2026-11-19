@@ -1,5 +1,6 @@
 #include <array>
 #include <cmath>
+#include <iterator>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_gamepad.h>
 
@@ -12,6 +13,9 @@ namespace Sapphire::Input {
 	static std::array<bool, SDL_GAMEPAD_BUTTON_COUNT> previousGamepadButtons{};
 	static float mouseDeltaX = 0.0f;
 	static float mouseDeltaY = 0.0f;
+
+	static bool ValidScancode(SDL_Scancode code) { return code > SDL_SCANCODE_UNKNOWN && code < SDL_SCANCODE_COUNT; }
+	static bool ValidGamepadButton(int button) { return button >= 0 && button < SDL_GAMEPAD_BUTTON_COUNT; }
 
 	static void OpenFirstGamepad() {
 		int count = 0;
@@ -40,21 +44,33 @@ namespace Sapphire::Input {
 	}
 
 	void ProcessEvent(const SDL_Event& event) {
-		if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.scancode > SDL_SCANCODE_UNKNOWN && event.key.scancode < SDL_SCANCODE_COUNT) pressed[event.key.scancode] = true;
-		else if (event.type == SDL_EVENT_KEY_UP && event.key.scancode > SDL_SCANCODE_UNKNOWN && event.key.scancode < SDL_SCANCODE_COUNT) released[event.key.scancode] = true;
-		else if (event.type == SDL_EVENT_MOUSE_MOTION) {
+		switch (event.type) {
+		case SDL_EVENT_KEY_DOWN:
+		case SDL_EVENT_KEY_UP:
+			if (ValidScancode(event.key.scancode) && (event.type != SDL_EVENT_KEY_DOWN || !event.key.repeat))
+				(event.type == SDL_EVENT_KEY_DOWN ? pressed : released)[event.key.scancode] = true;
+			break;
+		case SDL_EVENT_MOUSE_MOTION:
 			mouseDeltaX += event.motion.xrel;
 			mouseDeltaY += event.motion.yrel;
-		}
-		else if (event.type == SDL_EVENT_GAMEPAD_ADDED && !gamepad) gamepad = SDL_OpenGamepad(event.gdevice.which);
-		else if (event.type == SDL_EVENT_GAMEPAD_REMOVED && gamepad && SDL_GetGamepadID(gamepad) == event.gdevice.which) {
-			SDL_CloseGamepad(gamepad);
-			gamepad = nullptr;
-			OpenFirstGamepad();
-		}
-		else if ((event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || event.type == SDL_EVENT_GAMEPAD_BUTTON_UP) && gamepad && SDL_GetGamepadID(gamepad) == event.gbutton.which && event.gbutton.button >= 0 && event.gbutton.button < SDL_GAMEPAD_BUTTON_COUNT) {
-			if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) gamepadPressed[event.gbutton.button] = true;
-			else gamepadReleased[event.gbutton.button] = true;
+			break;
+		case SDL_EVENT_GAMEPAD_ADDED:
+			if (!gamepad) gamepad = SDL_OpenGamepad(event.gdevice.which);
+			break;
+		case SDL_EVENT_GAMEPAD_REMOVED:
+			if (gamepad && SDL_GetGamepadID(gamepad) == event.gdevice.which) {
+				SDL_CloseGamepad(gamepad);
+				gamepad = nullptr;
+				OpenFirstGamepad();
+			}
+			break;
+		case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+		case SDL_EVENT_GAMEPAD_BUTTON_UP:
+			if (gamepad && SDL_GetGamepadID(gamepad) == event.gbutton.which && ValidGamepadButton(event.gbutton.button))
+				(event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ? gamepadPressed : gamepadReleased)[event.gbutton.button] = true;
+			break;
+		default:
+			break;
 		}
 	}
 
@@ -74,7 +90,7 @@ namespace Sapphire::Input {
 
 
 	bool GetKey(SDL_Scancode code) {
-		if (code <= SDL_SCANCODE_UNKNOWN || code >= SDL_SCANCODE_COUNT) return false;
+		if (!ValidScancode(code)) return false;
 		return SDL_GetKeyboardState(nullptr)[code];
 	}
 
@@ -83,11 +99,11 @@ namespace Sapphire::Input {
 	}
 
 	bool GetKeyDown(SDL_Scancode code) {
-		return code > SDL_SCANCODE_UNKNOWN && code < SDL_SCANCODE_COUNT && pressed[code];
+		return ValidScancode(code) && pressed[code];
 	}
 
 	bool GetKeyUp(SDL_Scancode code) {
-		return code > SDL_SCANCODE_UNKNOWN && code < SDL_SCANCODE_COUNT && released[code];
+		return ValidScancode(code) && released[code];
 	}
 
 	bool GetKeyDown(const char* key) {
@@ -99,15 +115,15 @@ namespace Sapphire::Input {
 	}
 
 	bool GetButton(SDL_GamepadButton button) {
-		return button >= 0 && button < SDL_GAMEPAD_BUTTON_COUNT && gamepad && SDL_GetGamepadButton(gamepad, button);
+		return ValidGamepadButton(button) && gamepad && SDL_GetGamepadButton(gamepad, button);
 	}
 
 	bool GetButtonDown(SDL_GamepadButton button) {
-		return button >= 0 && button < SDL_GAMEPAD_BUTTON_COUNT && gamepadPressed[button];
+		return ValidGamepadButton(button) && gamepadPressed[button];
 	}
 
 	bool GetButtonUp(SDL_GamepadButton button) {
-		return button >= 0 && button < SDL_GAMEPAD_BUTTON_COUNT && gamepadReleased[button];
+		return ValidGamepadButton(button) && gamepadReleased[button];
 	}
 
 	enum class Axis {
@@ -136,7 +152,7 @@ namespace Sapphire::Input {
 			SDL_GAMEPAD_AXIS_RIGHTY
 		};
 		const auto index = static_cast<unsigned>(axis);
-		if (index >= 4) {
+		if (index >= std::size(axes)) {
 			return 0.0f;
 		}
 		const Sint16 rawValue = SDL_GetGamepadAxis(gamepad, axes[index]);

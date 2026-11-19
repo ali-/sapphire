@@ -1,79 +1,6 @@
 #include <string>
 
 namespace Sapphire::Graphics::Shaders {
-	inline const std::string waterVertexModifierSource = R"(
-		constant float4 oceanWaves[8] = {
-			float4( 0.928,  0.372, 0.170, 0.55),
-			float4( 0.811,  0.585, 0.273, 0.34),
-			float4( 0.994, -0.110, 0.419, 0.22),
-			float4( 0.601,  0.799, 0.628, 0.14),
-			float4( 0.955,  0.297, 0.982, 0.08),
-			float4(-0.381,  0.925, 1.532, 0.045),
-			float4( 0.733, -0.680, 2.244, 0.020),
-			float4( 0.246,  0.969, 2.856, 0.010)
-		};
-		constant float oceanSpeeds[8] = {1.29, 1.64, 2.03, 2.48, 3.11, 3.88, 4.69, 5.29};
-		constant float oceanPhases[8] = {0.0, 1.7, 4.1, 2.8, 5.2, 0.9, 3.5, 5.8};
-		constant float oceanSpeed = WAVE_SPEED;
-		constant float oceanHeight = WAVE_HEIGHT;
-		constant float oceanAmplitude = WAVE_AMPLITUDE;
-		void ModifyVertex(thread float3& position, thread float3& normal, thread float4& color, float instanceData, float time, float4x4 model) {
-			float2 world = (model * float4(position, 1.0)).xy;
-			float height = 0.0;
-			float amplitudeSum = 0.0;
-			float2 horizontal = float2(0.0);
-			for (int i = 0; i < 8; ++i) {
-				float2 direction = oceanWaves[i].xy;
-				float waveNumber = oceanWaves[i].z;
-				float amplitude = oceanWaves[i].w;
-				float phase = dot(world, direction) * waveNumber - time * oceanSpeed * oceanSpeeds[i] + oceanPhases[i];
-				float crest = sin(phase);
-				float flank = cos(phase);
-				height += amplitude * crest;
-				amplitudeSum += amplitude;
-				horizontal += direction * (0.45 * amplitude * flank);
-			}
-			float2 horizontalScale = float2(length(model[0].xyz), length(model[1].xyz));
-			position.xy += horizontal / horizontalScale;
-			position.z += 0.5 + 0.5 * oceanAmplitude * height / amplitudeSum;
-		}
-	)";
-	inline const std::string waterFragmentNormalModifierSource = R"(
-		constant float4 oceanWaves[8] = {
-			float4( 0.928,  0.372, 0.170, 0.55),
-			float4( 0.811,  0.585, 0.273, 0.34),
-			float4( 0.994, -0.110, 0.419, 0.22),
-			float4( 0.601,  0.799, 0.628, 0.14),
-			float4( 0.955,  0.297, 0.982, 0.08),
-			float4(-0.381,  0.925, 1.532, 0.045),
-			float4( 0.733, -0.680, 2.244, 0.020),
-			float4( 0.246,  0.969, 2.856, 0.010)
-		};
-		constant float oceanSpeeds[8] = {1.29, 1.64, 2.03, 2.48, 3.11, 3.88, 4.69, 5.29};
-		constant float oceanPhases[8] = {0.0, 1.7, 4.1, 2.8, 5.2, 0.9, 3.5, 5.8};
-		constant float oceanSpeed = WAVE_SPEED;
-		constant float oceanHeight = WAVE_HEIGHT;
-		constant float oceanAmplitude = WAVE_AMPLITUDE;
-		void ModifyFragmentNormal(thread float3& normal, float3 baseWorldPosition, float3 worldPosition, float2 uv, float time) {
-			float3 tangentX = float3(1.0, 0.0, 0.0);
-			float3 tangentY = float3(0.0, 1.0, 0.0);
-			float amplitudeSum = 0.0;
-			for (int i = 0; i < 8; ++i) {
-				float2 direction = oceanWaves[i].xy;
-				float waveNumber = oceanWaves[i].z;
-				float amplitude = oceanWaves[i].w;
-				amplitudeSum += amplitude;
-				float phase = dot(baseWorldPosition.xy, direction) * waveNumber - time * oceanSpeed * oceanSpeeds[i] + oceanPhases[i];
-				float verticalSlope = amplitude * waveNumber * cos(phase);
-				float horizontalSlope = -0.45 * amplitude * waveNumber * sin(phase);
-				tangentX += float3(horizontalSlope * direction.x * direction, verticalSlope * direction.x);
-				tangentY += float3(horizontalSlope * direction.y * direction, verticalSlope * direction.y);
-			}
-			tangentX.z *= oceanHeight * oceanAmplitude / (2.0 * amplitudeSum);
-			tangentY.z *= oceanHeight * oceanAmplitude / (2.0 * amplitudeSum);
-			normal = normalize(cross(tangentX, tangentY));
-		}
-	)";
 	inline const std::string deformationShaderSource = R"(
 		#include <metal_stdlib>
 		using namespace metal;
@@ -100,8 +27,8 @@ namespace Sapphire::Graphics::Shaders {
 		void ModifyVertex(thread float3& position, thread float3& normal, thread float4& color, float instanceData, float time, float4x4 model) {}
 		#endif
 	)";
-	
-	inline const std::string vertexShaderSource = deformationShaderSource + R"(
+
+	inline const std::string meshVertexPreparationSource = R"(
 		struct VertexInput { float3 position [[attribute(0)]]; float3 normal [[attribute(1)]]; float2 uv [[attribute(2)]]; float4 color [[attribute(3)]];
 		#if SKINNED
 		ushort4 boneIndices [[attribute(4)]]; float4 boneWeights [[attribute(5)]];
@@ -110,6 +37,39 @@ namespace Sapphire::Graphics::Shaders {
 		float3 instancePosition [[attribute(4)]]; float3 instanceRotation [[attribute(5)]]; float3 instanceScale [[attribute(6)]]; float instanceData [[attribute(7)]];
 		#endif
 		};
+		void PrepareVertex(VertexInput input, float4 uvTransform, float4 displacementParameters, float4x4 model,
+		#if SKINNED
+		device const float4x4* boneMatrices,
+		#endif
+		texture2d<float> heightMap, sampler heightSampler, texture2d<float> maskMap, sampler maskSampler,
+		thread float3& position, thread float3& normal, thread float2& uv, thread float4& color, thread float& instanceData) {
+			uv = input.uv * uvTransform.xy + uvTransform.zw;
+			float3 localPosition = input.position;
+			normal = input.normal;
+			color = input.color;
+			#if SKINNED
+			float4 skinnedPosition = float4(0.0);
+			float3 skinnedNormal = float3(0.0);
+			for (uint influence = 0; influence < 4; ++influence) {
+				float weight = input.boneWeights[influence];
+				skinnedPosition += (boneMatrices[input.boneIndices[influence]] * float4(localPosition, 1.0)) * weight;
+				skinnedNormal += (boneMatrices[input.boneIndices[influence]] * float4(normal, 0.0)).xyz * weight;
+			}
+			localPosition = skinnedPosition.xyz;
+			normal = normalize(skinnedNormal);
+			#endif
+			#if INSTANCED
+			localPosition = input.instancePosition + InstanceRotate(localPosition * input.instanceScale, input.instanceRotation);
+			normal = InstanceNormal(normal, input.instanceScale, input.instanceRotation);
+			instanceData = input.instanceData;
+			#else
+			instanceData = 0.0;
+			#endif
+			position = Deform(localPosition, normal, uv, color, model, displacementParameters, heightMap, heightSampler, maskMap, maskSampler);
+		}
+	)";
+	
+	inline const std::string vertexShaderSource = deformationShaderSource + meshVertexPreparationSource + R"(
 		struct VertexOutput { float4 position [[position]]; float2 uv; float4 color; float3 worldPosition; float3 worldNormal; float4 shadowPosition0; float4 shadowPosition1; float4 shadowPosition2;
 		#if CUSTOM_FRAGMENT_NORMAL
 		float3 baseWorldPosition;
@@ -122,32 +82,18 @@ namespace Sapphire::Graphics::Shaders {
 		#endif
 		texture2d<float> heightMap [[texture(0)]], sampler heightSampler [[sampler(0)]], texture2d<float> maskMap [[texture(1)]], sampler maskSampler [[sampler(1)]]) {
 			VertexOutput output;
-			float2 uv = input.uv * uniforms.uvTransform.xy + uniforms.uvTransform.zw;
-			float3 localPosition = input.position;
-			float3 localNormal = input.normal;
-			float4 color = input.color;
+			float2 uv;
+			float3 localNormal;
+			float4 color;
+			float3 position;
+			float instanceData;
+			PrepareVertex(input, uniforms.uvTransform, uniforms.displacementParameters, uniforms.model,
 			#if SKINNED
-			float4 skinnedPosition = float4(0.0);
-			float3 skinnedNormal = float3(0.0);
-			for (uint influence = 0; influence < 4; ++influence) {
-				float weight = input.boneWeights[influence];
-				skinnedPosition += (boneMatrices[input.boneIndices[influence]] * float4(localPosition, 1.0)) * weight;
-				skinnedNormal += (boneMatrices[input.boneIndices[influence]] * float4(localNormal, 0.0)).xyz * weight;
-			}
-			localPosition = skinnedPosition.xyz;
-			localNormal = normalize(skinnedNormal);
+				boneMatrices,
 			#endif
-			#if INSTANCED
-			localPosition = input.instancePosition + InstanceRotate(localPosition * input.instanceScale, input.instanceRotation);
-			localNormal = InstanceNormal(localNormal, input.instanceScale, input.instanceRotation);
-			#endif
-			float3 position = Deform(localPosition, localNormal, uv, color, uniforms.model, uniforms.displacementParameters, heightMap, heightSampler, maskMap, maskSampler);
+				heightMap, heightSampler, maskMap, maskSampler, position, localNormal, uv, color, instanceData);
 			#if CUSTOM_FRAGMENT_NORMAL
 			output.baseWorldPosition = (uniforms.model * float4(position, 1.0)).xyz;
-			#endif
-			float instanceData = 0.0;
-			#if INSTANCED
-			instanceData = input.instanceData;
 			#endif
 			ModifyVertex(position, localNormal, color, instanceData, uniforms.modifierTime.x, uniforms.model);
 			output.position = uniforms.mvp * float4(position, 1.0);
@@ -228,6 +174,10 @@ namespace Sapphire::Graphics::Shaders {
 			float previousFog[5] = {0.0};
 			float transmittance = 1.0;
 			float3 scattering = float3(0.0);
+			uint lightCount = min(uint(frame.fogParameters.x), 16u);
+			float3 baseLighting = frame.ambientLight.rgb * frame.ambientLight.a;
+			float directionalIntensity = frame.directionalDirection.w;
+			if (directionalIntensity > 0.0) baseLighting += frame.directionalColor.rgb * directionalIntensity;
 			for (uint slice = 0; slice < sliceCount; ++slice) {
 				float distance = nearClip * exp(logRange * (float(slice) + 0.5) / float(sliceCount));
 				float3 position = frame.cameraPosition.xyz + ray * distance;
@@ -255,10 +205,7 @@ namespace Sapphire::Graphics::Shaders {
 				}
 				segmentTransmittance = clamp(segmentTransmittance, 0.0, 1.0);
 				float segmentScattering = transmittance * (1.0 - segmentTransmittance) * frame.fogVolumeParameters.y;
-				float3 lighting = frame.ambientLight.rgb * frame.ambientLight.a;
-				float directionalIntensity = frame.directionalDirection.w;
-				if (directionalIntensity > 0.0) lighting += frame.directionalColor.rgb * directionalIntensity;
-				uint lightCount = min(uint(frame.fogParameters.x), 16u);
+				float3 lighting = baseLighting;
 				for (uint light = 0; light < lightCount; ++light) {
 					float4 positionRange = frame.pointLightPositionRange[light];
 					float4 colorIntensity = frame.pointLightColorIntensity[light];
@@ -310,27 +257,31 @@ namespace Sapphire::Graphics::Shaders {
 		float3 baseWorldPosition;
 		#endif
 		};
-		struct FragmentUniforms { float4 shadowParameters[3]; float4 lightingParameters; float4 baseColor; float4 surfaceParameters; uint4 pointLightIndices[4]; };
+		struct FragmentUniforms { float4 shadowParameters[3]; float4 lightingParameters; float4 baseColor; float4 surfaceParameters; float4 customData[4]; uint4 pointLightIndices[4]; };
 		#ifndef CUSTOM_FRAGMENT_NORMAL
 		void ModifyFragmentNormal(thread float3& normal, float3 baseWorldPosition, float3 worldPosition, float2 uv, float time) {}
 		#endif
-		float ShadowCoverage(float4 position, float4 parameters) {
+		float ShadowProjection(float4 position, float4 parameters, thread float2& uv, thread float& depth) {
 			if (parameters.x < 0.5) return 0.0;
 			float3 projected = position.xyz / position.w;
-			float2 uv = float2(projected.x * 0.5 + 0.5, 0.5 - projected.y * 0.5);
+			uv = float2(projected.x * 0.5 + 0.5, 0.5 - projected.y * 0.5);
+			depth = projected.z;
 			float border = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
 			if (projected.z < 0.0 || (projected.z > 1.0 && parameters.w < 0.5)) return 0.0;
 			return smoothstep(parameters.z * 2.0, parameters.z * 6.0, border);
 		}
-		float ShadowAmount(float4 position, depth2d<float> shadowMap, sampler shadowSampler, float4 parameters) {
-			if (ShadowCoverage(position, parameters) == 0.0) return 0.0;
-			float3 projected = position.xyz / position.w;
-			float2 uv = float2(projected.x * 0.5 + 0.5, 0.5 - projected.y * 0.5);
+		float ShadowTaps(float depth, float2 uv, depth2d<float> shadowMap, sampler shadowSampler, float4 parameters) {
 			float visibility = 0.0;
 			for (int y = 0; y < 2; ++y) {
-				for (int x = 0; x < 2; ++x) visibility += shadowMap.sample_compare(shadowSampler, uv + (float2(x, y) - 0.5) * parameters.z, min(projected.z, 1.0) - parameters.y);
+				for (int x = 0; x < 2; ++x) visibility += shadowMap.sample_compare(shadowSampler, uv + (float2(x, y) - 0.5) * parameters.z, min(depth, 1.0) - parameters.y);
 			}
 			return 1.0 - visibility * 0.25;
+		}
+		float ShadowAmount(float4 position, depth2d<float> shadowMap, sampler shadowSampler, float4 parameters) {
+			float2 uv;
+			float depth;
+			if (ShadowProjection(position, parameters, uv, depth) == 0.0) return 0.0;
+			return ShadowTaps(depth, uv, shadowMap, shadowSampler, parameters);
 		}
 		float PointShadowVisibility(float3 direction, float receiverDistance, float range, float bias, uint cubeIndex, depth2d_array<float> shadowMap, sampler shadowSampler) {
 			float faceDepth = max(max(abs(direction.x), abs(direction.y)), abs(direction.z)) * receiverDistance;
@@ -354,8 +305,7 @@ namespace Sapphire::Graphics::Shaders {
 			}
 			return shadowMap.sample_compare(shadowSampler, uv * 0.5 + 0.5, cubeIndex * 6u + face, compareDepth);
 		}
-		float PointShadowAmount(float3 direction, float range, float bias, uint cubeIndex, depth2d_array<float> shadowMap, sampler shadowSampler, float texelSize) {
-			float receiverDistance = length(direction);
+		float PointShadowAmount(float3 direction, float receiverDistance, float range, float bias, uint cubeIndex, depth2d_array<float> shadowMap, sampler shadowSampler, float texelSize) {
 			if (receiverDistance <= 0.0001 || receiverDistance >= range) return 0.0;
 			float3 normalizedDirection = direction / receiverDistance;
 			float3 axis = abs(normalizedDirection.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
@@ -457,20 +407,22 @@ namespace Sapphire::Graphics::Shaders {
 			}
 			float3 albedo = input.color.rgb * texel.rgb * uniforms.baseColor.rgb;
 			float roughness = clamp(uniforms.surfaceParameters.x * ((materialFlags & 2u) != 0u ? roughnessMap.sample(roughnessSampler, input.uv).r : 1.0), 0.045, 1.0);
-			float ao = (materialFlags & 4u) != 0u ? mix(1.0, aoMap.sample(aoSampler, input.uv).r, uniforms.surfaceParameters.z) : 1.0;
-			float metallic = uniforms.baseColor.w;
 			float3 view = frame.cameraPosition.xyz - input.worldPosition;
 			view *= rsqrt(max(dot(view, view), 0.000001));
-			float alphaSquared = roughness * roughness * roughness * roughness;
 			float nDotV = max(twoSided ? abs(dot(normal, view)) : dot(normal, view), 0.0001);
+			float ao = (materialFlags & 4u) != 0u ? mix(1.0, aoMap.sample(aoSampler, input.uv).r, uniforms.surfaceParameters.z) : 1.0;
+			float metallic = uniforms.baseColor.w;
+			float alphaSquared = roughness * roughness * roughness * roughness;
 			Surface surface{normal, view, albedo, mix(float3(0.04), albedo, metallic), metallic, alphaSquared, nDotV, sqrt(nDotV * nDotV * (1.0 - alphaSquared) + alphaSquared)};
 			float diffuse = max(twoSided ? abs(dot(normal, -frame.directionalDirection.xyz)) : dot(normal, -frame.directionalDirection.xyz), 0.0) * frame.directionalDirection.w;
 			bool directionalShadow = uniforms.lightingParameters.z > 0.5 && diffuse > 0.0;
 			float staticShadow = 0.0;
 			if (directionalShadow) {
-				float detailCoverage = ShadowCoverage(input.shadowPosition0, uniforms.shadowParameters[0]);
+				float2 detailUV;
+				float detailDepth;
+				float detailCoverage = ShadowProjection(input.shadowPosition0, uniforms.shadowParameters[0], detailUV, detailDepth);
 				if (detailCoverage < 1.0) staticShadow = ShadowAmount(input.shadowPosition1, fallbackMap, fallbackSampler, uniforms.shadowParameters[1]);
-				if (detailCoverage > 0.0) staticShadow = mix(staticShadow, ShadowAmount(input.shadowPosition0, detailMap, detailSampler, uniforms.shadowParameters[0]), detailCoverage);
+				if (detailCoverage > 0.0) staticShadow = mix(staticShadow, ShadowTaps(detailDepth, detailUV, detailMap, detailSampler, uniforms.shadowParameters[0]), detailCoverage);
 			}
 			float dynamicShadow = 0.0;
 			if (directionalShadow) dynamicShadow = ShadowAmount(input.shadowPosition2, dynamicMap, dynamicSampler, uniforms.shadowParameters[2]);
@@ -484,33 +436,30 @@ namespace Sapphire::Graphics::Shaders {
 				float distanceSquared = dot(toLight, toLight);
 				if (distanceSquared < positionRange.w * positionRange.w) {
 					float distanceToLight = sqrt(distanceSquared);
-					float pointDiffuse = max(twoSided ? abs(dot(normal, toLight / max(distanceToLight, 0.0001))) : dot(normal, toLight / max(distanceToLight, 0.0001)), 0.0);
+					float3 lightDirection = toLight / max(distanceToLight, 0.0001);
+					float pointDiffuse = max(twoSided ? abs(dot(normal, lightDirection)) : dot(normal, lightDirection), 0.0);
 					if (pointDiffuse <= 0.0) continue;
 					float rangeFade = clamp(1.0 - distanceToLight / positionRange.w, 0.0, 1.0);
 					float attenuation = rangeFade * rangeFade / max(distanceSquared, 1.0);
 					float4 shadowInfo = frame.pointLightShadowInfo[index];
 					float shadowBias = frame.pointLightShadowBias[index].x;
-					float staticPointShadow = uniforms.lightingParameters.z > 0.5 && shadowInfo.z > 0.5 ? PointShadowAmount(-toLight, positionRange.w, shadowBias, uint(shadowInfo.x), pointShadowMap, pointShadowSampler, uniforms.shadowParameters[0].z) : 0.0;
-					float dynamicPointShadow = uniforms.lightingParameters.z > 0.5 && shadowInfo.w > 0.5 ? PointShadowAmount(-toLight, positionRange.w, shadowBias, uint(shadowInfo.y), pointShadowMap, pointShadowSampler, uniforms.shadowParameters[0].z) : 0.0;
-					pointLighting += EvaluateLight(surface, toLight / max(distanceToLight, 0.0001), twoSided) * colorIntensity.rgb * colorIntensity.a * attenuation * (1.0 - staticPointShadow) * (1.0 - dynamicPointShadow);
+					bool staticShadowValid = uniforms.lightingParameters.z > 0.5 && shadowInfo.z > 0.5;
+					bool dynamicShadowValid = uniforms.lightingParameters.z > 0.5 && shadowInfo.w > 0.5;
+					float receiverDistance = staticShadowValid || dynamicShadowValid ? length(-toLight) : 0.0;
+					float staticPointShadow = staticShadowValid ? PointShadowAmount(-toLight, receiverDistance, positionRange.w, shadowBias, uint(shadowInfo.x), pointShadowMap, pointShadowSampler, uniforms.shadowParameters[0].z) : 0.0;
+					float dynamicPointShadow = dynamicShadowValid ? PointShadowAmount(-toLight, receiverDistance, positionRange.w, shadowBias, uint(shadowInfo.y), pointShadowMap, pointShadowSampler, uniforms.shadowParameters[0].z) : 0.0;
+					pointLighting += EvaluateLight(surface, lightDirection, twoSided) * colorIntensity.rgb * colorIntensity.a * attenuation * (1.0 - staticPointShadow) * (1.0 - dynamicPointShadow);
 				}
 			}
 			float3 ambient = frame.ambientLight.a > 0.5 ? frame.ambientLight.rgb : float3(0.0);
 			float3 color = albedo * ambient * ao * (1.0 - metallic) + direct + pointLighting;
+
 			color = frame.fogVolumeParameters.x > 0.5 ? color * fogTransmittance + fogScattering : mix(color, frame.fogColor.rgb, fog);
 			return float4(EncodeColor(color, frame, input.position.xy), opacity);
 		}
 	)";
 
-	inline const std::string shadowVertexShaderSource = deformationShaderSource + R"(
-		struct VertexInput { float3 position [[attribute(0)]]; float3 normal [[attribute(1)]]; float2 uv [[attribute(2)]]; float4 color [[attribute(3)]];
-		#if SKINNED
-		ushort4 boneIndices [[attribute(4)]]; float4 boneWeights [[attribute(5)]];
-		#endif
-		#if INSTANCED
-		float3 instancePosition [[attribute(4)]]; float3 instanceRotation [[attribute(5)]]; float3 instanceScale [[attribute(6)]]; float instanceData [[attribute(7)]];
-		#endif
-		};
+	inline const std::string shadowVertexShaderSource = deformationShaderSource + meshVertexPreparationSource + R"(
 		struct VertexOutput { float4 position [[position]]; float2 uv; };
 		struct ShadowUniforms { float4x4 mvp; float4x4 model; float4 displacementParameters; float4 uvTransform; float4 modifierTime; };
 		vertex VertexOutput main0(VertexInput input [[stage_in]], constant ShadowUniforms& uniforms [[buffer(0)]],
@@ -519,30 +468,16 @@ namespace Sapphire::Graphics::Shaders {
 		#endif
 		texture2d<float> heightMap [[texture(0)]], sampler heightSampler [[sampler(0)]], texture2d<float> maskMap [[texture(1)]], sampler maskSampler [[sampler(1)]]) {
 			VertexOutput output;
-			float2 uv = input.uv * uniforms.uvTransform.xy + uniforms.uvTransform.zw;
-			float3 localPosition = input.position;
-			float3 localNormal = input.normal;
-			float4 color = input.color;
+			float2 uv;
+			float3 localNormal;
+			float4 color;
+			float3 position;
+			float instanceData;
+			PrepareVertex(input, uniforms.uvTransform, uniforms.displacementParameters, uniforms.model,
 			#if SKINNED
-			float4 skinnedPosition = float4(0.0);
-			float3 skinnedNormal = float3(0.0);
-			for (uint influence = 0; influence < 4; ++influence) {
-				float weight = input.boneWeights[influence];
-				skinnedPosition += (boneMatrices[input.boneIndices[influence]] * float4(localPosition, 1.0)) * weight;
-				skinnedNormal += (boneMatrices[input.boneIndices[influence]] * float4(localNormal, 0.0)).xyz * weight;
-			}
-			localPosition = skinnedPosition.xyz;
-			localNormal = normalize(skinnedNormal);
+				boneMatrices,
 			#endif
-			#if INSTANCED
-			localPosition = input.instancePosition + InstanceRotate(localPosition * input.instanceScale, input.instanceRotation);
-			localNormal = InstanceNormal(localNormal, input.instanceScale, input.instanceRotation);
-			#endif
-			float3 position = Deform(localPosition, localNormal, uv, color, uniforms.model, uniforms.displacementParameters, heightMap, heightSampler, maskMap, maskSampler);
-			float instanceData = 0.0;
-			#if INSTANCED
-			instanceData = input.instanceData;
-			#endif
+				heightMap, heightSampler, maskMap, maskSampler, position, localNormal, uv, color, instanceData);
 			ModifyVertex(position, localNormal, color, instanceData, uniforms.modifierTime.x, uniforms.model);
 			output.position = uniforms.mvp * float4(position, 1.0);
 			output.uv = uv;
