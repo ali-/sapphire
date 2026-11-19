@@ -609,6 +609,7 @@ namespace Sapphire {
 		std::string displacementMaskTexturePath;
 		std::string vertexModifierSource;
 		std::string fragmentNormalSource;
+		std::string depthSurfaceSource;
 		float roughness = 1.0f;
 		float metallic = 0.0f;
 		float normalScale = 1.0f;
@@ -619,13 +620,17 @@ namespace Sapphire {
 		bool flipNormalY = false;
 		bool transparent = false;
 		bool unlit = false;
+		bool excludeFromSceneDepth = false;
+		bool singleLayer = false;
 		float opacity = 1.0f;
 		std::array<float, 16> customData{};
 
 		auto Key() const {
-			return std::tie(baseTexturePath, normalTexturePath, roughnessTexturePath, aoTexturePath, displacementTexturePath, displacementMaskTexturePath, vertexModifierSource, fragmentNormalSource, baseColor.x, baseColor.y, baseColor.z, roughness, metallic, normalScale, aoStrength, displacementScale, uvScale[0], uvScale[1], uvOffset[0], uvOffset[1], flipNormalY, transparent, unlit, opacity, customData);
+			return std::tie(baseTexturePath, normalTexturePath, roughnessTexturePath, aoTexturePath, displacementTexturePath, displacementMaskTexturePath, vertexModifierSource, fragmentNormalSource, depthSurfaceSource, baseColor.x, baseColor.y, baseColor.z, roughness, metallic, normalScale, aoStrength, displacementScale, uvScale[0], uvScale[1], uvOffset[0], uvOffset[1], flipNormalY, transparent, unlit, excludeFromSceneDepth, singleLayer, opacity, customData);
 		}
 
+		bool UsesSingleLayer() const { return transparent && singleLayer; }
+		bool HasShaderModifiers() const { return !vertexModifierSource.empty() || !fragmentNormalSource.empty() || !depthSurfaceSource.empty() || UsesSingleLayer(); }
 		bool operator<(const Material& other) const { return Key() < other.Key(); }
 
 	};
@@ -1437,6 +1442,90 @@ namespace Sapphire {
 					for (auto& instance : mesh.instances) instance.rotation = rotation;
 				}
 				mesh.MarkInstancesDirty();
+			}
+	};
+
+
+	namespace Graphics::Shaders {
+		extern const std::string waterVertexModifierSource;
+		extern const std::string waterSurfaceSource;
+	}
+
+	class WaterBody : public Object {
+		public:
+			using Object::Object;
+			float roughness = 0.25f;
+			float speed = 0.42f;
+			float direction = 0.0f;
+			Vector3 color{0.01f, 0.06f, 0.18f};
+			float opacity = 0.5f;
+			bool foam = true;
+
+			void Initialize() override {
+				if (!std::isfinite(roughness) || !std::isfinite(speed) || speed < 0.0f || !std::isfinite(direction) || !std::isfinite(opacity)) return;
+				if (!std::isfinite(transform.scale.x) || transform.scale.x == 0.0f || !std::isfinite(transform.scale.y) || transform.scale.y == 0.0f || !std::isfinite(transform.scale.z) || transform.scale.z < 0.0f) return;
+				const float seaState = std::clamp(roughness, 0.0f, 1.0f);
+				const float motion = std::min(seaState / 0.25f, 1.0f);
+				const float storm = std::max((seaState - 0.25f) / 0.75f, 0.0f);
+				auto blend = [storm](float calm, float rough) { return calm + (rough - calm) * storm; };
+				const float amplitude = motion * blend(0.48f, 2.65f);
+				const float spread = blend(51.0f, 43.0f);
+				const float wavelength = blend(16.0f, 52.0f);
+				const float waveSpeed = motion * speed;
+				const float rippleSpeed = waveSpeed * blend(0.28f / 0.42f, 0.65f / 1.10f);
+				const float steepness = blend(0.21f, 1.0f);
+				const int subdivisions = static_cast<int>(std::round(blend(512.0f, 576.0f)));
+				const float surfaceOpacity = std::clamp(opacity, 0.0f, 1.0f);
+				const int rowSize = subdivisions + 1;
+				MeshData data;
+				data.vertices.reserve(static_cast<std::size_t>(rowSize) * rowSize);
+				data.indices.reserve(static_cast<std::size_t>(subdivisions) * subdivisions * 6);
+				for (int y = 0; y <= subdivisions; ++y) {
+					for (int x = 0; x <= subdivisions; ++x) {
+					const float u = static_cast<float>(x) / subdivisions;
+					const float v = static_cast<float>(y) / subdivisions;
+						data.vertices.push_back({{u - 0.5f, v - 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {u, v}, {1.0f, 1.0f, 1.0f, surfaceOpacity}});
+					}
+				}
+				for (int y = 0; y < subdivisions; ++y) {
+					for (int x = 0; x < subdivisions; ++x) {
+					const std::uint32_t first = y * rowSize + x;
+					const std::uint32_t next = first + rowSize;
+					data.indices.insert(data.indices.end(), {first, next + 1, next, first, first + 1, next + 1});
+					}
+				}
+				auto& mesh = AddComponent<Mesh>();
+				mesh.data = std::move(data);
+				mesh.material.transparent = surfaceOpacity < 1.0f;
+				mesh.material.singleLayer = true;
+				mesh.material.baseColor = color;
+				mesh.material.roughness = 0.20f;
+				mesh.material.depthSurfaceSource = Graphics::Shaders::waterSurfaceSource;
+				mesh.material.customData = {
+					blend(0.30f, 0.65f), 8.0f, foam ? 1.0f : 0.0f, 0.0f,
+					blend(16.0f, 22.0f), motion * blend(0.028f, 0.059f), rippleSpeed, direction * Math::degreesToRadians,
+					blend(0.50f, 0.93f)
+				};
+				mesh.material.vertexModifierSource = Graphics::Shaders::waterVertexModifierSource;
+				auto& vertexSource = mesh.material.vertexModifierSource;
+				auto replaceMarker = [&](const char* marker, float value) {
+					const std::string replacement = std::to_string(value);
+					const auto length = std::char_traits<char>::length(marker);
+					for (auto position = vertexSource.find(marker); position != std::string::npos; position = vertexSource.find(marker, position + replacement.size())) {
+						vertexSource.replace(position, length, replacement);
+					}
+				};
+				replaceMarker("WAVE_SPEED", waveSpeed);
+				replaceMarker("WAVE_AMPLITUDE", amplitude);
+				replaceMarker("WAVE_DIRECTION", direction);
+				replaceMarker("WAVE_SPREAD", spread);
+				replaceMarker("WAVE_LENGTH", wavelength);
+				replaceMarker("WAVE_STEEPNESS", steepness);
+
+				mesh.vertexAnimated = true;
+				const float horizontalPadding = steepness * amplitude * transform.scale.z;
+				mesh.vertexBoundsPadding = {horizontalPadding / std::abs(transform.scale.x), horizontalPadding / std::abs(transform.scale.y), amplitude};
+				mesh.castShadows = false;
 			}
 	};
 

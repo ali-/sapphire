@@ -74,11 +74,17 @@ namespace Sapphire::Graphics::Shaders {
 		#if CUSTOM_FRAGMENT_NORMAL
 		float3 baseWorldPosition;
 		#endif
+		#if SINGLE_LAYER
+		uint layerInstance [[flat]];
+		#endif
 		};
-		struct ObjectUniforms { float4x4 mvp; float4x4 model; float4x4 normal; float4 displacementParameters; float4 uvTransform; float4 modifierTime; float4x4 shadowMvp[3]; float4 shadowState; };
+		struct ObjectUniforms { float4x4 mvp; float4x4 model; float4x4 normal; float4 displacementParameters; float4 uvTransform; float4 modifierTime; float4x4 shadowMvp[3]; float4 shadowState; uint4 layerParameters; };
 		vertex VertexOutput main0(VertexInput input [[stage_in]], constant ObjectUniforms& uniforms [[buffer(0)]],
 		#if SKINNED
 		device const float4x4* boneMatrices [[buffer(1)]],
+		#endif
+		#if SINGLE_LAYER
+		uint instanceID [[instance_id]],
 		#endif
 		texture2d<float> heightMap [[texture(0)]], sampler heightSampler [[sampler(0)]], texture2d<float> maskMap [[texture(1)]], sampler maskSampler [[sampler(1)]]) {
 			VertexOutput output;
@@ -97,6 +103,9 @@ namespace Sapphire::Graphics::Shaders {
 			#endif
 			ModifyVertex(position, localNormal, color, instanceData, uniforms.modifierTime.x, uniforms.model);
 			output.position = uniforms.mvp * float4(position, 1.0);
+			#if SINGLE_LAYER
+			output.layerInstance = uniforms.layerParameters.x + instanceID;
+			#endif
 			output.uv = uv;
 			output.color = color;
 			output.worldPosition = (uniforms.model * float4(position, 1.0)).xyz;
@@ -256,6 +265,9 @@ namespace Sapphire::Graphics::Shaders {
 		#if CUSTOM_FRAGMENT_NORMAL
 		float3 baseWorldPosition;
 		#endif
+		#ifdef SINGLE_LAYER_VISIBILITY_SLOT
+		uint layerInstance [[flat]];
+		#endif
 		};
 		struct FragmentUniforms { float4 shadowParameters[3]; float4 lightingParameters; float4 baseColor; float4 surfaceParameters; float4 customData[4]; uint4 pointLightIndices[4]; };
 		#ifndef CUSTOM_FRAGMENT_NORMAL
@@ -349,7 +361,18 @@ namespace Sapphire::Graphics::Shaders {
 		}
 
 
-		fragment float4 main0(FragmentInput input [[stage_in]], constant FragmentUniforms& uniforms [[buffer(0)]], constant FrameUniforms& frame [[buffer(1)]], texture2d<float> image [[texture(0)]], sampler imageSampler [[sampler(0)]], depth2d<float> detailMap [[texture(1)]], sampler detailSampler [[sampler(1)]], depth2d<float> fallbackMap [[texture(2)]], sampler fallbackSampler [[sampler(2)]], depth2d<float> dynamicMap [[texture(3)]], sampler dynamicSampler [[sampler(3)]], depth2d_array<float> pointShadowMap [[texture(4)]], sampler pointShadowSampler [[sampler(4)]], texture2d<float> normalMap [[texture(5)]], sampler normalSampler [[sampler(5)]], texture2d<float> roughnessMap [[texture(6)]], sampler roughnessSampler [[sampler(6)]], texture2d<float> aoMap [[texture(7)]], sampler aoSampler [[sampler(7)]], texture3d<float> fogVolumeMap [[texture(8)]], sampler fogVolumeSampler [[sampler(8)]]) {
+		fragment float4 main0(FragmentInput input [[stage_in]], constant FragmentUniforms& uniforms [[buffer(0)]], constant FrameUniforms& frame [[buffer(1)]], texture2d<float> image [[texture(0)]], sampler imageSampler [[sampler(0)]], depth2d<float> detailMap [[texture(1)]], sampler detailSampler [[sampler(1)]], depth2d<float> fallbackMap [[texture(2)]], sampler fallbackSampler [[sampler(2)]], depth2d<float> dynamicMap [[texture(3)]], sampler dynamicSampler [[sampler(3)]], depth2d_array<float> pointShadowMap [[texture(4)]], sampler pointShadowSampler [[sampler(4)]], texture2d<float> normalMap [[texture(5)]], sampler normalSampler [[sampler(5)]], texture2d<float> roughnessMap [[texture(6)]], sampler roughnessSampler [[sampler(6)]], texture2d<float> aoMap [[texture(7)]], sampler aoSampler [[sampler(7)]], texture3d<float> fogVolumeMap [[texture(8)]], sampler fogVolumeSampler [[sampler(8)]]
+		#if CUSTOM_DEPTH_SURFACE
+			, depth2d<float> sceneDepth [[texture(9)]]
+		#endif
+		#ifdef SINGLE_LAYER_VISIBILITY_SLOT
+			, texture2d<uint, access::read> layerVisibility [[texture(SINGLE_LAYER_VISIBILITY_SLOT)]], uint primitiveID [[primitive_id]]
+		#endif
+		) {
+			#ifdef SINGLE_LAYER_VISIBILITY_SLOT
+			uint2 nearest = layerVisibility.read(uint2(input.position.xy)).xy;
+			bool behindNearest = nearest.x != 0u && any(nearest != uint2(input.layerInstance, primitiveID));
+			#endif
 			uint materialFlags = uint(uniforms.lightingParameters.x);
 			bool twoSided = (materialFlags & 32u) != 0u;
 			float3 normal = (materialFlags & 16u) != 0u ? float3(0.0) : normalize(input.worldNormal);
@@ -399,6 +422,9 @@ namespace Sapphire::Graphics::Shaders {
 				fogTransmittance = 1.0 - fog;
 			}
 			float opacity = input.color.a * texel.a * uniforms.lightingParameters.y;
+			#ifdef SINGLE_LAYER_VISIBILITY_SLOT
+			if (behindNearest && ((materialFlags & 16u) != 0u || (fog >= 1.0 && frame.fogVolumeParameters.x < 0.5))) discard_fragment();
+			#endif
 			if (fog >= 1.0 && frame.fogVolumeParameters.x < 0.5) return float4(EncodeColor(frame.fogColor.rgb, frame, input.position.xy), opacity);
 			if ((materialFlags & 16u) != 0u) {
 				float3 tint = input.color.rgb * uniforms.baseColor.rgb * texel.rgb;
@@ -409,6 +435,26 @@ namespace Sapphire::Graphics::Shaders {
 			float roughness = clamp(uniforms.surfaceParameters.x * ((materialFlags & 2u) != 0u ? roughnessMap.sample(roughnessSampler, input.uv).r : 1.0), 0.045, 1.0);
 			float3 view = frame.cameraPosition.xyz - input.worldPosition;
 			view *= rsqrt(max(dot(view, view), 0.000001));
+			float3 surfaceRadiance = float3(0.0);
+			#if CUSTOM_DEPTH_SURFACE
+			constexpr sampler depthSampler(coord::normalized, address::clamp_to_edge, filter::nearest);
+			float depth = sceneDepth.sample(depthSampler, input.position.xy / frame.fogScreenParameters.xy, level(0.0));
+			float opaqueDistance = -1.0;
+			if (depth < 1.0 && frame.cameraForward.w > 0.5) {
+				float nearClip = frame.fogViewParameters.z;
+				float farClip = frame.fogViewParameters.w;
+				float range = farClip - nearClip;
+				float opaqueViewDepth = nearClip * farClip / (farClip - depth * range);
+				float surfaceViewDepth = nearClip * farClip / (farClip - input.position.z * range);
+				opaqueDistance = max(opaqueViewDepth - surfaceViewDepth, 0.0) / max(dot(-view, frame.cameraForward.xyz), 0.0001);
+			}
+			ModifyDepthSurface(albedo, normal, roughness, surfaceRadiance, input.worldPosition, view, opaqueDistance, uniforms.customData, frame);
+			normal = normalize(normal);
+			roughness = clamp(roughness, 0.045, 1.0);
+			#endif
+			#ifdef SINGLE_LAYER_VISIBILITY_SLOT
+			if (behindNearest) discard_fragment();
+			#endif
 			float nDotV = max(twoSided ? abs(dot(normal, view)) : dot(normal, view), 0.0001);
 			float ao = (materialFlags & 4u) != 0u ? mix(1.0, aoMap.sample(aoSampler, input.uv).r, uniforms.surfaceParameters.z) : 1.0;
 			float metallic = uniforms.baseColor.w;
@@ -452,7 +498,7 @@ namespace Sapphire::Graphics::Shaders {
 				}
 			}
 			float3 ambient = frame.ambientLight.a > 0.5 ? frame.ambientLight.rgb : float3(0.0);
-			float3 color = albedo * ambient * ao * (1.0 - metallic) + direct + pointLighting;
+			float3 color = albedo * ambient * ao * (1.0 - metallic) + direct + pointLighting + surfaceRadiance;
 
 			color = frame.fogVolumeParameters.x > 0.5 ? color * fogTransmittance + fogScattering : mix(color, frame.fogColor.rgb, fog);
 			return float4(EncodeColor(color, frame, input.position.xy), opacity);
@@ -498,6 +544,16 @@ namespace Sapphire::Graphics::Shaders {
 		#endif
 	)";
 
+	inline constexpr const char* layerDepthFragmentShaderSource = R"(
+		#include <metal_stdlib>
+		using namespace metal;
+		struct FragmentInput { float4 position [[position]]; float2 uv; float4 color; uint layerInstance [[flat]]; };
+		fragment uint2 main0(FragmentInput input [[stage_in]], constant float4& opacity [[buffer(0)]], texture2d<float> image [[texture(0)]], sampler imageSampler [[sampler(0)]], uint primitiveID [[primitive_id]]) {
+			if (input.color.a * image.sample(imageSampler, input.uv).a * opacity.x <= 0.0) discard_fragment();
+			return uint2(input.layerInstance, primitiveID);
+		}
+	)";
+
 	inline constexpr const char* vertexSource = R"(using namespace metal;
 	struct Input { float3 position [[attribute(0)]]; };
 	struct Output { float4 position [[position]]; };
@@ -528,6 +584,144 @@ namespace Sapphire::Graphics::Shaders {
 		fragment float4 main0(FragmentInput input [[stage_in]],
 			texture2d<float> image [[texture(0)]], sampler imageSampler [[sampler(0)]]) {
 			return image.sample(imageSampler, input.uv);
+		}
+	)";
+
+	inline const std::string waterVertexModifierSource = R"(
+		constant float waveWeights[8] = {0.23, 0.19, 0.16, 0.13, 0.10, 0.08, 0.065, 0.045};
+		constant float stormWeights[8] = {0.31, 0.24, 0.17, 0.095, 0.062, 0.05, 0.041, 0.032};
+		constant float waveFrequencies[8] = {0.54, 0.78, 0.91, 1.16, 1.37, 1.59, 1.83, 2.07};
+		constant float waveHeadings[8] = {0.14, -0.48, 0.75, -0.95, -0.16, 0.53, -0.71, 0.98};
+		constant float stormHeadingOffsets[8] = {0.0, 0.0, 48.0, 0.0, 0.0, 52.0, 0.0, 35.0};
+		constant float wavePhases[8] = {0.0, 1.7, 4.1, 2.8, 5.2, 0.9, 3.5, 5.8};
+
+		void ModifyVertex(thread float3& position, thread float3& normal, thread float4& color, float instanceData, float time, float4x4 model) {
+			float2 world = (model * float4(position, 1.0)).xy;
+			float heightScale = length(model[2].xyz) * WAVE_AMPLITUDE;
+			float storm = smoothstep(0.25, 0.9, WAVE_STEEPNESS);
+			float secondHarmonic = 0.24 * storm;
+			float crestLean = 0.08 * storm;
+			float profileScale = 1.0 / (1.0 + secondHarmonic + crestLean);
+			float compressionLimit = mix(0.72, 0.87, storm);
+			float localHeight = 0.0;
+			float2 horizontal = float2(0.0);
+			float3 tangentX = float3(1.0, 0.0, 0.0);
+			float3 tangentY = float3(0.0, 1.0, 0.0);
+			for (int i = 0; i < 8; ++i) {
+				float headingSpread = mix(1.0, i < 3 ? 0.32 : 0.82, storm);
+				float heading = WAVE_DIRECTION + WAVE_SPREAD * waveHeadings[i] * headingSpread + storm * stormHeadingOffsets[i];
+				float angle = heading * 0.01745329252;
+				float2 direction = float2(cos(angle), sin(angle));
+				float2 crosswind = float2(-direction.y, direction.x);
+				float waveNumber = (6.28318530718 / WAVE_LENGTH) * waveFrequencies[i];
+				float2 carrier = direction * waveNumber;
+				float travel = time * WAVE_SPEED * sqrt(9.81 * waveNumber);
+				float phase = dot(world, carrier) - travel + wavePhases[i];
+				float2 envelopeAxis = waveNumber * (0.14 * direction + 0.26 * crosswind * waveHeadings[i]);
+				float groupTravel = 0.5 * travel * dot(envelopeAxis, direction) / waveNumber;
+				float groupPhase = dot(world, envelopeAxis) - mix(travel * 0.17, groupTravel, storm) + wavePhases[i] * 1.81;
+				float envelope = 0.68 + 0.32 * cos(groupPhase);
+				float2 envelopeGradient = -0.32 * sin(groupPhase) * envelopeAxis;
+				float weight = mix(waveWeights[i], stormWeights[i], storm);
+				float sine = sin(phase);
+				float cosine = cos(phase);
+				float sineTwice = 2.0 * sine * cosine;
+				float cosineTwice = cosine * cosine - sine * sine;
+				float profile = (sine - secondHarmonic * cosineTwice + crestLean * sineTwice) * profileScale;
+				float profileSlope = (cosine + 2.0 * (secondHarmonic * sineTwice + crestLean * cosineTwice)) * profileScale;
+				float horizontalAmplitude = weight * min(WAVE_STEEPNESS * heightScale, compressionLimit / waveNumber);
+				localHeight += WAVE_AMPLITUDE * weight * envelope * profile;
+				horizontal += direction * (horizontalAmplitude * envelope * cosine);
+				float2 verticalSlope = heightScale * weight * (envelope * profileSlope * carrier + profile * envelopeGradient);
+				float2 horizontalSlope = horizontalAmplitude * (cosine * envelopeGradient - envelope * sine * carrier);
+				tangentX += float3(direction * horizontalSlope.x, verticalSlope.x);
+				tangentY += float3(direction * horizontalSlope.y, verticalSlope.y);
+			}
+			float3 worldNormal = cross(tangentX, tangentY);
+			if (heightScale > 0.0001) {
+				normal = float3(dot(model[0].xyz, worldNormal), dot(model[1].xyz, worldNormal), dot(model[2].xyz, worldNormal));
+			}
+
+			float3 offset = float3(horizontal, 0.0);
+			position.x += dot(offset, model[0].xyz) / max(dot(model[0].xyz, model[0].xyz), 0.00000001);
+			position.y += dot(offset, model[1].xyz) / max(dot(model[1].xyz, model[1].xyz), 0.00000001);
+			position.z += localHeight;
+		}
+	)";
+
+	inline const std::string waterSurfaceSource = R"(
+		float4 RippleRandom(int2 cell) {
+			uint2 key = uint2(cell);
+			uint state = (key.x * 1597334677u ^ key.y * 3812015801u) * 747796405u + 2891336453u;
+			uint bits = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+			bits ^= bits >> 22u;
+			return float4(uint4(bits, bits >> 8u, bits >> 16u, bits >> 24u) & 255u) / 255.0;
+		}
+
+		float2 RippleSlope(float2 position, float time, float coverage) {
+			float visible = 1.0 - smoothstep(0.06, 0.20, max(fwidth(position.x), fwidth(position.y)));
+			if (visible <= 0.0) return float2(0.0);
+			int2 cell = int2(floor(position));
+			float2 slope = float2(0.0);
+			for (int corner = 0; corner < 4; ++corner) {
+				int2 anchor = cell + int2(corner & 1, corner >> 1);
+				float4 random = RippleRandom(anchor);
+				float2 offset = position - float2(anchor) - (random.xy - 0.5) * 0.42;
+				float radius = mix(0.24, 0.58, coverage) * mix(0.82, 1.12, random.z);
+				float inverseRadiusSquared = 1.0 / (radius * radius);
+				float envelope = 1.0 - dot(offset, offset) * inverseRadiusSquared;
+				if (envelope <= 0.0) continue;
+
+				float heading = (random.z - 0.5) * 1.65;
+				float2 direction = float2(cos(heading), sin(heading));
+				float waveNumber = mix(9.0, 17.0, random.y);
+				float seedPhase = random.w * 6.2831853;
+				float phase = dot(offset, direction) * waveNumber - time * mix(0.8, 2.1, random.x) + seedPhase;
+				float lifetime = mix(0.22, 1.0, smoothstep(-0.50, 0.78, sin(time * mix(0.55, 0.95, random.w) + seedPhase)));
+				float2 carrierSlope = direction * (cos(phase) * envelope * envelope);
+				float2 envelopeSlope = offset * (-4.0 * inverseRadiusSquared * envelope * sin(phase) / waveNumber);
+				slope += (carrierSlope + envelopeSlope) * lifetime;
+			}
+			return slope * visible;
+		}
+
+		void ModifyDepthSurface(thread float3& albedo, thread float3& normal, thread float& roughness, thread float3& radiance,
+			float3 position, float3 view, float opaqueDistance, constant float4* parameters, constant FrameUniforms& frame) {
+			float4 shoreline = parameters[0];
+			float4 ripples = parameters[1];
+			float time = frame.modifierTime.x;
+			float rippleTime = time * ripples.z;
+			float2 direction = float2(cos(ripples.w), sin(ripples.w));
+			float2 crosswind = float2(-direction.y, direction.x);
+			float2 ripplePosition = float2(dot(position.xy, direction), dot(position.xy, crosswind));
+			ripplePosition = (ripplePosition - float2(rippleTime, rippleTime * 0.18)) / ripples.x;
+			float2 slope = RippleSlope(ripplePosition, rippleTime, parameters[2].x);
+			float2 worldSlope = direction * slope.x + crosswind * slope.y;
+			float3 swellNormal = normal;
+			normal = normalize(normal - float3(worldSlope * ripples.y, 0.0));
+
+			float depth = opaqueDistance < 0.0 ? shoreline.y : opaqueDistance * max(abs(view.z), 0.25);
+			float shallows = 1.0 - smoothstep(0.0, shoreline.y, depth);
+			float3 waterColor = albedo;
+			albedo = mix(albedo, mix(waterColor, float3(0.55, 0.72, 0.77), 0.5), shallows * 0.58);
+
+			float contactFilter = fwidth(max(opaqueDistance, 0.0));
+			float foam = 0.0;
+			if (shoreline.z > 0.5 && shoreline.x > 0.0 && opaqueDistance >= 0.0) {
+				float pulse = sin(dot(position.xy, float2(3.2, 2.1)) - rippleTime * 4.0);
+				float breakup = sin(dot(position.xy, float2(-4.1, 3.3)) + rippleTime * 3.1);
+				float width = shoreline.x * (0.75 + 0.16 * pulse + 0.09 * breakup);
+				float contact = 1.0 - smoothstep(width * 0.35, width + min(contactFilter, width * 0.25), opaqueDistance);
+				foam = contact * (0.53 + 0.19 * pulse + 0.17 * breakup);
+			}
+			albedo = mix(albedo, mix(waterColor, float3(1.0), 0.48), foam);
+			roughness = mix(roughness, 0.65, foam);
+			float3 sheenNormal = normalize(mix(swellNormal, normal, 0.45));
+			float grazing = 1.0 - saturate(dot(sheenNormal, view));
+			float fresnel = 0.02 + 0.98 * pow(grazing, 5.0);
+			float horizon = 1.0 - saturate(reflect(-view, sheenNormal).z);
+			float sheenStrength = clamp(dot(waterColor, float3(0.2126, 0.7152, 0.0722)) * 8.0, 0.35, 1.0);
+			radiance = frame.ambientLight.rgb * frame.ambientLight.a * sheenStrength * (fresnel + 0.22 * horizon) * (1.0 - foam);
 		}
 	)";
 }

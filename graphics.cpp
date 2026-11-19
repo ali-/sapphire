@@ -88,6 +88,7 @@ namespace Sapphire::Graphics {
 			float modifierTime[4];
 			float shadowMvp[shadowMapCount][16];
 			float shadowState[4];
+			Uint32 layerParameters[4];
 		};
 
 		struct FragmentUniforms {
@@ -306,12 +307,17 @@ namespace Sapphire::Graphics {
 		struct MeshPipelines {
 			SDL_GPUGraphicsPipeline* main[3][2][2]{};
 			SDL_GPUGraphicsPipeline* transparent[3][2]{};
+			SDL_GPUGraphicsPipeline* layerDepth[3][2]{};
 			SDL_GPUGraphicsPipeline* shadow[3][2][2]{};
 		};
 		MeshPipelines meshPipelines;
-		std::map<std::tuple<std::string, std::string, bool>, MeshPipelines> modifierPipelines;
+		std::map<std::tuple<std::string, std::string, std::string, bool, bool>, MeshPipelines> modifierPipelines;
 		MeshPipelines& GetModifierPipelines(const Material& material, bool skinned = false);
 		SDL_GPUTexture* depthTexture = nullptr;
+		SDL_GPUTexture* sceneDepthTexture = nullptr;
+		SDL_GPUTexture* layerDepthTexture = nullptr;
+		SDL_GPUTexture* layerVisibilityTexture = nullptr;
+		constexpr SDL_GPUTextureFormat layerVisibilityFormat = SDL_GPU_TEXTUREFORMAT_R32G32_UINT;
 		SDL_GPUTexture* emptyShadowTexture = nullptr;
 		SDL_GPUTexture* dynamicShadowTexture = nullptr;
 		SDL_GPUTexture* fallbackShadowTexture = nullptr;
@@ -1396,11 +1402,11 @@ namespace Sapphire::Graphics {
 			gpuMesh.geometryDirty = false;
 		}
 
-		SDL_GPUTexture* CreateDepthTexture(Uint32 width, Uint32 height) {
+		SDL_GPUTexture* CreateDepthTexture(Uint32 width, Uint32 height, bool sampleable = false) {
 			SDL_GPUTextureCreateInfo textureInfo{};
 			textureInfo.type = SDL_GPU_TEXTURETYPE_2D;
 			textureInfo.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
-			textureInfo.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
+			textureInfo.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET | (sampleable ? SDL_GPU_TEXTUREUSAGE_SAMPLER : 0);
 			textureInfo.width = width;
 			textureInfo.height = height;
 			textureInfo.layer_count_or_depth = 1;
@@ -1685,9 +1691,9 @@ namespace Sapphire::Graphics {
 			const auto signature = MeshSignature(object, *mesh);
 			if (!inserted && source.signature == signature && !instancesChanged && (!rebuildAll || !source.batched)) return &source;
 			if (mesh->materials.empty()) {
-				if (!mesh->material.vertexModifierSource.empty() || !mesh->material.fragmentNormalSource.empty()) GetModifierPipelines(mesh->material, mesh->IsSkinned());
+				if (mesh->material.HasShaderModifiers()) GetModifierPipelines(mesh->material, mesh->IsSkinned());
 			}
-			else for (const auto& material : mesh->materials) if (!material.vertexModifierSource.empty() || !material.fragmentNormalSource.empty()) GetModifierPipelines(material, mesh->IsSkinned());
+			else for (const auto& material : mesh->materials) if (material.HasShaderModifiers()) GetModifierPipelines(material, mesh->IsSkinned());
 			const auto spatialSignature = SpatialSignature(object, *mesh);
 			const auto shadowSignature = ShadowSignature(object, *mesh);
 			const bool shadowChanged = inserted || source.shadowSignature != shadowSignature || instancesChanged;
@@ -2320,7 +2326,7 @@ namespace Sapphire::Graphics {
 		return layouts.data();
 	}
 
-	void BuildMeshPipelines(MeshPipelines& family, int mode, SDL_GPUShader* vertex, SDL_GPUShader* shadowVertex, SDL_GPUShader* const (&fragments)[2], SDL_GPUShader* const (&shadowFragments)[2]) {
+	void BuildMeshPipelines(MeshPipelines& family, int mode, SDL_GPUShader* vertex, SDL_GPUShader* shadowVertex, SDL_GPUShader* const (&fragments)[2], SDL_GPUShader* const (&shadowFragments)[2], SDL_GPUShader* layerFragment = nullptr) {
 		const MeshVertexLayout& layout = GetMeshVertexLayouts()[mode];
 		SDL_GPUColorTargetDescription color{};
 		color.format = pipelineColorFormat;
@@ -2357,13 +2363,26 @@ namespace Sapphire::Graphics {
 		}
 		color.blend_state.enable_blend = false;
 		info.depth_stencil_state.enable_depth_write = true;
+		info.target_info.num_color_targets = 0;
+		info.target_info.color_target_descriptions = nullptr;
+		if (layerFragment) {
+			SDL_GPUColorTargetDescription visibility{};
+			visibility.format = layerVisibilityFormat;
+			info.target_info.num_color_targets = 1;
+			info.target_info.color_target_descriptions = &visibility;
+			info.fragment_shader = layerFragment;
+			for (int cull = 0; cull < 2; ++cull) {
+				info.rasterizer_state.cull_mode = cull ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_NONE;
+				family.layerDepth[mode][cull] = CreatePipeline(gpuDevice, info);
+			}
+			info.target_info.num_color_targets = 0;
+			info.target_info.color_target_descriptions = nullptr;
+		}
 		info.vertex_shader = shadowVertex;
 		info.rasterizer_state.front_face = SDL_GPU_FRONTFACE_CLOCKWISE;
 		info.rasterizer_state.enable_depth_bias = true;
 		info.rasterizer_state.depth_bias_constant_factor = 2.0f;
 		info.rasterizer_state.depth_bias_slope_factor = shadowSlopeFactor;
-		info.target_info.num_color_targets = 0;
-		info.target_info.color_target_descriptions = nullptr;
 		for (int masked = 0; masked < 2; ++masked) {
 			info.fragment_shader = shadowFragments[masked];
 			for (int cull = 0; cull < 2; ++cull) {
@@ -2379,6 +2398,10 @@ namespace Sapphire::Graphics {
 			pipeline = nullptr;
 		}
 		for (auto& mode : family.transparent) for (auto*& pipeline : mode) {
+			if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
+			pipeline = nullptr;
+		}
+		for (auto& mode : family.layerDepth) for (auto*& pipeline : mode) {
 			if (pipeline) SDL_ReleaseGPUGraphicsPipeline(gpuDevice, pipeline);
 			pipeline = nullptr;
 		}
@@ -2450,7 +2473,9 @@ namespace Sapphire::Graphics {
 	MeshPipelines& GetModifierPipelines(const Material& material, bool skinned) {
 		const std::string& vertexSource = material.vertexModifierSource;
 		const std::string& normalSource = material.fragmentNormalSource;
-		auto [entry, inserted] = modifierPipelines.try_emplace(std::make_tuple(vertexSource, normalSource, skinned));
+		const std::string& surfaceSource = material.depthSurfaceSource;
+		const bool singleLayer = material.UsesSingleLayer();
+		auto [entry, inserted] = modifierPipelines.try_emplace(std::make_tuple(vertexSource, normalSource, surfaceSource, skinned, singleLayer));
 		if (!inserted) return entry->second;
 		auto& family = entry->second;
 		SDL_GPUShader* vertex[2]{};
@@ -2459,6 +2484,7 @@ namespace Sapphire::Graphics {
 		SDL_GPUShader* skinnedShadowVertex = nullptr;
 		SDL_GPUShader* fragment[2]{};
 		SDL_GPUShader* shadowFragment[2]{};
+		SDL_GPUShader* layerFragment = nullptr;
 		auto releaseShaders = [&] {
 			for (auto* shader : vertex) if (shader) SDL_ReleaseGPUShader(gpuDevice, shader);
 			for (auto* shader : shadowVertex) if (shader) SDL_ReleaseGPUShader(gpuDevice, shader);
@@ -2466,11 +2492,13 @@ namespace Sapphire::Graphics {
 			if (skinnedShadowVertex) SDL_ReleaseGPUShader(gpuDevice, skinnedShadowVertex);
 			for (auto* shader : fragment) if (shader) SDL_ReleaseGPUShader(gpuDevice, shader);
 			for (auto* shader : shadowFragment) if (shader) SDL_ReleaseGPUShader(gpuDevice, shader);
+			if (layerFragment) SDL_ReleaseGPUShader(gpuDevice, layerFragment);
 		};
 		try {
+			const std::string layerVertexPrefix = singleLayer ? "#define SINGLE_LAYER 1\n" : "";
 			for (int instanced = 0; instanced < 2; ++instanced) {
 				const std::string prefix = std::string(instanced ? "#define INSTANCED 1\n" : "") + (vertexSource.empty() ? "" : "#define CUSTOM_MODIFIER 1\n") + (normalSource.empty() ? "" : "#define CUSTOM_FRAGMENT_NORMAL 1\n");
-				const std::string mainSource = prefix + deformationShaderSource + vertexSource + vertexShaderSource.substr(deformationShaderSource.size());
+				const std::string mainSource = prefix + layerVertexPrefix + deformationShaderSource + vertexSource + vertexShaderSource.substr(deformationShaderSource.size());
 				const std::string shadowSource = prefix + deformationShaderSource + vertexSource + shadowVertexShaderSource.substr(deformationShaderSource.size());
 				vertex[instanced] = CreateShader(gpuDevice, mainSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
 				shadowVertex[instanced] = CreateShader(gpuDevice, shadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
@@ -2478,21 +2506,28 @@ namespace Sapphire::Graphics {
 			}
 			if (skinned) {
 				const std::string skinnedPrefix = std::string("#define SKINNED 1\n") + (vertexSource.empty() ? "" : "#define CUSTOM_MODIFIER 1\n") + (normalSource.empty() ? "" : "#define CUSTOM_FRAGMENT_NORMAL 1\n");
-				const std::string skinnedMainSource = skinnedPrefix + deformationShaderSource + vertexSource + vertexShaderSource.substr(deformationShaderSource.size());
+				const std::string skinnedMainSource = skinnedPrefix + layerVertexPrefix + deformationShaderSource + vertexSource + vertexShaderSource.substr(deformationShaderSource.size());
 				const std::string skinnedShadowSource = skinnedPrefix + deformationShaderSource + vertexSource + shadowVertexShaderSource.substr(deformationShaderSource.size());
 				skinnedVertex = CreateShader(gpuDevice, skinnedMainSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1, 1);
 				skinnedShadowVertex = CreateShader(gpuDevice, skinnedShadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1, 1);
 				if (!skinnedVertex || !skinnedShadowVertex) throw std::runtime_error(std::string("Compile skinned vertex modifier: ") + SDL_GetError());
 			}
+			if (singleLayer) {
+				layerFragment = CreateShader(gpuDevice, layerDepthFragmentShaderSource, SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 1, 1);
+				if (!layerFragment) throw std::runtime_error(std::string("Compile layer depth fragment shader: ") + SDL_GetError());
+			}
 			for (int masked = 0; masked < 2; ++masked) {
 				const std::string prefix = std::string(masked ? "#define ALPHA_MASKED 1\n" : "#define ALPHA_MASKED 0\n") + (normalSource.empty() ? "" : "#define CUSTOM_FRAGMENT_NORMAL 1\n");
-				const std::string mainSource = prefix + fogCommonShaderSource + normalSource + fragmentShaderSource.substr(fogCommonShaderSource.size());
-				fragment[masked] = CreateShader(gpuDevice, mainSource.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 9, 2);
+				const std::string depthPrefix = surfaceSource.empty() ? "" : "#define CUSTOM_DEPTH_SURFACE 1\n";
+				const Uint32 layerSlot = surfaceSource.empty() ? 9 : 10;
+				const std::string layerPrefix = singleLayer ? "#define SINGLE_LAYER_VISIBILITY_SLOT " + std::to_string(layerSlot) + "\n" : "";
+				const std::string mainSource = prefix + depthPrefix + layerPrefix + fogCommonShaderSource + normalSource + surfaceSource + fragmentShaderSource.substr(fogCommonShaderSource.size());
+				fragment[masked] = CreateShader(gpuDevice, mainSource.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, layerSlot + singleLayer, 2);
 				shadowFragment[masked] = CreateShader(gpuDevice, (prefix + shadowFragmentShaderSource).c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, masked ? 1 : 0);
 				if (!fragment[masked] || !shadowFragment[masked]) throw std::runtime_error(std::string("Compile modifier pipeline fragment shader: ") + SDL_GetError());
 			}
-			for (int instanced = 0; instanced < 2; ++instanced) BuildMeshPipelines(family, instanced, vertex[instanced], shadowVertex[instanced], fragment, shadowFragment);
-			if (skinned) BuildMeshPipelines(family, 2, skinnedVertex, skinnedShadowVertex, fragment, shadowFragment);
+			for (int instanced = 0; instanced < 2; ++instanced) BuildMeshPipelines(family, instanced, vertex[instanced], shadowVertex[instanced], fragment, shadowFragment, layerFragment);
+			if (skinned) BuildMeshPipelines(family, 2, skinnedVertex, skinnedShadowVertex, fragment, shadowFragment, layerFragment);
 		}
 		catch (...) {
 			releaseShaders();
@@ -2685,7 +2720,7 @@ namespace Sapphire::Graphics {
 		slowFrameTime = sorted[frameSampleCount - 1];
 	}
 
-	static void SortDraws() {
+	static auto SortDraws() {
 		const auto transparent = std::partition(visibleItems.begin(), visibleItems.end(), [](const RenderItem* item) { return !item->mesh->GetMaterial(item->materialIndex).transparent; });
 		std::sort(visibleItems.begin(), transparent, [](const RenderItem* left, const RenderItem* right) {
 			if (left->depthBucket != right->depthBucket) return left->depthBucket < right->depthBucket;
@@ -2698,6 +2733,7 @@ namespace Sapphire::Graphics {
 			return left->viewDepth < right->viewDepth;
 		});
 		std::sort(transparent, visibleItems.end(), [](const RenderItem* left, const RenderItem* right) { return left->viewDepth > right->viewDepth; });
+		return transparent;
 	}
 
 	void Render(Scene& scene, SDL_GPUCommandBuffer* commandBuffer, SDL_GPUTexture* colorTarget, Uint32 width, Uint32 height) {
@@ -2731,6 +2767,12 @@ namespace Sapphire::Graphics {
 		EnsureDirectionalShadowTextures(directionalShadowsActive, directionalShadowsActive && light->renderStatic);
 		if (depthWidth != width || depthHeight != height) {
 			if (depthTexture) ReleaseTexture(gpuDevice, depthTexture);
+			if (sceneDepthTexture) ReleaseTexture(gpuDevice, sceneDepthTexture);
+			if (layerDepthTexture) ReleaseTexture(gpuDevice, layerDepthTexture);
+			if (layerVisibilityTexture) ReleaseTexture(gpuDevice, layerVisibilityTexture);
+			sceneDepthTexture = nullptr;
+			layerDepthTexture = nullptr;
+			layerVisibilityTexture = nullptr;
 			depthTexture = CreateDepthTexture(width, height);
 			depthWidth = width;
 			depthHeight = height;
@@ -2954,6 +2996,7 @@ namespace Sapphire::Graphics {
 		frame.cameraForward[0] = frustum.forward.x;
 		frame.cameraForward[1] = frustum.forward.y;
 		frame.cameraForward[2] = frustum.forward.z;
+		frame.cameraForward[3] = scene.activeCamera ? 1.0f : 0.0f;
 		frame.ambientLight[0] = scene.ambientLightColor.x;
 		frame.ambientLight[1] = scene.ambientLightColor.y;
 		frame.ambientLight[2] = scene.ambientLightColor.z;
@@ -3041,7 +3084,108 @@ namespace Sapphire::Graphics {
 				volumetricFogSupported = false;
 			}
 		}
+		const auto transparent = SortDraws();
+		auto makeObjectUniforms = [&](const RenderItem& item, const GpuMeshMaterial& material) {
+			ObjectUniforms uniforms{};
+			const Matrix4 mvp = Multiply(viewProjection, item.model);
+			std::memcpy(uniforms.mvp, mvp.values, sizeof(uniforms.mvp));
+			std::memcpy(uniforms.model, item.model.values, sizeof(uniforms.model));
+			std::memcpy(uniforms.normal, item.normal.values, sizeof(uniforms.normal));
+			uniforms.displacementParameters[0] = material.displacementScale;
+			std::memcpy(uniforms.uvTransform, material.uv, sizeof(uniforms.uvTransform));
+			uniforms.modifierTime[0] = frameTime;
+			return uniforms;
+		};
+		auto bindMeshBuffers = [](SDL_GPURenderPass* pass, const RenderItem& item, BufferBindings& buffers, SkeletonBindings& skeletons) {
+			const GpuMesh& gpu = *item.gpu;
+			buffers.Bind(pass, gpu);
+			if (item.skeleton) {
+				const SDL_GPUBufferBinding skinBinding{gpu.skinBuffer, 0};
+				SDL_BindGPUVertexBuffers(pass, 1, &skinBinding, 1);
+				skeletons.Bind(pass, GetSkeleton(item.skeleton));
+			}
+			else if (item.mesh->instanced) {
+				const SDL_GPUBufferBinding instanceBinding{gpu.instanceBuffer, 0};
+				SDL_BindGPUVertexBuffers(pass, 1, &instanceBinding, 1);
+			}
+		};
+		Uint64 nextLayerInstance = 1;
+		auto assignLayerInstance = [&](ObjectUniforms& uniforms, Uint32 instanceCount) {
+			if (nextLayerInstance + instanceCount - 1 > std::numeric_limits<Uint32>::max()) {
+				throw std::overflow_error("Too many single-layer instances in one frame");
+			}
+			uniforms.layerParameters[0] = static_cast<Uint32>(nextLayerInstance);
+			nextLayerInstance += instanceCount;
+		};
+		if (std::any_of(transparent, visibleItems.end(), [](const RenderItem* item) {
+			return item->mesh->GetMaterial(item->materialIndex).UsesSingleLayer();
+		})) {
+			if (!layerDepthTexture) layerDepthTexture = CreateDepthTexture(width, height);
+			if (!layerVisibilityTexture) {
+				SDL_GPUTextureCreateInfo visibility{};
+				visibility.type = SDL_GPU_TEXTURETYPE_2D;
+				visibility.format = layerVisibilityFormat;
+				visibility.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+				visibility.width = width;
+				visibility.height = height;
+				visibility.layer_count_or_depth = visibility.num_levels = 1;
+				visibility.sample_count = SDL_GPU_SAMPLECOUNT_1;
+				layerVisibilityTexture = CreateTextureResource(gpuDevice, visibility);
+			}
+			SDL_GPUColorTargetInfo visibilityInfo{};
+			visibilityInfo.texture = layerVisibilityTexture;
+			visibilityInfo.load_op = SDL_GPU_LOADOP_CLEAR;
+			visibilityInfo.store_op = SDL_GPU_STOREOP_STORE;
+			SDL_GPUDepthStencilTargetInfo layerInfo{};
+			layerInfo.texture = layerDepthTexture;
+			layerInfo.clear_depth = 1.0f;
+			layerInfo.load_op = SDL_GPU_LOADOP_CLEAR;
+			layerInfo.store_op = SDL_GPU_STOREOP_DONT_CARE;
+			layerInfo.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
+			layerInfo.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
+			auto* layerPass = SDL_BeginGPURenderPass(commandBuffer, &visibilityInfo, 1, &layerInfo);
+			if (!layerPass) throw std::runtime_error(std::string("Begin transparent layer depth pass: ") + SDL_GetError());
+			BufferBindings buffers;
+			SkeletonBindings skeletons;
+			for (auto draw = transparent; draw != visibleItems.end(); ++draw) {
+				const RenderItem& item = **draw;
+				const Mesh& mesh = *item.mesh;
+				const Material& material = mesh.GetMaterial(item.materialIndex);
+				if (!material.UsesSingleLayer()) continue;
+				const auto& gpuMaterial = item.gpu->materials.at(item.materialIndex);
+				auto& family = GetModifierPipelines(material, item.skeleton != nullptr);
+				const int mode = item.skeleton ? 2 : mesh.instanced ? 1 : 0;
+				SDL_BindGPUGraphicsPipeline(layerPass, family.layerDepth[mode][mesh.cullBackfaces ? 1 : 0]);
+				const Uint32 instanceCount = mesh.instanced ? item.gpu->uploadedInstanceCount : 1;
+				auto uniforms = makeObjectUniforms(item, gpuMaterial);
+				assignLayerInstance(uniforms, instanceCount);
+				SDL_PushGPUVertexUniformData(commandBuffer, 0, &uniforms, sizeof(uniforms));
+				const float opacity[4] = {gpuMaterial.fragment.lightingParameters[1]};
+				SDL_PushGPUFragmentUniformData(commandBuffer, 0, opacity, sizeof(opacity));
+				const auto& textures = gpuMaterial.material->textures;
+				const SDL_GPUTextureSamplerBinding vertexBindings[] = {{textures[4], sampler}, {textures[5], sampler}};
+				const SDL_GPUTextureSamplerBinding fragmentBinding{textures[0], sampler};
+				SDL_BindGPUVertexSamplers(layerPass, 0, vertexBindings, 2);
+				SDL_BindGPUFragmentSamplers(layerPass, 0, &fragmentBinding, 1);
+				bindMeshBuffers(layerPass, item, buffers, skeletons);
+				SDL_DrawGPUIndexedPrimitives(layerPass, item.indexCount, instanceCount, item.firstIndex, 0, 0);
+				++drawCallCount;
+			}
+			SDL_EndGPURenderPass(layerPass);
+		}
+		nextLayerInstance = 1;
 		SDL_PushGPUFragmentUniformData(commandBuffer, 1, &frame, sizeof(frame));
+		const bool needsSceneDepth = std::any_of(visibleItems.begin(), visibleItems.end(), [](const RenderItem* item) {
+			return !item->mesh->GetMaterial(item->materialIndex).depthSurfaceSource.empty();
+		});
+		auto depthBoundary = visibleItems.end();
+		if (needsSceneDepth) {
+			depthBoundary = std::stable_partition(visibleItems.begin(), transparent, [](const RenderItem* item) {
+				const auto& material = item->mesh->GetMaterial(item->materialIndex);
+				return !material.excludeFromSceneDepth && material.depthSurfaceSource.empty();
+			});
+			if (!sceneDepthTexture) sceneDepthTexture = CreateDepthTexture(width, height, true);
+		}
 		SDL_GPUColorTargetInfo colorInfo{};
 		colorInfo.texture = colorTarget;
 		Vector3 background = scene.backgroundColor;
@@ -3056,7 +3200,7 @@ namespace Sapphire::Graphics {
 		depthInfo.texture = depthTexture;
 		depthInfo.clear_depth = 1.0f;
 		depthInfo.load_op = SDL_GPU_LOADOP_CLEAR;
-		depthInfo.store_op = SDL_GPU_STOREOP_DONT_CARE;
+		depthInfo.store_op = needsSceneDepth ? SDL_GPU_STOREOP_STORE : SDL_GPU_STOREOP_DONT_CARE;
 		depthInfo.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
 		depthInfo.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
 		SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(commandBuffer, &colorInfo, 1, &depthInfo);
@@ -3070,14 +3214,34 @@ namespace Sapphire::Graphics {
 			SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
 			++drawCallCount;
 		}
-		SortDraws();
 		SDL_GPUGraphicsPipeline* activePipeline = nullptr;
 		std::array<SDL_GPUTexture*, 9> activeTextures{};
 		GpuMaterial* activeMaterial = nullptr;
 		BufferBindings buffers;
 		SkeletonBindings skeletonBindings;
-		for (const auto* itemPointer : visibleItems) {
-			const RenderItem& item = *itemPointer;
+		for (auto draw = visibleItems.begin(); draw != visibleItems.end(); ++draw) {
+			if (draw == depthBoundary) {
+				SDL_EndGPURenderPass(pass);
+				SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(commandBuffer);
+				if (!copy) throw std::runtime_error(std::string("Begin scene depth copy: ") + SDL_GetError());
+				SDL_GPUTextureLocation source{}, destination{};
+				source.texture = depthTexture;
+				destination.texture = sceneDepthTexture;
+				SDL_CopyGPUTextureToTexture(copy, &source, &destination, width, height, 1, false);
+				SDL_EndGPUCopyPass(copy);
+				colorInfo.load_op = SDL_GPU_LOADOP_LOAD;
+				depthInfo.load_op = SDL_GPU_LOADOP_LOAD;
+				depthInfo.store_op = SDL_GPU_STOREOP_DONT_CARE;
+				pass = SDL_BeginGPURenderPass(commandBuffer, &colorInfo, 1, &depthInfo);
+				if (!pass) throw std::runtime_error(std::string("Resume main render pass: ") + SDL_GetError());
+				SDL_PushGPUFragmentUniformData(commandBuffer, 1, &frame, sizeof(frame));
+				activePipeline = nullptr;
+				activeTextures = {};
+				activeMaterial = nullptr;
+				buffers = {};
+				skeletonBindings = {};
+			}
+			const RenderItem& item = **draw;
 			Mesh* mesh = item.mesh;
 			const auto selected = shadowsActive ? staticShadowMaps.find({item.cellX, item.cellY, item.cellZ}) : staticShadowMaps.end();
 			const StaticShadowMap* detail = selected != staticShadowMaps.end() ? &selected->second : nullptr;
@@ -3090,8 +3254,8 @@ namespace Sapphire::Graphics {
 			GpuMaterial* activeGpuMaterial = gpuMeshMaterial.material;
 			SDL_GPUGraphicsPipeline* meshPipeline = nullptr;
 			const bool blended = material.transparent;
-			const bool modified = !material.vertexModifierSource.empty() || !material.fragmentNormalSource.empty();
-			MeshPipelines& family = modified ? GetModifierPipelines(material, item.skeleton != nullptr) : meshPipelines;
+			const bool singleLayer = material.UsesSingleLayer();
+			MeshPipelines& family = material.HasShaderModifiers() ? GetModifierPipelines(material, item.skeleton != nullptr) : meshPipelines;
 			const int mode = item.skeleton ? 2 : mesh->instanced ? 1 : 0;
 			meshPipeline = blended ? family.transparent[mode][mesh->cullBackfaces ? 1 : 0] : family.main[mode][activeGpuMaterial->masked ? 1 : 0][mesh->cullBackfaces ? 1 : 0];
 			if (meshPipeline != activePipeline) {
@@ -3099,16 +3263,10 @@ namespace Sapphire::Graphics {
 				activePipeline = meshPipeline;
 			}
 			visibleTriangles += item.indexCount / 3 * (mesh->instanced ? mesh->instances.size() : 1);
-			ObjectUniforms vertex{};
-			const Matrix4 mvp = Multiply(viewProjection, item.model);
-			std::memcpy(vertex.mvp, mvp.values, sizeof(vertex.mvp));
-			std::memcpy(vertex.model, item.model.values, sizeof(vertex.model));
-			std::memcpy(vertex.normal, item.normal.values, sizeof(vertex.normal));
-			vertex.displacementParameters[0] = gpuMeshMaterial.displacementScale;
-			std::memcpy(vertex.uvTransform, gpuMeshMaterial.uv, sizeof(vertex.uvTransform));
-			vertex.modifierTime[0] = frameTime;
+			ObjectUniforms vertex = makeObjectUniforms(item, gpuMeshMaterial);
+			const Uint32 instanceCount = mesh->instanced ? gpuMesh.uploadedInstanceCount : 1;
+			if (singleLayer) assignLayerInstance(vertex, instanceCount);
 			vertex.shadowState[0] = directionalShadowsActive ? 1.0f : 0.0f;
-			SDL_PushGPUVertexUniformData(commandBuffer, 0, &vertex, sizeof(vertex));
 			FragmentUniforms fragment = gpuMeshMaterial.fragment;
 			if (!mesh->cullBackfaces) fragment.lightingParameters[0] = static_cast<float>(static_cast<Uint32>(fragment.lightingParameters[0]) | 32u);
 			Uint32 lightCount = 0;
@@ -3126,17 +3284,9 @@ namespace Sapphire::Graphics {
 			}
 			fragment.shadowParameters[1][3] = 1.0f;
 			fragment.lightingParameters[2] = shadowsActive ? 1.0f : 0.0f;
+			SDL_PushGPUVertexUniformData(commandBuffer, 0, &vertex, sizeof(vertex));
 			SDL_PushGPUFragmentUniformData(commandBuffer, 0, &fragment, sizeof(fragment));
-			buffers.Bind(pass, gpuMesh);
-			if (item.skeleton) {
-				SDL_GPUBufferBinding skinBinding{gpuMesh.skinBuffer, 0};
-				SDL_BindGPUVertexBuffers(pass, 1, &skinBinding, 1);
-				skeletonBindings.Bind(pass, GetSkeleton(item.skeleton));
-			}
-			else if (mesh->instanced) {
-				SDL_GPUBufferBinding instanceBinding{gpuMesh.instanceBuffer, 0};
-				SDL_BindGPUVertexBuffers(pass, 1, &instanceBinding, 1);
-			}
+			bindMeshBuffers(pass, item, buffers, skeletonBindings);
 			SDL_GPUTextureSamplerBinding bindings[9]{};
 			bindings[0] = {activeGpuMaterial->textures[0], sampler};
 			bindings[1] = {enabled[0] ? detail->texture : emptyShadowTexture, shadowSampler};
@@ -3153,10 +3303,18 @@ namespace Sapphire::Graphics {
 				activeTextures[index] = bindings[index].texture;
 			}
 			if (texturesChanged) SDL_BindGPUFragmentSamplers(pass, 0, bindings, 9);
+			if (!material.depthSurfaceSource.empty()) {
+				const SDL_GPUTextureSamplerBinding depthBinding{sceneDepthTexture, sampler};
+				SDL_BindGPUFragmentSamplers(pass, 9, &depthBinding, 1);
+			}
+			if (singleLayer) {
+				const SDL_GPUTextureSamplerBinding layerBinding{layerVisibilityTexture, sampler};
+				SDL_BindGPUFragmentSamplers(pass, material.depthSurfaceSource.empty() ? 9 : 10, &layerBinding, 1);
+			}
 			SDL_GPUTextureSamplerBinding vertexBindings[2] = {{activeGpuMaterial->textures[4], sampler}, {activeGpuMaterial->textures[5], sampler}};
 			if (activeMaterial != activeGpuMaterial) SDL_BindGPUVertexSamplers(pass, 0, vertexBindings, 2);
 			activeMaterial = activeGpuMaterial;
-			SDL_DrawGPUIndexedPrimitives(pass, item.indexCount, mesh->instanced ? gpuMesh.uploadedInstanceCount : 1, item.firstIndex, 0, 0);
+			SDL_DrawGPUIndexedPrimitives(pass, item.indexCount, instanceCount, item.firstIndex, 0, 0);
 			++drawCallCount;
 		}
 		if (colliderDebugVertices) {
@@ -3254,11 +3412,17 @@ namespace Sapphire::Graphics {
 		if (sampler) SDL_ReleaseGPUSampler(gpuDevice, sampler);
 		if (shadowSampler) SDL_ReleaseGPUSampler(gpuDevice, shadowSampler);
 		if (depthTexture) ReleaseTexture(gpuDevice, depthTexture);
+		if (sceneDepthTexture) ReleaseTexture(gpuDevice, sceneDepthTexture);
+		if (layerDepthTexture) ReleaseTexture(gpuDevice, layerDepthTexture);
+		if (layerVisibilityTexture) ReleaseTexture(gpuDevice, layerVisibilityTexture);
 		if (emptyShadowTexture) ReleaseTexture(gpuDevice, emptyShadowTexture);
 		if (dynamicShadowTexture) ReleaseTexture(gpuDevice, dynamicShadowTexture);
 		if (fallbackShadowTexture) ReleaseTexture(gpuDevice, fallbackShadowTexture);
 		if (pointShadowTexture) ReleaseTexture(gpuDevice, pointShadowTexture);
 		depthTexture = nullptr;
+		sceneDepthTexture = nullptr;
+		layerDepthTexture = nullptr;
+		layerVisibilityTexture = nullptr;
 		emptyShadowTexture = nullptr;
 		dynamicShadowTexture = nullptr;
 		fallbackShadowTexture = nullptr;

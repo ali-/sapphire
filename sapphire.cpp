@@ -24,10 +24,10 @@ namespace Sapphire {
 		SDL_Quit();
 	}
 
-	int App(const char* windowTitle, Scene& scene) {
+	int App(const char* windowTitle, Scene& scene, SDL_WindowFlags windowFlags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_FULLSCREEN) {
 		if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) return 1;
 		Input::Initialize();
-		SDL_Window *window = SDL_CreateWindow(windowTitle, Screen::width, Screen::height, SDL_WINDOW_RESIZABLE | SDL_WINDOW_FULLSCREEN);
+		SDL_Window *window = SDL_CreateWindow(windowTitle, Screen::width, Screen::height, windowFlags);
 		if (!window) {
 			Shutdown(nullptr, nullptr);
 			return 1;
