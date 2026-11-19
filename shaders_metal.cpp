@@ -1,6 +1,79 @@
 #include <string>
 
 namespace Sapphire::Graphics::Shaders {
+	inline const std::string waterVertexModifierSource = R"(
+		constant float4 oceanWaves[8] = {
+			float4( 0.928,  0.372, 0.170, 0.55),
+			float4( 0.811,  0.585, 0.273, 0.34),
+			float4( 0.994, -0.110, 0.419, 0.22),
+			float4( 0.601,  0.799, 0.628, 0.14),
+			float4( 0.955,  0.297, 0.982, 0.08),
+			float4(-0.381,  0.925, 1.532, 0.045),
+			float4( 0.733, -0.680, 2.244, 0.020),
+			float4( 0.246,  0.969, 2.856, 0.010)
+		};
+		constant float oceanSpeeds[8] = {1.29, 1.64, 2.03, 2.48, 3.11, 3.88, 4.69, 5.29};
+		constant float oceanPhases[8] = {0.0, 1.7, 4.1, 2.8, 5.2, 0.9, 3.5, 5.8};
+		constant float oceanSpeed = WAVE_SPEED;
+		constant float oceanHeight = WAVE_HEIGHT;
+		constant float oceanAmplitude = WAVE_AMPLITUDE;
+		void ModifyVertex(thread float3& position, thread float3& normal, thread float4& color, float instanceData, float time, float4x4 model) {
+			float2 world = (model * float4(position, 1.0)).xy;
+			float height = 0.0;
+			float amplitudeSum = 0.0;
+			float2 horizontal = float2(0.0);
+			for (int i = 0; i < 8; ++i) {
+				float2 direction = oceanWaves[i].xy;
+				float waveNumber = oceanWaves[i].z;
+				float amplitude = oceanWaves[i].w;
+				float phase = dot(world, direction) * waveNumber - time * oceanSpeed * oceanSpeeds[i] + oceanPhases[i];
+				float crest = sin(phase);
+				float flank = cos(phase);
+				height += amplitude * crest;
+				amplitudeSum += amplitude;
+				horizontal += direction * (0.45 * amplitude * flank);
+			}
+			float2 horizontalScale = float2(length(model[0].xyz), length(model[1].xyz));
+			position.xy += horizontal / horizontalScale;
+			position.z += 0.5 + 0.5 * oceanAmplitude * height / amplitudeSum;
+		}
+	)";
+	inline const std::string waterFragmentNormalModifierSource = R"(
+		constant float4 oceanWaves[8] = {
+			float4( 0.928,  0.372, 0.170, 0.55),
+			float4( 0.811,  0.585, 0.273, 0.34),
+			float4( 0.994, -0.110, 0.419, 0.22),
+			float4( 0.601,  0.799, 0.628, 0.14),
+			float4( 0.955,  0.297, 0.982, 0.08),
+			float4(-0.381,  0.925, 1.532, 0.045),
+			float4( 0.733, -0.680, 2.244, 0.020),
+			float4( 0.246,  0.969, 2.856, 0.010)
+		};
+		constant float oceanSpeeds[8] = {1.29, 1.64, 2.03, 2.48, 3.11, 3.88, 4.69, 5.29};
+		constant float oceanPhases[8] = {0.0, 1.7, 4.1, 2.8, 5.2, 0.9, 3.5, 5.8};
+		constant float oceanSpeed = WAVE_SPEED;
+		constant float oceanHeight = WAVE_HEIGHT;
+		constant float oceanAmplitude = WAVE_AMPLITUDE;
+		void ModifyFragmentNormal(thread float3& normal, float3 baseWorldPosition, float3 worldPosition, float2 uv, float time) {
+			float3 tangentX = float3(1.0, 0.0, 0.0);
+			float3 tangentY = float3(0.0, 1.0, 0.0);
+			float amplitudeSum = 0.0;
+			for (int i = 0; i < 8; ++i) {
+				float2 direction = oceanWaves[i].xy;
+				float waveNumber = oceanWaves[i].z;
+				float amplitude = oceanWaves[i].w;
+				amplitudeSum += amplitude;
+				float phase = dot(baseWorldPosition.xy, direction) * waveNumber - time * oceanSpeed * oceanSpeeds[i] + oceanPhases[i];
+				float verticalSlope = amplitude * waveNumber * cos(phase);
+				float horizontalSlope = -0.45 * amplitude * waveNumber * sin(phase);
+				tangentX += float3(horizontalSlope * direction.x * direction, verticalSlope * direction.x);
+				tangentY += float3(horizontalSlope * direction.y * direction, verticalSlope * direction.y);
+			}
+			tangentX.z *= oceanHeight * oceanAmplitude / (2.0 * amplitudeSum);
+			tangentY.z *= oceanHeight * oceanAmplitude / (2.0 * amplitudeSum);
+			normal = normalize(cross(tangentX, tangentY));
+		}
+	)";
 	inline const std::string deformationShaderSource = R"(
 		#include <metal_stdlib>
 		using namespace metal;
