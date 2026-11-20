@@ -428,6 +428,7 @@ namespace Sapphire::Graphics {
 		std::unordered_map<SDL_GPUTexture*, std::size_t> textureReferences;
 		SDL_GPUCommandBuffer* uploadCommandBuffer = nullptr;
 		SDL_GPUCopyPass* uploadPass = nullptr;
+		std::vector<SDL_GPUTransferBuffer*> uploadTransfers;
 		std::size_t uploadBytes = 0;
 
 
@@ -461,8 +462,16 @@ namespace Sapphire::Graphics {
 			SDL_GPUDevice* device;
 			SDL_GPUTransferBuffer* buffer;
 			~TransferBufferOwner() { if (buffer) ReleaseTransferBuffer(device, buffer); }
-			SDL_GPUTransferBuffer* Release() { return std::exchange(buffer, nullptr); }
+			void RetainForUpload() {
+				uploadTransfers.push_back(buffer);
+				buffer = nullptr;
+			}
 		};
+
+		void ReleaseUploadTransfers() {
+			for (auto* transfer : uploadTransfers) ReleaseTransferBuffer(gpuDevice, transfer);
+			uploadTransfers.clear();
+		}
 
 		void BeginUploadAccounting(Uint32 size) {
 			if (uploadBytes + size > 32 * 1024 * 1024) FlushUploads();
@@ -521,7 +530,7 @@ namespace Sapphire::Graphics {
 				destination.h = input.heightSamples;
 				destination.d = input.depth;
 				SDL_UploadToGPUTexture(BeginUploads(), &source, &destination, false);
-				transfer.Release();
+				transfer.RetainForUpload();
 				return texture;
 			}
 			catch (...) {
@@ -1359,7 +1368,7 @@ namespace Sapphire::Graphics {
 				SDL_GPUTransferBufferLocation source{transfer.buffer, 0};
 				SDL_GPUBufferRegion destination{buffer, 0, size};
 				SDL_UploadToGPUBuffer(BeginUploads(), &source, &destination, existing != nullptr);
-				transfer.Release();
+				transfer.RetainForUpload();
 				return buffer;
 			}
 			catch (...) {
@@ -2133,7 +2142,7 @@ namespace Sapphire::Graphics {
 			SDL_UploadToGPUTexture(BeginUploads(), &source, &destination, false);
 			offset += static_cast<std::uint64_t>(destination.w) * destination.h * stride;
 		}
-		transfer.Release();
+		transfer.RetainForUpload();
 		if (generateOnGpu && textureInfo.num_levels > 1) {
 			SDL_EndGPUCopyPass(uploadPass);
 			uploadPass = nullptr;
@@ -2250,6 +2259,7 @@ namespace Sapphire::Graphics {
 		if (!uploadCommandBuffer) return;
 		if (uploadPass) SDL_EndGPUCopyPass(uploadPass);
 		const bool submitted = SDL_SubmitGPUCommandBuffer(uploadCommandBuffer);
+		ReleaseUploadTransfers();
 		uploadCommandBuffer = nullptr;
 		uploadPass = nullptr;
 		uploadBytes = 0;
@@ -3391,6 +3401,7 @@ namespace Sapphire::Graphics {
 		if (uploadCommandBuffer) {
 			if (uploadPass) SDL_EndGPUCopyPass(uploadPass);
 			SDL_CancelGPUCommandBuffer(uploadCommandBuffer);
+			ReleaseUploadTransfers();
 			uploadCommandBuffer = nullptr;
 			uploadPass = nullptr;
 		}
