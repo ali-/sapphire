@@ -154,12 +154,17 @@ def bake_channels(material):
 
 
 def material_is_baked(material):
-    if not material:
+    if not material or not material.use_nodes or not material.node_tree:
         return False
-    values = [owner["isBaked"] for owner in (material, material.node_tree) if owner and "isBaked" in owner]
-    if any(not isinstance(value, bool) for value in values):
-        raise ValueError("isBaked must be boolean on material " + material.name)
-    return any(values)
+    for node in material.node_tree.nodes:
+        if "isBaked" not in node:
+            continue
+        value = node["isBaked"]
+        if not isinstance(value, bool):
+            raise ValueError("isBaked must be boolean on shader node " + node.name)
+        if value:
+            return True
+    return False
 
 
 def limited_size(width, height, maximum):

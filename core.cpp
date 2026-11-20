@@ -1,7 +1,9 @@
 #include <algorithm>
+#include <array>
 #include <any>
 #include <limits>
 #include <cmath>
+#include <complex>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -103,7 +105,7 @@ namespace Sapphire {
 		}
 
 		Vector3 Scale(const Vector3& value, float scalar) {
-			return {value.x * scalar, value.y * scalar, value.z * scalar};
+			return value * scalar;
 		}
 
 		Vector3 Cross(const Vector3& left, const Vector3& right) {
@@ -115,27 +117,19 @@ namespace Sapphire {
 			return length > 0.0001f ? Scale(value, 1.0f / length) : Vector3{};
 		}
 
-		void GetAxes(const Transform& transform, Vector3 (&axes)[3]) {
-			const float x = transform.rotation.x * Math::degreesToRadians;
-			const float y = transform.rotation.y * Math::degreesToRadians;
-			const float z = transform.rotation.z * Math::degreesToRadians;
+		void GetRotationAxes(const Vector3& rotation, Vector3 (&axes)[3]) {
+			const float x = rotation.x * Math::degreesToRadians;
+			const float y = rotation.y * Math::degreesToRadians;
+			const float z = rotation.z * Math::degreesToRadians;
 			const float cx = std::cos(x), sx = std::sin(x), cy = std::cos(y), sy = std::sin(y), cz = std::cos(z), sz = std::sin(z);
 			axes[0] = {cz * cy, sz * cy, -sy};
 			axes[1] = {cz * sy * sx - sz * cx, sz * sy * sx + cz * cx, cy * sx};
 			axes[2] = {cz * sy * cx + sz * sx, sz * sy * cx - cz * sx, cy * cx};
 		}
 
-		Vector3 ComposeRotation(const Vector3& parent, const Vector3& local) {
-			Vector3 parentAxes[3];
-			Vector3 localAxes[3];
-			Transform parentTransform;
-			Transform localTransform;
-			parentTransform.rotation = parent;
-			localTransform.rotation = local;
-			GetAxes(parentTransform, parentAxes);
-			GetAxes(localTransform, localAxes);
-			Vector3 axes[3];
-			for (int index = 0; index < 3; ++index) axes[index] = Add(Scale(parentAxes[0], localAxes[index].x), Add(Scale(parentAxes[1], localAxes[index].y), Scale(parentAxes[2], localAxes[index].z)));
+		void GetAxes(const Transform& transform, Vector3 (&axes)[3]) { GetRotationAxes(transform.rotation, axes); }
+
+		Vector3 RotationFromAxes(const Vector3 (&axes)[3]) {
 			const float roll = std::asin(std::clamp(-axes[0].z, -1.0f, 1.0f));
 			const float cosineRoll = std::cos(roll);
 			const float pitch = std::abs(cosineRoll) > 0.0001f ? std::atan2(axes[1].z, axes[2].z) : std::atan2(-axes[2].y, axes[1].y);
@@ -143,22 +137,36 @@ namespace Sapphire {
 			return {pitch / degreesToRadians, roll / degreesToRadians, yaw / degreesToRadians};
 		}
 
+		Vector3 ComposeRotation(const Vector3& parent, const Vector3& local, const Vector3* preparedParentAxes = nullptr) {
+			Vector3 parentAxes[3];
+			Vector3 localAxes[3];
+			if (preparedParentAxes) std::copy_n(preparedParentAxes, 3, parentAxes);
+			else GetRotationAxes(parent, parentAxes);
+			GetRotationAxes(local, localAxes);
+			Vector3 axes[3];
+			for (int index = 0; index < 3; ++index) axes[index] = Add(Scale(parentAxes[0], localAxes[index].x), Add(Scale(parentAxes[1], localAxes[index].y), Scale(parentAxes[2], localAxes[index].z)));
+			return RotationFromAxes(axes);
+		}
+
+		Vector3 RelativeRotation(const Vector3& parent, const Vector3& world, const Vector3* preparedParentAxes) {
+			Vector3 parentAxes[3];
+			Vector3 worldAxes[3];
+			if (preparedParentAxes) std::copy_n(preparedParentAxes, 3, parentAxes);
+			else GetRotationAxes(parent, parentAxes);
+			GetRotationAxes(world, worldAxes);
+			Vector3 localAxes[3];
+			for (int index = 0; index < 3; ++index) localAxes[index] = {Dot(parentAxes[0], worldAxes[index]), Dot(parentAxes[1], worldAxes[index]), Dot(parentAxes[2], worldAxes[index])};
+			return RotationFromAxes(localAxes);
+		}
+
 		Vector3 RelativeRotation(const Vector3& parent, const Vector3& world) {
 			Vector3 parentAxes[3];
 			Vector3 worldAxes[3];
-			Transform parentTransform;
-			Transform worldTransform;
-			parentTransform.rotation = parent;
-			worldTransform.rotation = world;
-			GetAxes(parentTransform, parentAxes);
-			GetAxes(worldTransform, worldAxes);
+			GetRotationAxes(parent, parentAxes);
+			GetRotationAxes(world, worldAxes);
 			Vector3 localAxes[3];
 			for (int index = 0; index < 3; ++index) localAxes[index] = {Dot(parentAxes[0], worldAxes[index]), Dot(parentAxes[1], worldAxes[index]), Dot(parentAxes[2], worldAxes[index])};
-			const float roll = std::asin(std::clamp(-localAxes[0].z, -1.0f, 1.0f));
-			const float cosineRoll = std::cos(roll);
-			const float pitch = std::abs(cosineRoll) > 0.0001f ? std::atan2(localAxes[1].z, localAxes[2].z) : std::atan2(-localAxes[2].y, localAxes[1].y);
-			const float yaw = std::abs(cosineRoll) > 0.0001f ? std::atan2(localAxes[0].y, localAxes[0].x) : 0.0f;
-			return {pitch / degreesToRadians, roll / degreesToRadians, yaw / degreesToRadians};
+			return RotationFromAxes(localAxes);
 		}
 
 		Matrix4 Identity() {
@@ -358,7 +366,6 @@ namespace Sapphire {
 
 			void InitializePose() {
 				for (auto& bone : bones) bone.poseTransform = bone.bindTransform;
-				bindMatrices.clear();
 				inverseBindMatrices.clear();
 				poseGlobalMatrices.clear();
 				poseMatrices.clear();
@@ -371,10 +378,9 @@ namespace Sapphire {
 			const std::vector<Math::Matrix4>& PoseMatrices() {
 				if (cachedPoseRevision == poseRevision) return poseMatrices;
 				Validate();
-				auto buildMatrices = [&](bool bindPose) {
-					std::vector<Math::Matrix4> matrices(bones.size());
-					std::vector<std::uint8_t> complete(bones.size());
-					std::vector<std::size_t> path;
+				auto buildMatrices = [&](bool bindPose, std::vector<Math::Matrix4>& matrices, std::vector<std::uint8_t>& complete, std::vector<std::size_t>& path) {
+					matrices.resize(bones.size());
+					std::fill(complete.begin(), complete.end(), 0);
 					for (std::size_t index = 0; index < bones.size(); ++index) {
 						if (complete[index]) continue;
 						path.clear();
@@ -393,17 +399,19 @@ namespace Sapphire {
 							complete[*boneIndex] = 1;
 						}
 					}
-					return matrices;
 				};
-				if (bindMatrices.size() != bones.size()) bindMatrices = buildMatrices(true);
+				std::vector<std::uint8_t> complete(bones.size());
+				std::vector<std::size_t> path;
 				if (inverseBindMatrices.size() != bones.size()) {
-					inverseBindMatrices.resize(bones.size());
-					for (std::size_t index = 0; index < bones.size(); ++index) inverseBindMatrices[index] = InverseAffine(bindMatrices[index]);
+					std::vector<Math::Matrix4> bindMatrices(bones.size());
+					buildMatrices(true, bindMatrices, complete, path);
+					std::vector<Math::Matrix4> inverseBindMatricesNext(bones.size());
+					for (std::size_t index = 0; index < bones.size(); ++index) inverseBindMatricesNext[index] = InverseAffine(bindMatrices[index]);
+					inverseBindMatrices = std::move(inverseBindMatricesNext);
 				}
-				const auto poseGlobals = buildMatrices(false);
-				poseGlobalMatrices = poseGlobals;
+				buildMatrices(false, poseGlobalMatrices, complete, path);
 				poseMatrices.resize(bones.size());
-				for (std::size_t index = 0; index < bones.size(); ++index) poseMatrices[index] = Math::Multiply(poseGlobals[index], inverseBindMatrices[index]);
+				for (std::size_t index = 0; index < bones.size(); ++index) poseMatrices[index] = Math::Multiply(poseGlobalMatrices[index], inverseBindMatrices[index]);
 				cachedPoseRevision = poseRevision;
 				return poseMatrices;
 			}
@@ -412,7 +420,6 @@ namespace Sapphire {
 			const std::vector<Math::Matrix4>& PoseGlobalMatrices() { PoseMatrices(); return poseGlobalMatrices; }
 
 		private:
-			std::vector<Math::Matrix4> bindMatrices;
 			std::vector<Math::Matrix4> inverseBindMatrices;
 			std::vector<Math::Matrix4> poseGlobalMatrices;
 			std::vector<Math::Matrix4> poseMatrices;
@@ -535,6 +542,8 @@ namespace Sapphire {
 		}
 		if (shape == Shape::Cube) {
 			MeshData mesh;
+			mesh.vertices.reserve(24);
+			mesh.indices.reserve(36);
 			const Vector3 faces[6][4] = {
 				{{-0.5f,-0.5f,0.5f}, {0.5f,-0.5f,0.5f}, {0.5f,0.5f,0.5f}, {-0.5f,0.5f,0.5f}},
 				{{0.5f,-0.5f,-0.5f}, {-0.5f,-0.5f,-0.5f}, {-0.5f,0.5f,-0.5f}, {0.5f,0.5f,-0.5f}},
@@ -557,20 +566,32 @@ namespace Sapphire {
 		constexpr int sides = 16;
 		constexpr int hemisphereRings = 8;
 		constexpr float pi = 3.14159265358979323846f;
+		static const std::array<std::array<float, 2>, sides + 1> azimuths = [] {
+			std::array<std::array<float, 2>, sides + 1> values{};
+			for (int side = 0; side <= sides; ++side) {
+				const float azimuth = static_cast<float>(side) / sides * 2.0f * pi;
+				values[side] = {std::cos(azimuth), std::sin(azimuth)};
+			}
+			return values;
+		}();
+		const int upperStart = halfStraight > 0.0f ? 0 : 1;
+		const std::size_t ringCount = static_cast<std::size_t>(hemisphereRings + 1 + hemisphereRings - upperStart + 1);
+		mesh.vertices.reserve(ringCount * (sides + 1));
+		mesh.indices.reserve((ringCount - 1) * sides * 6);
 		auto addRing = [&](float angle, float centerZ) {
-			const float ringRadius = radius * std::cos(angle);
-			const float z = centerZ + radius * std::sin(angle);
+			const float cosineAngle = std::cos(angle);
+			const float sineAngle = std::sin(angle);
+			const float ringRadius = radius * cosineAngle;
+			const float z = centerZ + radius * sineAngle;
 			for (int side = 0; side <= sides; ++side) {
 				const float u = static_cast<float>(side) / sides;
-				const float azimuth = u * 2.0f * pi;
-				const float cosine = std::cos(azimuth);
-				const float sine = std::sin(azimuth);
-				mesh.vertices.push_back({{ringRadius * cosine, ringRadius * sine, z}, {std::cos(angle) * cosine, std::cos(angle) * sine, std::sin(angle)}, {u, size.z > 0.0f ? z / size.z + 0.5f : 0.5f}});
+				const float cosine = azimuths[side][0];
+				const float sine = azimuths[side][1];
+				mesh.vertices.push_back({{ringRadius * cosine, ringRadius * sine, z}, {cosineAngle * cosine, cosineAngle * sine, sineAngle}, {u, size.z > 0.0f ? z / size.z + 0.5f : 0.5f}});
 			}
 		};
 		for (int ring = 0; ring <= hemisphereRings; ++ring) addRing(-pi * 0.5f + static_cast<float>(ring) / hemisphereRings * pi * 0.5f, -halfStraight);
-		for (int ring = halfStraight > 0.0f ? 0 : 1; ring <= hemisphereRings; ++ring) addRing(static_cast<float>(ring) / hemisphereRings * pi * 0.5f, halfStraight);
-		const std::uint32_t ringCount = static_cast<std::uint32_t>(mesh.vertices.size() / (sides + 1));
+		for (int ring = upperStart; ring <= hemisphereRings; ++ring) addRing(static_cast<float>(ring) / hemisphereRings * pi * 0.5f, halfStraight);
 		for (std::uint32_t ring = 0; ring + 1 < ringCount; ++ring) for (int side = 0; side < sides; ++side) {
 			const std::uint32_t first = ring * (sides + 1) + side;
 			const std::uint32_t next = first + sides + 1;
@@ -589,6 +610,7 @@ namespace Sapphire {
 		std::string displacementMaskTexturePath;
 		std::string vertexModifierSource;
 		std::string fragmentNormalSource;
+		std::string depthSurfaceSource;
 		float roughness = 1.0f;
 		float metallic = 0.0f;
 		float normalScale = 1.0f;
@@ -599,12 +621,17 @@ namespace Sapphire {
 		bool flipNormalY = false;
 		bool transparent = false;
 		bool unlit = false;
+		bool excludeFromSceneDepth = false;
+		bool singleLayer = false;
 		float opacity = 1.0f;
+		std::array<float, 16> customData{};
 
 		auto Key() const {
-			return std::tie(baseTexturePath, normalTexturePath, roughnessTexturePath, aoTexturePath, displacementTexturePath, displacementMaskTexturePath, vertexModifierSource, fragmentNormalSource, baseColor.x, baseColor.y, baseColor.z, roughness, metallic, normalScale, aoStrength, displacementScale, uvScale[0], uvScale[1], uvOffset[0], uvOffset[1], flipNormalY, transparent, unlit, opacity);
+			return std::tie(baseTexturePath, normalTexturePath, roughnessTexturePath, aoTexturePath, displacementTexturePath, displacementMaskTexturePath, vertexModifierSource, fragmentNormalSource, depthSurfaceSource, baseColor.x, baseColor.y, baseColor.z, roughness, metallic, normalScale, aoStrength, displacementScale, uvScale[0], uvScale[1], uvOffset[0], uvOffset[1], flipNormalY, transparent, unlit, excludeFromSceneDepth, singleLayer, opacity, customData);
 		}
 
+		bool UsesSingleLayer() const { return transparent && singleLayer; }
+		bool HasShaderModifiers() const { return !vertexModifierSource.empty() || !fragmentNormalSource.empty() || !depthSurfaceSource.empty() || UsesSingleLayer(); }
 		bool operator<(const Material& other) const { return Key() < other.Key(); }
 
 	};
@@ -646,17 +673,18 @@ namespace Sapphire {
 				auto section = std::upper_bound(sections.begin(), sections.end(), index, [](std::size_t position, const MeshSection& value) { return position < value.firstIndex; });
 				return section == sections.begin() ? 0 : (section - 1)->materialIndex;
 			}
-			void ValidateSections() const {
-				if (materials.size() > std::numeric_limits<std::uint32_t>::max()) throw std::length_error("Mesh material count exceeds supported range");
-				if (materials.size() > 1 && sections.empty()) throw std::invalid_argument("Meshes with multiple materials require sections");
+			static void ValidateSections(std::size_t indexCount, std::size_t suppliedMaterialCount, const std::vector<MeshSection>& sectionList) {
+				if (suppliedMaterialCount > std::numeric_limits<std::uint32_t>::max()) throw std::length_error("Mesh material count exceeds supported range");
+				if (suppliedMaterialCount > 1 && sectionList.empty()) throw std::invalid_argument("Meshes with multiple materials require sections");
 				std::size_t nextIndex = 0;
-				for (const auto& section : sections) {
-					if (section.firstIndex != nextIndex || section.indexCount == 0 || section.indexCount % 3 != 0 || static_cast<std::size_t>(section.firstIndex) + section.indexCount > data.indices.size()) throw std::invalid_argument("Mesh sections must cover contiguous triangle index ranges");
-					if (section.materialIndex >= MaterialCount()) throw std::out_of_range("Mesh section material index is invalid");
+				for (const auto& section : sectionList) {
+					if (section.firstIndex != nextIndex || section.indexCount == 0 || section.indexCount % 3 != 0 || static_cast<std::size_t>(section.firstIndex) + section.indexCount > indexCount) throw std::invalid_argument("Mesh sections must cover contiguous triangle index ranges");
+					if (section.materialIndex >= (suppliedMaterialCount ? suppliedMaterialCount : 1)) throw std::out_of_range("Mesh section material index is invalid");
 					nextIndex += section.indexCount;
 				}
-				if (!sections.empty() && nextIndex != data.indices.size()) throw std::invalid_argument("Mesh sections must cover all mesh indices");
+				if (!sectionList.empty() && nextIndex != indexCount) throw std::invalid_argument("Mesh sections must cover all mesh indices");
 			}
+			void ValidateSections() const { ValidateSections(data.indices.size(), materials.size(), sections); }
 			void Validate() const {
 				data.Validate();
 				ValidateSections();
@@ -722,7 +750,7 @@ namespace Sapphire {
 				Vector3 axes[3];
 				Math::GetAxes(parent->transform, axes);
 				transform.position = Math::Add(parent->transform.position, Math::Add(Math::Scale(axes[0], transform.localPosition.x * parent->transform.scale.x), Math::Add(Math::Scale(axes[1], transform.localPosition.y * parent->transform.scale.y), Math::Scale(axes[2], transform.localPosition.z * parent->transform.scale.z))));
-				transform.rotation = Math::ComposeRotation(parent->transform.rotation, transform.localRotation);
+				transform.rotation = Math::ComposeRotation(parent->transform.rotation, transform.localRotation, axes);
 				transform.scale = {parent->transform.scale.x * transform.localScale.x, parent->transform.scale.y * transform.localScale.y, parent->transform.scale.z * transform.localScale.z};
 			}
 
@@ -749,22 +777,25 @@ namespace Sapphire {
 				parent->UpdateWorldTransform();
 				Vector3 axes[3];
 				Math::GetAxes(parent->transform, axes);
-				const Vector3 offset = Math::Subtract(position, parent->transform.position);
-				transform.localPosition = {std::abs(parent->transform.scale.x) > 0.0001f ? Math::Dot(offset, axes[0]) / parent->transform.scale.x : 0.0f, std::abs(parent->transform.scale.y) > 0.0001f ? Math::Dot(offset, axes[1]) / parent->transform.scale.y : 0.0f, std::abs(parent->transform.scale.z) > 0.0001f ? Math::Dot(offset, axes[2]) / parent->transform.scale.z : 0.0f};
+				transform.localPosition = LocalPosition(position, parent->transform, axes);
 				UpdateDescendantWorldTransforms();
 			}
 
 			void SetWorldRotation(const Vector3& rotation) {
 				transform.rotation = rotation;
-				if (parent) parent->UpdateWorldTransform();
-				transform.localRotation = parent ? Math::RelativeRotation(parent->transform.rotation, rotation) : rotation;
+				Vector3 axes[3];
+				if (parent) {
+					parent->UpdateWorldTransform();
+					Math::GetAxes(parent->transform, axes);
+				}
+				transform.localRotation = parent ? Math::RelativeRotation(parent->transform.rotation, rotation, axes) : rotation;
 				UpdateDescendantWorldTransforms();
 			}
 
 			void SetWorldScale(const Vector3& scale) {
 				transform.scale = scale;
 				if (parent) parent->UpdateWorldTransform();
-				transform.localScale = parent ? Vector3{std::abs(parent->transform.scale.x) > 0.0001f ? scale.x / parent->transform.scale.x : 0.0f, std::abs(parent->transform.scale.y) > 0.0001f ? scale.y / parent->transform.scale.y : 0.0f, std::abs(parent->transform.scale.z) > 0.0001f ? scale.z / parent->transform.scale.z : 0.0f} : scale;
+				transform.localScale = parent ? RelativeScale(scale, parent->transform.scale) : scale;
 				UpdateDescendantWorldTransforms();
 			}
 
@@ -781,9 +812,22 @@ namespace Sapphire {
 				parent = nextParent;
 				if (parent) parent->children.push_back(this);
 				if (worldPositionStays) {
-					SetWorldPosition(worldPosition);
-					SetWorldRotation(worldRotation);
-					SetWorldScale(worldScale);
+					transform.position = worldPosition;
+					transform.rotation = worldRotation;
+					transform.scale = worldScale;
+					if (parent) {
+						parent->UpdateWorldTransform();
+						Vector3 axes[3];
+						Math::GetAxes(parent->transform, axes);
+						transform.localPosition = LocalPosition(worldPosition, parent->transform, axes);
+						transform.localRotation = Math::RelativeRotation(parent->transform.rotation, worldRotation, axes);
+						transform.localScale = RelativeScale(worldScale, parent->transform.scale);
+					}
+					else {
+						transform.localRotation = worldRotation;
+						transform.localScale = worldScale;
+					}
+					UpdateDescendantWorldTransforms();
 				}
 				else {
 					if (!parent) {
@@ -829,6 +873,15 @@ namespace Sapphire {
 			}
 		
 		private:
+			static Vector3 LocalPosition(const Vector3& position, const Transform& parentTransform, const Vector3 (&axes)[3]) {
+				const Vector3 offset = Math::Subtract(position, parentTransform.position);
+				return {std::abs(parentTransform.scale.x) > 0.0001f ? Math::Dot(offset, axes[0]) / parentTransform.scale.x : 0.0f, std::abs(parentTransform.scale.y) > 0.0001f ? Math::Dot(offset, axes[1]) / parentTransform.scale.y : 0.0f, std::abs(parentTransform.scale.z) > 0.0001f ? Math::Dot(offset, axes[2]) / parentTransform.scale.z : 0.0f};
+			}
+
+			static Vector3 RelativeScale(const Vector3& scale, const Vector3& parentScale) {
+				return {std::abs(parentScale.x) > 0.0001f ? scale.x / parentScale.x : 0.0f, std::abs(parentScale.y) > 0.0001f ? scale.y / parentScale.y : 0.0f, std::abs(parentScale.z) > 0.0001f ? scale.z / parentScale.z : 0.0f};
+			}
+
 			std::vector<std::unique_ptr<Component>> components;
 			std::vector<std::pair<const void*, Component*>> componentCache;
 			std::unordered_map<std::string, std::any> properties;
@@ -861,14 +914,14 @@ namespace Sapphire {
 		std::map<CellKey, std::vector<Object*>> cells;
 		std::map<CellKey, Math::Bounds> cellBounds;
 		std::vector<Object*> alwaysResidentObjects;
-		std::vector<Object*> dynamicObjects;
+		struct DynamicObject { Object* object; bool resident = false; };
+		std::vector<DynamicObject> dynamicObjects;
 		std::vector<Object*> residentObjects;
 		std::vector<Object*> residentRenderObjects;
 		std::vector<CellKey> residentCells;
 		std::set<CellKey> residentCellKeys;
 		std::deque<CellKey> pendingCellLoads;
 		std::deque<CellKey> pendingCellUnloads;
-		std::set<Object*> residentDynamicObjects;
 		std::vector<std::unique_ptr<Object>> cellsData;
 		struct SourceSnapshot {
 			Object* object;
@@ -921,7 +974,6 @@ namespace Sapphire {
 			residentCellKeys.clear();
 			pendingCellLoads.clear();
 			pendingCellUnloads.clear();
-			residentDynamicObjects.clear();
 			cellsData.clear();
 			sources.clear();
 			partitionSize = size;
@@ -945,7 +997,7 @@ namespace Sapphire {
 					continue;
 				}
 				if (!object->renderStatic) {
-					dynamicObjects.push_back(object.get());
+					dynamicObjects.push_back({object.get(), false});
 					continue;
 				}
 				if (!mesh || mesh->instanced || mesh->IsSkinned() || mesh->data.indices.size() < 3 || mesh->data.vertices.empty()) {
@@ -955,32 +1007,41 @@ namespace Sapphire {
 					continue;
 				}
 				using VertexMap = std::unordered_map<std::uint32_t, std::uint32_t>;
-				std::map<CellKey, MeshData> cellMeshes;
-				std::map<CellKey, VertexMap> cellVertices;
-				std::map<CellKey, std::vector<MeshSection>> cellSections;
-				std::map<CellKey, Math::Bounds> cellMeshBounds;
+				struct CellMesh {
+					MeshData data;
+					VertexMap vertices;
+					std::vector<MeshSection> sections;
+					Math::Bounds bounds = Math::EmptyBounds();
+				};
+				std::map<CellKey, CellMesh> cellMeshes;
 				const Math::Matrix4 model = Math::Model(object->transform);
-				for (std::size_t index = 0; index + 2 < mesh->data.indices.size(); index += 3) {
+				const std::size_t sectionCount = mesh->sections.empty() ? 1 : mesh->sections.size();
+				for (std::size_t sectionIndex = 0; sectionIndex < sectionCount; ++sectionIndex) {
+					const MeshSection section = mesh->sections.empty() ? MeshSection{0, static_cast<std::uint32_t>(mesh->data.indices.size()), 0} : mesh->GetSection(sectionIndex);
+					for (std::size_t index = section.firstIndex; index + 2 < static_cast<std::size_t>(section.firstIndex) + section.indexCount; index += 3) {
 					const std::uint32_t sourceIndices[3] = {mesh->data.indices[index], mesh->data.indices[index + 1], mesh->data.indices[index + 2]};
-					if (sourceIndices[0] >= mesh->data.vertices.size() || sourceIndices[1] >= mesh->data.vertices.size() || sourceIndices[2] >= mesh->data.vertices.size()) continue;
 					const Vector3 a = Math::TransformPoint(model, mesh->data.vertices[sourceIndices[0]].position);
 					const Vector3 b = Math::TransformPoint(model, mesh->data.vertices[sourceIndices[1]].position);
 					const Vector3 c = Math::TransformPoint(model, mesh->data.vertices[sourceIndices[2]].position);
 					const CellKey key = Key(Math::Scale(Math::Add(Math::Add(a, b), c), 1.0f / 3.0f), size);
-					IncludeBounds(cellMeshBounds, key, a);
-					IncludeBounds(cellMeshBounds, key, b);
-					IncludeBounds(cellMeshBounds, key, c);
-					MeshData& cellMesh = cellMeshes[key];
-					const std::uint32_t materialIndex = mesh->MaterialIndexAt(index);
-					auto& sections = cellSections[key];
+					auto [cellEntry, insertedCell] = cellMeshes.try_emplace(key);
+					CellMesh& cell = cellEntry->second;
+					if (insertedCell) cell.bounds = {a, a};
+					else Math::Include(cell.bounds, a);
+					Math::Include(cell.bounds, b);
+					Math::Include(cell.bounds, c);
+					MeshData& cellMesh = cell.data;
+					const std::uint32_t materialIndex = section.materialIndex;
+					auto& sections = cell.sections;
 					if (sections.empty() || sections.back().materialIndex != materialIndex) sections.push_back({static_cast<std::uint32_t>(cellMesh.indices.size()), 0, materialIndex});
-					VertexMap& vertices = cellVertices[key];
+					VertexMap& vertices = cell.vertices;
 					for (const auto sourceIndex : sourceIndices) {
 						auto [entry, inserted] = vertices.try_emplace(sourceIndex, static_cast<std::uint32_t>(cellMesh.vertices.size()));
 						if (inserted) cellMesh.vertices.push_back(mesh->data.vertices[sourceIndex]);
 						cellMesh.indices.push_back(entry->second);
 					}
 					sections.back().indexCount += 3;
+					}
 				}
 				if (cellMeshes.empty()) {
 					const CellKey key = Key(object->transform.position, size);
@@ -989,7 +1050,7 @@ namespace Sapphire {
 					continue;
 				}
 				object->worldPartitionedMesh = true;
-				for (auto& [key, data] : cellMeshes) {
+				for (auto& [key, cellData] : cellMeshes) {
 					auto cellObject = std::make_unique<Object>(object->name);
 					cellObject->scene = object->scene;
 					cellObject->transform = object->transform;
@@ -997,17 +1058,17 @@ namespace Sapphire {
 					cellObject->worldPartitionCell = true;
 					cellObject->worldPartitionSourceObject = object.get();
 					Mesh& cellMesh = cellObject->AddComponent<Mesh>();
-					cellMesh.data = std::move(data);
+					cellMesh.data = std::move(cellData.data);
 					cellMesh.material = mesh->material;
 					cellMesh.materials = mesh->materials;
-					cellMesh.sections = std::move(cellSections.at(key));
+					cellMesh.sections = std::move(cellData.sections);
 					cellMesh.cullBackfaces = mesh->cullBackfaces;
 					cellMesh.castShadows = mesh->castShadows;
 					cellMesh.vertexBoundsPadding = mesh->vertexBoundsPadding;
 					cellMesh.vertexAnimated = mesh->vertexAnimated;
 					cells[key].push_back(object.get());
 					cells[key].push_back(cellObject.get());
-					const Math::Bounds cellMeshBoundsValue = cellMeshBounds.at(key);
+					const Math::Bounds cellMeshBoundsValue = cellData.bounds;
 					IncludeBounds(cellBounds, key, cellMeshBoundsValue.minimum);
 					IncludeBounds(cellBounds, key, cellMeshBoundsValue.maximum);
 					cellsData.push_back(std::move(cellObject));
@@ -1037,13 +1098,12 @@ namespace Sapphire {
 				residentCellKeys.clear();
 				pendingCellLoads.clear();
 				pendingCellUnloads.clear();
-				residentDynamicObjects.clear();
 				cellsData.clear();
 				hasCellSelection = false;
 				initialCellLoadComplete = false;
 				nextCellStreamTime = {};
-				for (const auto& object : objects) object->worldPartitionedMesh = false;
 				for (const auto& object : objects) {
+					object->worldPartitionedMesh = false;
 					if (!object->initializedForApp) continue;
 					residentObjects.push_back(object.get());
 					residentRenderObjects.push_back(object.get());
@@ -1095,21 +1155,36 @@ namespace Sapphire {
 			const float unloadRange = loadRange + size;
 			const float loadRangeSquared = loadRange * loadRange;
 			const float unloadRangeSquared = unloadRange * unloadRange;
-			const float priorityAngle = std::min(camera->fieldOfView * 0.5f + 15.0f, 89.0f) * Math::degreesToRadians;
-			const float forwardThreshold = std::cos(priorityAngle);
 			const bool directionChanged = !pendingCellLoads.empty() && Math::Dot(sourceForward, forward) < 0.9659258f;
 			const bool refreshCells = !hasCellSelection || sourceCell != nextSource || loadingRange != range || directionChanged;
 			if (refreshCells) {
+				const float priorityAngle = std::min(camera->fieldOfView * 0.5f + 15.0f, 89.0f) * Math::degreesToRadians;
+				const float forwardThreshold = std::cos(priorityAngle);
+				pendingCellLoads.clear();
+				pendingCellUnloads.clear();
 				std::vector<std::tuple<int, float, CellKey>> ordered;
-				for (const auto& [key, members] : cells) {
-					const auto& bounds = cellBounds.at(key);
+				const auto distanceSquaredToBounds = [&](const Math::Bounds& bounds, Vector3* delta) {
 					const Vector3 closest{std::clamp(sourcePosition.x, bounds.minimum.x, bounds.maximum.x), std::clamp(sourcePosition.y, bounds.minimum.y, bounds.maximum.y), std::clamp(sourcePosition.z, bounds.minimum.z, bounds.maximum.z)};
 					const Vector3 difference{closest.x - sourcePosition.x, closest.y - sourcePosition.y, closest.z - sourcePosition.z};
-					const float distanceSquared = Math::Dot(difference, difference);
-					if (key == nextSource || distanceSquared <= loadRangeSquared || (residentCellKeys.count(key) && distanceSquared <= unloadRangeSquared)) {
-						const float distance = std::sqrt(distanceSquared);
-						const float alignment = distance > 0.0001f ? Math::Dot(Math::Scale(difference, 1.0f / distance), forward) : 1.0f;
-						const int priority = key == nextSource ? -1 : alignment >= forwardThreshold ? 0 : 1;
+					if (delta) *delta = difference;
+					return Math::Dot(difference, difference);
+				};
+				for (const auto& [key, members] : cells) {
+					if (!residentCellKeys.count(key)) continue;
+					const float distanceSquared = distanceSquaredToBounds(cellBounds.at(key), nullptr);
+					if (key != nextSource && distanceSquared > loadRangeSquared && distanceSquared > unloadRangeSquared) pendingCellUnloads.push_back(key);
+				}
+				for (const auto& [key, members] : cells) {
+					const auto& bounds = cellBounds.at(key);
+					Vector3 difference;
+					const float distanceSquared = distanceSquaredToBounds(bounds, key == nextSource ? nullptr : &difference);
+					if (key == nextSource || distanceSquared <= loadRangeSquared) {
+						int priority = -1;
+						if (key != nextSource) {
+							const float distance = std::sqrt(distanceSquared);
+							const float alignment = distance > 0.0001f ? Math::Dot(Math::Scale(difference, 1.0f / distance), forward) : 1.0f;
+							priority = alignment >= forwardThreshold ? 0 : 1;
+						}
 						ordered.emplace_back(priority, distanceSquared, key);
 					}
 				}
@@ -1118,24 +1193,14 @@ namespace Sapphire {
 					if (std::get<1>(left) != std::get<1>(right)) return std::get<1>(left) < std::get<1>(right);
 					return std::get<2>(left) < std::get<2>(right);
 				});
-				pendingCellLoads.clear();
-				pendingCellUnloads.clear();
-				std::set<CellKey> desiredCells;
 				for (const auto& entry : ordered) {
-					const float distance = std::get<1>(entry);
 					const CellKey& key = std::get<2>(entry);
-					desiredCells.insert(key);
-					if ((key == nextSource || distance <= loadRangeSquared) && !residentCellKeys.count(key)) pendingCellLoads.push_back(key);
+					if (!residentCellKeys.count(key)) pendingCellLoads.push_back(key);
 				}
-				for (const auto& key : residentCellKeys) if (!desiredCells.count(key)) pendingCellUnloads.push_back(key);
 				std::sort(pendingCellUnloads.begin(), pendingCellUnloads.end(), [&](const CellKey& left, const CellKey& right) {
-					const auto& leftBounds = cellBounds.at(left);
-					const auto& rightBounds = cellBounds.at(right);
-					const Vector3 leftPoint{std::clamp(sourcePosition.x, leftBounds.minimum.x, leftBounds.maximum.x), std::clamp(sourcePosition.y, leftBounds.minimum.y, leftBounds.maximum.y), std::clamp(sourcePosition.z, leftBounds.minimum.z, leftBounds.maximum.z)};
-					const Vector3 rightPoint{std::clamp(sourcePosition.x, rightBounds.minimum.x, rightBounds.maximum.x), std::clamp(sourcePosition.y, rightBounds.minimum.y, rightBounds.maximum.y), std::clamp(sourcePosition.z, rightBounds.minimum.z, rightBounds.maximum.z)};
-					const Vector3 leftDelta{leftPoint.x - sourcePosition.x, leftPoint.y - sourcePosition.y, leftPoint.z - sourcePosition.z};
-					const Vector3 rightDelta{rightPoint.x - sourcePosition.x, rightPoint.y - sourcePosition.y, rightPoint.z - sourcePosition.z};
-					return Math::Dot(leftDelta, leftDelta) > Math::Dot(rightDelta, rightDelta);
+					const float leftDistance = distanceSquaredToBounds(cellBounds.at(left), nullptr);
+					const float rightDistance = distanceSquaredToBounds(cellBounds.at(right), nullptr);
+					return leftDistance > rightDistance;
 				});
 				if (!initialCellLoadComplete) {
 					if (cells.count(nextSource) && residentCellKeys.insert(nextSource).second) residentCells.push_back(nextSource);
@@ -1181,16 +1246,13 @@ namespace Sapphire {
 			for (const auto& key : residentCells) {
 				for (auto* object : cells.at(key)) addResident(object);
 			}
-			std::set<Object*> nextDynamicObjects;
-			for (auto* object : dynamicObjects) {
+			for (auto& entry : dynamicObjects) {
+				auto* object = entry.object;
 				const Vector3 difference{object->transform.position.x - sourcePosition.x, object->transform.position.y - sourcePosition.y, object->transform.position.z - sourcePosition.z};
 				const float distanceSquared = Math::Dot(difference, difference);
-				if (distanceSquared <= loadRangeSquared || (residentDynamicObjects.count(object) && distanceSquared <= unloadRangeSquared)) {
-					nextDynamicObjects.insert(object);
-					addResident(object);
-				}
+				entry.resident = distanceSquared <= loadRangeSquared || (entry.resident && distanceSquared <= unloadRangeSquared);
+				if (entry.resident) addResident(object);
 			}
-			residentDynamicObjects.swap(nextDynamicObjects);
 			if (camera->owner->parent) addResident(camera->owner->parent);
 			addResident(camera->owner);
 			for (auto* object : alwaysResidentObjects) addResident(object);
@@ -1290,6 +1352,7 @@ namespace Sapphire {
 			WorldPartitioner worldPartitioner;
 	};
 
+
 	class ParticleEmitter : public Object {
 		struct Particle {
 			Vector3 velocity;
@@ -1334,7 +1397,7 @@ namespace Sapphire {
 			void Update() override {
 				auto& mesh = *GetComponent<Mesh>();
 				const float deltaTime = Time::deltaTime;
-				bool changed = false;
+				bool changed = !particles.empty();
 				for (std::size_t index = 0; index < particles.size();) {
 					Particle& particle = particles[index];
 					particle.age += deltaTime;
@@ -1343,7 +1406,6 @@ namespace Sapphire {
 						particles.pop_back();
 						mesh.instances[index] = mesh.instances.back();
 						mesh.instances.pop_back();
-						changed = true;
 						continue;
 					}
 					mesh.instances[index].position += particle.velocity * deltaTime;
@@ -1353,7 +1415,6 @@ namespace Sapphire {
 					mesh.instances[index].scale.y = particleSize;
 					mesh.instances[index].customData = age;
 					++index;
-					changed = true;
 				}
 				emissionRemainder += std::max(rate, 0.0f) * deltaTime;
 				const std::size_t scheduled = static_cast<std::size_t>(emissionRemainder);
@@ -1361,15 +1422,17 @@ namespace Sapphire {
 				const std::size_t available = maxParticles > particles.size() ? maxParticles - particles.size() : 0;
 				const std::size_t count = std::min(available, scheduled + pendingBurst);
 				pendingBurst = 0;
-				const Vector3 launchDirection = Math::Normalize(direction);
-				std::uniform_real_distribution<float> deviation(-spread, spread);
-				for (std::size_t index = 0; index < count; ++index) {
-					Vector3 travel = launchDirection;
-					if (spread > 0.0f) travel = Math::Normalize(Math::Add(travel, {deviation(random), deviation(random), deviation(random)}));
-					particles.push_back({Math::Scale(travel, speed), 0.0f});
-					MeshInstance instance{};
-					instance.scale = {sizeStart, sizeStart, sizeStart};
-					mesh.instances.push_back(instance);
+				if (count) {
+					const Vector3 launchDirection = Math::Normalize(direction);
+					std::uniform_real_distribution<float> deviation(-spread, spread);
+					for (std::size_t index = 0; index < count; ++index) {
+						Vector3 travel = launchDirection;
+						if (spread > 0.0f) travel = Math::Normalize(Math::Add(travel, {deviation(random), deviation(random), deviation(random)}));
+						particles.push_back({Math::Scale(travel, speed), 0.0f});
+						MeshInstance instance{};
+						instance.scale = {sizeStart, sizeStart, sizeStart};
+						mesh.instances.push_back(instance);
+					}
 					changed = true;
 				}
 				if (!changed) return;
@@ -1383,9 +1446,182 @@ namespace Sapphire {
 			}
 	};
 
+
+	namespace Graphics::Shaders {
+		extern const std::string waterVertexModifierSource;
+		extern const std::string waterSurfaceSource;
+	}
+
+	namespace Graphics {
+		void EnsureGeneratedTexture(const std::string& name, int width, int height, std::vector<std::uint8_t> (*generate)());
+	}
+
+	class WaterBody : public Object {
+		static constexpr int resolution = 128;
+		static constexpr int tile = resolution + 2;
+		using Complex = std::complex<float>;
+
+		static std::vector<std::uint8_t> BakeSpectrum() {
+			constexpr int n = resolution, count = n * n, frames = 64;
+			constexpr float tau = 6.28318530718f, dk = tau / 160.0f;
+			constexpr float wind = 10.0f, age = 0.84f, peakK = 9.81f * age * age / (wind * wind);
+			auto omega = [](float k) { return std::sqrt(9.81f * k * (1.0f + k * k / (370.0f * 370.0f))); };
+			const float cp = omega(peakK) / peakK;
+			const float friction = 0.41f * wind / std::log(10.0f / (0.000037f * wind * wind / 9.81f * std::pow(wind / cp, 0.9f)));
+			const float sigma = 0.08f * (1.0f + 4.0f / (age * age * age));
+			struct Mode { Complex seed; int rate; float x, y; };
+			std::vector<Mode> modes(count);
+			std::mt19937 random(48271);
+			std::uniform_real_distribution<float> phase(0.0f, tau);
+			for (int y = 0; y < n; ++y) for (int x = 0; x < n; ++x) {
+				if ((!x && !y) || x == n / 2 || y == n / 2) continue;
+				const float kx = (x < n / 2 ? x : x - n) * dk, ky = (y < n / 2 ? y : y - n) * dk;
+				const float k = std::hypot(kx, ky), c = omega(k) / k, ratio = std::sqrt(k / peakK) - 1.0f;
+				const float cutoff = std::exp(-1.25f * peakK * peakK / (k * k));
+				const float peakShape = std::pow(1.7f, std::exp(-0.5f * ratio * ratio * sigma * sigma));
+				const float gravity = 0.003f * std::sqrt(age) * cp / c * cutoff * peakShape * std::exp(-age * ratio / std::sqrt(10.0f));
+				const float capillary = 0.005f * (1 + (friction >= 0.23f ? 3 : 1) * std::log(friction / 0.23f)) *
+					0.23f / c * std::exp(-0.25f * std::pow(k / 370.0f - 1, 2.0f)) * cutoff;
+				const float spread = std::tanh(std::log(2.0f) / 4 + 4 * std::pow(c / cp, 2.5f) + 0.13f * friction / 0.23f * std::pow(0.23f / c, 2.5f));
+				const float density = (gravity + capillary) * (1 + spread * (2 * kx * kx / (k * k) - 1)) / (tau * k * k * k * k);
+				modes[y * n + x] = {std::polar(std::sqrt(density * 0.5f) * dk, phase(random)), static_cast<int>(std::round(omega(k) * 16 / tau)), kx / k, ky / k};
+			}
+
+			std::array<Complex, n> roots;
+			std::array<int, n> reverse{};
+			for (int i = 0; i < n; ++i) {
+				roots[i] = std::polar(1.0f, tau * i / n);
+				reverse[i] = (reverse[i / 2] >> 1) | ((i & 1) * (n / 2));
+			}
+			auto inverse = [&](Complex* line, int stride) {
+				for (int i = 0; i < n; ++i) if (i < reverse[i]) std::swap(line[i * stride], line[reverse[i] * stride]);
+				for (int half = 1; half < n; half *= 2) {
+					for (int start = 0; start < n; start += 2 * half) for (int j = 0; j < half; ++j) {
+						auto& a = line[(start + j) * stride];
+						auto& b = line[(start + j + half) * stride];
+						const Complex odd = b * roots[j * n / (2 * half)];
+						b = a - odd;
+						a += odd;
+					}
+				}
+			};
+			std::vector<Complex> evolved(count), height(count), field(count);
+			std::vector<float> samples(frames * 3 * count);
+			float peak = 0.0f;
+			for (int frame = 0; frame < frames; ++frame) {
+				for (int i = 0; i < count; ++i) evolved[i] = modes[i].seed * std::conj(roots[(modes[i].rate * frame % frames) * (n / frames)]);
+				for (int y = 0; y < n; ++y) for (int x = 0; x < n; ++x)
+					height[y * n + x] = evolved[y * n + x] + std::conj(evolved[(n - y) % n * n + (n - x) % n]);
+				for (int plane = 0; plane < 3; ++plane) {
+					for (int i = 0; i < count; ++i) field[i] = plane == 0 ? height[i] : height[i] * Complex(0, plane == 1 ? modes[i].x : modes[i].y);
+					for (int row = 0; row < n; ++row) inverse(field.data() + row * n, 1);
+					for (int col = 0; col < n; ++col) inverse(field.data() + col, n);
+					float* values = samples.data() + (frame * 3 + plane) * count;
+					for (int i = 0; i < count; ++i) {
+						values[i] = field[i].real();
+						peak = std::max(peak, std::abs(values[i]));
+					}
+				}
+			}
+			const float scale = 127.5f / peak;
+			auto encode = [scale](float value) { return static_cast<std::uint8_t>(std::clamp(value * scale + 128.0f, 0.0f, 255.0f)); };
+			std::vector<std::uint8_t> pixels(tile * 24 * tile * 8 * 4);
+			for (int frame = 0; frame < frames; ++frame) for (int plane = 0; plane < 3; ++plane) {
+				const float* values = samples.data() + (frame * 3 + plane) * count;
+				for (int y = 0; y < tile; ++y) for (int x = 0; x < tile; ++x) {
+					const int col = (x + n - 1) % n, row = (y + n - 1) % n;
+					const int pixel = ((frame / 8 * tile + y) * tile * 24 + (plane * 8 + frame % 8) * tile + x) * 4;
+					pixels[pixel] = encode(values[row * n + col]);
+					pixels[pixel + 1] = encode(values[row * n + (col + 1) % n] - values[row * n + (col + n - 1) % n]);
+					pixels[pixel + 2] = encode(values[(row + 1) % n * n + col] - values[(row + n - 1) % n * n + col]);
+					pixels[pixel + 3] = 255;
+				}
+			}
+			return pixels;
+		}
+
+		public:
+			using Object::Object;
+			float choppiness = 1.0f;
+			float size = 160.0f;
+			float direction = 0.0f;
+			Vector3 color{0.01f, 0.06f, 0.18f};
+			float opacity = 0.5f;
+			bool foam = true;
+
+			void Initialize() override {
+				if (!std::isfinite(size) || size <= 0.0f || !std::isfinite(choppiness) || !std::isfinite(direction) || !std::isfinite(opacity)) return;
+				if (!std::isfinite(transform.scale.x) || transform.scale.x == 0.0f || !std::isfinite(transform.scale.y) || transform.scale.y == 0.0f || !std::isfinite(transform.scale.z) || transform.scale.z < 0.0f) return;
+				const float patch = std::max(size, 0.01f);
+				const float chop = std::clamp(choppiness, 0.0f, 2.5f);
+				const float angle = direction * Math::degreesToRadians;
+				const float windX = std::cos(angle), windY = std::sin(angle);
+				auto divisions = [&](float extent) {
+					return static_cast<int>(std::clamp(std::ceil(std::abs(extent) / patch * 48.0f), 1.0f, 448.0f));
+				};
+				const int columns = divisions(transform.scale.x);
+				const int rows = divisions(transform.scale.y);
+				const float surfaceOpacity = std::clamp(opacity, 0.0f, 1.0f);
+				const int rowSize = columns + 1;
+				MeshData data;
+				data.vertices.reserve(static_cast<std::size_t>(rowSize) * (rows + 1));
+				data.indices.reserve(static_cast<std::size_t>(columns) * rows * 6);
+				for (int y = 0; y <= rows; ++y) {
+					for (int x = 0; x <= columns; ++x) {
+						const float u = static_cast<float>(x) / columns;
+						const float v = static_cast<float>(y) / rows;
+						data.vertices.push_back({{u - 0.5f, v - 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {u, v}, {1.0f, 1.0f, 1.0f, surfaceOpacity}});
+					}
+				}
+				for (int y = 0; y < rows; ++y) {
+					for (int x = 0; x < columns; ++x) {
+						const std::uint32_t first = y * rowSize + x;
+						const std::uint32_t next = first + rowSize;
+						data.indices.insert(data.indices.end(), {first, next + 1, next, first, first + 1, next + 1});
+					}
+				}
+				auto& mesh = AddComponent<Mesh>();
+				mesh.data = std::move(data);
+				mesh.material.transparent = surfaceOpacity < 1.0f;
+				mesh.material.singleLayer = true;
+				mesh.material.baseColor = color;
+				mesh.material.roughness = 0.20f;
+				mesh.material.depthSurfaceSource = Graphics::Shaders::waterSurfaceSource;
+				Graphics::EnsureGeneratedTexture("generated:water-spectrum", tile * 24, tile * 8, BakeSpectrum);
+				mesh.material.displacementTexturePath = "generated:water-spectrum";
+				mesh.material.normalTexturePath = mesh.material.displacementTexturePath;
+				mesh.material.displacementScale = 0.0f;
+				mesh.material.normalScale = 0.0f;
+				mesh.material.customData = {0.35f, 8.0f, foam ? 1.0f : 0.0f, 0.0f, windX, windY, chop};
+				mesh.material.vertexModifierSource = Graphics::Shaders::waterVertexModifierSource;
+				auto& vertexSource = mesh.material.vertexModifierSource;
+				auto replaceMarker = [&](const char* marker, float value) {
+					const std::string replacement = std::to_string(value);
+					const auto length = std::char_traits<char>::length(marker);
+					for (auto position = vertexSource.find(marker); position != std::string::npos; position = vertexSource.find(marker, position + replacement.size())) {
+						vertexSource.replace(position, length, replacement);
+					}
+				};
+				replaceMarker("PATCH_METRES", patch);
+				replaceMarker("CHOP", chop);
+				replaceMarker("WIND_X", windX);
+				replaceMarker("WIND_Y", windY);
+				mesh.vertexAnimated = true;
+				const float padding = 0.707107f * chop * transform.scale.z;
+				mesh.vertexBoundsPadding = {padding / std::abs(transform.scale.x), padding / std::abs(transform.scale.y), 0.5f};
+				mesh.castShadows = false;
+			}
+	};
+
+
 	namespace Physics { std::vector<Vector3> ColliderDebugLines(Scene& scene); }
 
 	namespace {
+		inline constexpr std::array<std::string Material::*, 6> materialTexturePaths{
+			&Material::baseTexturePath, &Material::normalTexturePath, &Material::roughnessTexturePath,
+			&Material::aoTexturePath, &Material::displacementTexturePath, &Material::displacementMaskTexturePath
+		};
+
 		struct S3DRecord {
 			std::string name;
 			std::string source;
@@ -1485,8 +1721,7 @@ namespace Sapphire {
 				for (float& value : material.uvOffset) value = reader.Read<float>();
 				material.flipNormalY = reader.Read<std::uint8_t>() != 0; material.transparent = reader.Read<std::uint8_t>() != 0; material.unlit = reader.Read<std::uint8_t>() != 0;
 				material.opacity = reader.Read<float>();
-				std::string* paths[] = {&material.baseTexturePath, &material.normalTexturePath, &material.roughnessTexturePath, &material.aoTexturePath, &material.displacementTexturePath, &material.displacementMaskTexturePath};
-				for (auto* path : paths) *path = reader.String();
+				for (const auto path : materialTexturePaths) material.*path = reader.String();
 				material.vertexModifierSource = reader.String();
 			}
 			for (auto& bone : record.bones) {
@@ -1499,19 +1734,12 @@ namespace Sapphire {
 				for (auto& weight : skin.weights) weight = reader.Read<std::uint16_t>();
 			}
 			record.data.Validate();
-			Mesh validation;
-			validation.data = std::move(record.data);
-			validation.materials = std::move(record.materials);
-			validation.sections = std::move(record.sections);
-			validation.ValidateSections();
-			record.data = std::move(validation.data);
-			record.materials = std::move(validation.materials);
-			record.sections = std::move(validation.sections);
+			Mesh::ValidateSections(record.data.indices.size(), record.materials.size(), record.sections);
 			if (!record.bones.empty()) {
 				Skeleton skeleton;
 				skeleton.bones = std::move(record.bones);
-				skeleton.Validate();
 				if (!record.data.skinWeights.empty()) record.data.ValidateSkeleton(skeleton);
+				else skeleton.Validate();
 				record.bones = std::move(skeleton.bones);
 			}
 			else if (!record.data.skinWeights.empty()) throw std::runtime_error("Skinned mesh has no skeleton");
@@ -1573,7 +1801,6 @@ namespace Sapphire {
 					record.light.intensity = reader.Read<float>(); record.light.range = reader.Read<float>(); record.light.innerSpotAngle = reader.Read<float>(); record.light.outerSpotAngle = reader.Read<float>();
 					record.light.castShadows = reader.Read<std::uint8_t>() != 0;
 					reader.Read<float>(); // Consume the stored bias; loaded lights use the current Light default.
-					record.light.shadowBias = Light{}.shadowBias;
 				}
 				else throw std::runtime_error("Invalid S3D object type");
 				records.push_back(std::move(record));
@@ -1592,8 +1819,10 @@ namespace Sapphire {
 		try {
 			records = ReadS3D(fileName, sourcePath, models);
 			for (auto& [name, model] : models) for (auto& material : model.materials) {
-				std::string* paths[] = {&material.baseTexturePath, &material.normalTexturePath, &material.roughnessTexturePath, &material.aoTexturePath, &material.displacementTexturePath, &material.displacementMaskTexturePath};
-				for (auto* path : paths) if (!path->empty() && std::filesystem::path(*path).is_relative()) *path = (sourcePath.parent_path() / *path).lexically_normal().string();
+				for (const auto path : materialTexturePaths) {
+					auto& value = material.*path;
+					if (!value.empty() && std::filesystem::path(value).is_relative()) value = (sourcePath.parent_path() / value).lexically_normal().string();
+				}
 			}
 		}
 		catch (const std::exception&) { return false; }

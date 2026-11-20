@@ -27,8 +27,8 @@ namespace Sapphire::Graphics::Shaders {
 		void ModifyVertex(thread float3& position, thread float3& normal, thread float4& color, float instanceData, float time, float4x4 model) {}
 		#endif
 	)";
-	
-	inline const std::string vertexShaderSource = deformationShaderSource + R"(
+
+	inline const std::string meshVertexPreparationSource = R"(
 		struct VertexInput { float3 position [[attribute(0)]]; float3 normal [[attribute(1)]]; float2 uv [[attribute(2)]]; float4 color [[attribute(3)]];
 		#if SKINNED
 		ushort4 boneIndices [[attribute(4)]]; float4 boneWeights [[attribute(5)]];
@@ -37,47 +37,82 @@ namespace Sapphire::Graphics::Shaders {
 		float3 instancePosition [[attribute(4)]]; float3 instanceRotation [[attribute(5)]]; float3 instanceScale [[attribute(6)]]; float instanceData [[attribute(7)]];
 		#endif
 		};
-		struct VertexOutput { float4 position [[position]]; float2 uv; float4 color; float3 worldPosition; float3 worldNormal; float4 shadowPosition0; float4 shadowPosition1; float4 shadowPosition2;
-		#if CUSTOM_FRAGMENT_NORMAL
-		float3 baseWorldPosition;
-		#endif
-		};
-		struct ObjectUniforms { float4x4 mvp; float4x4 model; float4x4 normal; float4 displacementParameters; float4 uvTransform; float4 modifierTime; float4x4 shadowMvp[3]; float4 shadowState; };
-		vertex VertexOutput main0(VertexInput input [[stage_in]], constant ObjectUniforms& uniforms [[buffer(0)]],
+		void PrepareVertex(VertexInput input, float4 uvTransform, float4 displacementParameters, float4x4 model,
 		#if SKINNED
-		device const float4x4* boneMatrices [[buffer(1)]],
+		device const float4x4* boneMatrices,
 		#endif
-		texture2d<float> heightMap [[texture(0)]], sampler heightSampler [[sampler(0)]], texture2d<float> maskMap [[texture(1)]], sampler maskSampler [[sampler(1)]]) {
-			VertexOutput output;
-			float2 uv = input.uv * uniforms.uvTransform.xy + uniforms.uvTransform.zw;
+		texture2d<float> heightMap, sampler heightSampler, texture2d<float> maskMap, sampler maskSampler,
+		thread float3& position, thread float3& normal, thread float2& uv, thread float4& color, thread float& instanceData) {
+			uv = input.uv * uvTransform.xy + uvTransform.zw;
 			float3 localPosition = input.position;
-			float3 localNormal = input.normal;
-			float4 color = input.color;
+			normal = input.normal;
+			color = input.color;
 			#if SKINNED
 			float4 skinnedPosition = float4(0.0);
 			float3 skinnedNormal = float3(0.0);
 			for (uint influence = 0; influence < 4; ++influence) {
 				float weight = input.boneWeights[influence];
 				skinnedPosition += (boneMatrices[input.boneIndices[influence]] * float4(localPosition, 1.0)) * weight;
-				skinnedNormal += (boneMatrices[input.boneIndices[influence]] * float4(localNormal, 0.0)).xyz * weight;
+				skinnedNormal += (boneMatrices[input.boneIndices[influence]] * float4(normal, 0.0)).xyz * weight;
 			}
 			localPosition = skinnedPosition.xyz;
-			localNormal = normalize(skinnedNormal);
+			normal = normalize(skinnedNormal);
 			#endif
 			#if INSTANCED
 			localPosition = input.instancePosition + InstanceRotate(localPosition * input.instanceScale, input.instanceRotation);
-			localNormal = InstanceNormal(localNormal, input.instanceScale, input.instanceRotation);
+			normal = InstanceNormal(normal, input.instanceScale, input.instanceRotation);
+			instanceData = input.instanceData;
+			#else
+			instanceData = 0.0;
 			#endif
-			float3 position = Deform(localPosition, localNormal, uv, color, uniforms.model, uniforms.displacementParameters, heightMap, heightSampler, maskMap, maskSampler);
+			position = Deform(localPosition, normal, uv, color, model, displacementParameters, heightMap, heightSampler, maskMap, maskSampler);
+		}
+	)";
+	
+	inline const std::string vertexShaderSource = deformationShaderSource + meshVertexPreparationSource + R"(
+		struct VertexOutput { float4 position [[position]]; float2 uv; float4 color; float3 worldPosition; float3 worldNormal; float4 shadowPosition0; float4 shadowPosition1; float4 shadowPosition2;
+		#if CUSTOM_FRAGMENT_NORMAL
+		float3 baseWorldPosition;
+		#endif
+		#ifdef SAMPLED_MODIFIER
+		float4 modifierData;
+		#endif
+		#if SINGLE_LAYER
+		uint layerInstance [[flat]];
+		#endif
+		};
+		struct ObjectUniforms { float4x4 mvp; float4x4 model; float4x4 normal; float4 displacementParameters; float4 uvTransform; float4 modifierTime; float4x4 shadowMvp[3]; float4 shadowState; uint4 layerParameters; };
+		vertex VertexOutput main0(VertexInput input [[stage_in]], constant ObjectUniforms& uniforms [[buffer(0)]],
+		#if SKINNED
+		device const float4x4* boneMatrices [[buffer(1)]],
+		#endif
+		#if SINGLE_LAYER
+		uint instanceID [[instance_id]],
+		#endif
+		texture2d<float> heightMap [[texture(0)]], sampler heightSampler [[sampler(0)]], texture2d<float> maskMap [[texture(1)]], sampler maskSampler [[sampler(1)]]) {
+			VertexOutput output;
+			float2 uv;
+			float3 localNormal;
+			float4 color;
+			float3 position;
+			float instanceData;
+			PrepareVertex(input, uniforms.uvTransform, uniforms.displacementParameters, uniforms.model,
+			#if SKINNED
+				boneMatrices,
+			#endif
+				heightMap, heightSampler, maskMap, maskSampler, position, localNormal, uv, color, instanceData);
 			#if CUSTOM_FRAGMENT_NORMAL
 			output.baseWorldPosition = (uniforms.model * float4(position, 1.0)).xyz;
 			#endif
-			float instanceData = 0.0;
-			#if INSTANCED
-			instanceData = input.instanceData;
-			#endif
+			#ifdef SAMPLED_MODIFIER
+			ModifySampledVertex(position, uniforms.modifierTime.x, uniforms.model, heightMap, output.modifierData);
+			#else
 			ModifyVertex(position, localNormal, color, instanceData, uniforms.modifierTime.x, uniforms.model);
+			#endif
 			output.position = uniforms.mvp * float4(position, 1.0);
+			#if SINGLE_LAYER
+			output.layerInstance = uniforms.layerParameters.x + instanceID;
+			#endif
 			output.uv = uv;
 			output.color = color;
 			output.worldPosition = (uniforms.model * float4(position, 1.0)).xyz;
@@ -155,6 +190,10 @@ namespace Sapphire::Graphics::Shaders {
 			float previousFog[5] = {0.0};
 			float transmittance = 1.0;
 			float3 scattering = float3(0.0);
+			uint lightCount = min(uint(frame.fogParameters.x), 16u);
+			float3 baseLighting = frame.ambientLight.rgb * frame.ambientLight.a;
+			float directionalIntensity = frame.directionalDirection.w;
+			if (directionalIntensity > 0.0) baseLighting += frame.directionalColor.rgb * directionalIntensity;
 			for (uint slice = 0; slice < sliceCount; ++slice) {
 				float distance = nearClip * exp(logRange * (float(slice) + 0.5) / float(sliceCount));
 				float3 position = frame.cameraPosition.xyz + ray * distance;
@@ -182,10 +221,7 @@ namespace Sapphire::Graphics::Shaders {
 				}
 				segmentTransmittance = clamp(segmentTransmittance, 0.0, 1.0);
 				float segmentScattering = transmittance * (1.0 - segmentTransmittance) * frame.fogVolumeParameters.y;
-				float3 lighting = frame.ambientLight.rgb * frame.ambientLight.a;
-				float directionalIntensity = frame.directionalDirection.w;
-				if (directionalIntensity > 0.0) lighting += frame.directionalColor.rgb * directionalIntensity;
-				uint lightCount = min(uint(frame.fogParameters.x), 16u);
+				float3 lighting = baseLighting;
 				for (uint light = 0; light < lightCount; ++light) {
 					float4 positionRange = frame.pointLightPositionRange[light];
 					float4 colorIntensity = frame.pointLightColorIntensity[light];
@@ -236,28 +272,38 @@ namespace Sapphire::Graphics::Shaders {
 		#if CUSTOM_FRAGMENT_NORMAL
 		float3 baseWorldPosition;
 		#endif
+		#ifdef SAMPLED_MODIFIER
+		float4 modifierData;
+		#endif
+		#ifdef SINGLE_LAYER_VISIBILITY_SLOT
+		uint layerInstance [[flat]];
+		#endif
 		};
-		struct FragmentUniforms { float4 shadowParameters[3]; float4 lightingParameters; float4 baseColor; float4 surfaceParameters; uint4 pointLightIndices[4]; };
+		struct FragmentUniforms { float4 shadowParameters[3]; float4 lightingParameters; float4 baseColor; float4 surfaceParameters; float4 customData[4]; uint4 pointLightIndices[4]; };
 		#ifndef CUSTOM_FRAGMENT_NORMAL
 		void ModifyFragmentNormal(thread float3& normal, float3 baseWorldPosition, float3 worldPosition, float2 uv, float time) {}
 		#endif
-		float ShadowCoverage(float4 position, float4 parameters) {
+		float ShadowProjection(float4 position, float4 parameters, thread float2& uv, thread float& depth) {
 			if (parameters.x < 0.5) return 0.0;
 			float3 projected = position.xyz / position.w;
-			float2 uv = float2(projected.x * 0.5 + 0.5, 0.5 - projected.y * 0.5);
+			uv = float2(projected.x * 0.5 + 0.5, 0.5 - projected.y * 0.5);
+			depth = projected.z;
 			float border = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
 			if (projected.z < 0.0 || (projected.z > 1.0 && parameters.w < 0.5)) return 0.0;
 			return smoothstep(parameters.z * 2.0, parameters.z * 6.0, border);
 		}
-		float ShadowAmount(float4 position, depth2d<float> shadowMap, sampler shadowSampler, float4 parameters) {
-			if (ShadowCoverage(position, parameters) == 0.0) return 0.0;
-			float3 projected = position.xyz / position.w;
-			float2 uv = float2(projected.x * 0.5 + 0.5, 0.5 - projected.y * 0.5);
+		float ShadowTaps(float depth, float2 uv, depth2d<float> shadowMap, sampler shadowSampler, float4 parameters) {
 			float visibility = 0.0;
 			for (int y = 0; y < 2; ++y) {
-				for (int x = 0; x < 2; ++x) visibility += shadowMap.sample_compare(shadowSampler, uv + (float2(x, y) - 0.5) * parameters.z, min(projected.z, 1.0) - parameters.y);
+				for (int x = 0; x < 2; ++x) visibility += shadowMap.sample_compare(shadowSampler, uv + (float2(x, y) - 0.5) * parameters.z, min(depth, 1.0) - parameters.y);
 			}
 			return 1.0 - visibility * 0.25;
+		}
+		float ShadowAmount(float4 position, depth2d<float> shadowMap, sampler shadowSampler, float4 parameters) {
+			float2 uv;
+			float depth;
+			if (ShadowProjection(position, parameters, uv, depth) == 0.0) return 0.0;
+			return ShadowTaps(depth, uv, shadowMap, shadowSampler, parameters);
 		}
 		float PointShadowVisibility(float3 direction, float receiverDistance, float range, float bias, uint cubeIndex, depth2d_array<float> shadowMap, sampler shadowSampler) {
 			float faceDepth = max(max(abs(direction.x), abs(direction.y)), abs(direction.z)) * receiverDistance;
@@ -281,8 +327,7 @@ namespace Sapphire::Graphics::Shaders {
 			}
 			return shadowMap.sample_compare(shadowSampler, uv * 0.5 + 0.5, cubeIndex * 6u + face, compareDepth);
 		}
-		float PointShadowAmount(float3 direction, float range, float bias, uint cubeIndex, depth2d_array<float> shadowMap, sampler shadowSampler, float texelSize) {
-			float receiverDistance = length(direction);
+		float PointShadowAmount(float3 direction, float receiverDistance, float range, float bias, uint cubeIndex, depth2d_array<float> shadowMap, sampler shadowSampler, float texelSize) {
 			if (receiverDistance <= 0.0001 || receiverDistance >= range) return 0.0;
 			float3 normalizedDirection = direction / receiverDistance;
 			float3 axis = abs(normalizedDirection.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
@@ -326,7 +371,18 @@ namespace Sapphire::Graphics::Shaders {
 		}
 
 
-		fragment float4 main0(FragmentInput input [[stage_in]], constant FragmentUniforms& uniforms [[buffer(0)]], constant FrameUniforms& frame [[buffer(1)]], texture2d<float> image [[texture(0)]], sampler imageSampler [[sampler(0)]], depth2d<float> detailMap [[texture(1)]], sampler detailSampler [[sampler(1)]], depth2d<float> fallbackMap [[texture(2)]], sampler fallbackSampler [[sampler(2)]], depth2d<float> dynamicMap [[texture(3)]], sampler dynamicSampler [[sampler(3)]], depth2d_array<float> pointShadowMap [[texture(4)]], sampler pointShadowSampler [[sampler(4)]], texture2d<float> normalMap [[texture(5)]], sampler normalSampler [[sampler(5)]], texture2d<float> roughnessMap [[texture(6)]], sampler roughnessSampler [[sampler(6)]], texture2d<float> aoMap [[texture(7)]], sampler aoSampler [[sampler(7)]], texture3d<float> fogVolumeMap [[texture(8)]], sampler fogVolumeSampler [[sampler(8)]]) {
+		fragment float4 main0(FragmentInput input [[stage_in]], constant FragmentUniforms& uniforms [[buffer(0)]], constant FrameUniforms& frame [[buffer(1)]], texture2d<float> image [[texture(0)]], sampler imageSampler [[sampler(0)]], depth2d<float> detailMap [[texture(1)]], sampler detailSampler [[sampler(1)]], depth2d<float> fallbackMap [[texture(2)]], sampler fallbackSampler [[sampler(2)]], depth2d<float> dynamicMap [[texture(3)]], sampler dynamicSampler [[sampler(3)]], depth2d_array<float> pointShadowMap [[texture(4)]], sampler pointShadowSampler [[sampler(4)]], texture2d<float> normalMap [[texture(5)]], sampler normalSampler [[sampler(5)]], texture2d<float> roughnessMap [[texture(6)]], sampler roughnessSampler [[sampler(6)]], texture2d<float> aoMap [[texture(7)]], sampler aoSampler [[sampler(7)]], texture3d<float> fogVolumeMap [[texture(8)]], sampler fogVolumeSampler [[sampler(8)]]
+		#if CUSTOM_DEPTH_SURFACE
+			, depth2d<float> sceneDepth [[texture(9)]]
+		#endif
+		#ifdef SINGLE_LAYER_VISIBILITY_SLOT
+			, texture2d<uint, access::read> layerVisibility [[texture(SINGLE_LAYER_VISIBILITY_SLOT)]], uint primitiveID [[primitive_id]]
+		#endif
+		) {
+			#ifdef SINGLE_LAYER_VISIBILITY_SLOT
+			uint2 nearest = layerVisibility.read(uint2(input.position.xy)).xy;
+			bool behindNearest = nearest.x != 0u && any(nearest != uint2(input.layerInstance, primitiveID));
+			#endif
 			uint materialFlags = uint(uniforms.lightingParameters.x);
 			bool twoSided = (materialFlags & 32u) != 0u;
 			float3 normal = (materialFlags & 16u) != 0u ? float3(0.0) : normalize(input.worldNormal);
@@ -356,9 +412,9 @@ namespace Sapphire::Graphics::Shaders {
 			#if ALPHA_MASKED
 			if (texel.a < 0.5) discard_fragment();
 			#endif
-			float fog = HeightFog(input.worldPosition, frame);
+			float fog = 0.0;
 			float3 fogScattering = float3(0.0);
-			float fogTransmittance = 1.0 - fog;
+			float fogTransmittance = 1.0;
 			if (frame.fogVolumeParameters.x > 0.5) {
 				float nearClip = frame.fogViewParameters.z;
 				float farClip = frame.fogViewParameters.w;
@@ -371,7 +427,14 @@ namespace Sapphire::Graphics::Shaders {
 				fogScattering = integratedFog.rgb;
 				fogTransmittance = integratedFog.a;
 			}
+			else {
+				fog = HeightFog(input.worldPosition, frame);
+				fogTransmittance = 1.0 - fog;
+			}
 			float opacity = input.color.a * texel.a * uniforms.lightingParameters.y;
+			#ifdef SINGLE_LAYER_VISIBILITY_SLOT
+			if (behindNearest && ((materialFlags & 16u) != 0u || (fog >= 1.0 && frame.fogVolumeParameters.x < 0.5))) discard_fragment();
+			#endif
 			if (fog >= 1.0 && frame.fogVolumeParameters.x < 0.5) return float4(EncodeColor(frame.fogColor.rgb, frame, input.position.xy), opacity);
 			if ((materialFlags & 16u) != 0u) {
 				float3 tint = input.color.rgb * uniforms.baseColor.rgb * texel.rgb;
@@ -380,20 +443,46 @@ namespace Sapphire::Graphics::Shaders {
 			}
 			float3 albedo = input.color.rgb * texel.rgb * uniforms.baseColor.rgb;
 			float roughness = clamp(uniforms.surfaceParameters.x * ((materialFlags & 2u) != 0u ? roughnessMap.sample(roughnessSampler, input.uv).r : 1.0), 0.045, 1.0);
-			float ao = (materialFlags & 4u) != 0u ? mix(1.0, aoMap.sample(aoSampler, input.uv).r, uniforms.surfaceParameters.z) : 1.0;
-			float metallic = uniforms.baseColor.w;
 			float3 view = frame.cameraPosition.xyz - input.worldPosition;
 			view *= rsqrt(max(dot(view, view), 0.000001));
-			float alphaSquared = roughness * roughness * roughness * roughness;
+			float3 surfaceRadiance = float3(0.0);
+			#if CUSTOM_DEPTH_SURFACE
+			constexpr sampler depthSampler(coord::normalized, address::clamp_to_edge, filter::nearest);
+			float depth = sceneDepth.sample(depthSampler, input.position.xy / frame.fogScreenParameters.xy, level(0.0));
+			float opaqueDistance = -1.0;
+			if (depth < 1.0 && frame.cameraForward.w > 0.5) {
+				float nearClip = frame.fogViewParameters.z;
+				float farClip = frame.fogViewParameters.w;
+				float range = farClip - nearClip;
+				float opaqueViewDepth = nearClip * farClip / (farClip - depth * range);
+				float surfaceViewDepth = nearClip * farClip / (farClip - input.position.z * range);
+				opaqueDistance = max(opaqueViewDepth - surfaceViewDepth, 0.0) / max(dot(-view, frame.cameraForward.xyz), 0.0001);
+			}
+			ModifyDepthSurface(albedo, normal, roughness, surfaceRadiance, input.worldPosition, view, opaqueDistance, uniforms.customData, frame
+			#ifdef SAMPLED_MODIFIER
+				, normalMap, input.modifierData
+			#endif
+			);
+			normal = normalize(normal);
+			roughness = clamp(roughness, 0.045, 1.0);
+			#endif
+			#ifdef SINGLE_LAYER_VISIBILITY_SLOT
+			if (behindNearest) discard_fragment();
+			#endif
 			float nDotV = max(twoSided ? abs(dot(normal, view)) : dot(normal, view), 0.0001);
+			float ao = (materialFlags & 4u) != 0u ? mix(1.0, aoMap.sample(aoSampler, input.uv).r, uniforms.surfaceParameters.z) : 1.0;
+			float metallic = uniforms.baseColor.w;
+			float alphaSquared = roughness * roughness * roughness * roughness;
 			Surface surface{normal, view, albedo, mix(float3(0.04), albedo, metallic), metallic, alphaSquared, nDotV, sqrt(nDotV * nDotV * (1.0 - alphaSquared) + alphaSquared)};
 			float diffuse = max(twoSided ? abs(dot(normal, -frame.directionalDirection.xyz)) : dot(normal, -frame.directionalDirection.xyz), 0.0) * frame.directionalDirection.w;
 			bool directionalShadow = uniforms.lightingParameters.z > 0.5 && diffuse > 0.0;
 			float staticShadow = 0.0;
 			if (directionalShadow) {
-				float detailCoverage = ShadowCoverage(input.shadowPosition0, uniforms.shadowParameters[0]);
+				float2 detailUV;
+				float detailDepth;
+				float detailCoverage = ShadowProjection(input.shadowPosition0, uniforms.shadowParameters[0], detailUV, detailDepth);
 				if (detailCoverage < 1.0) staticShadow = ShadowAmount(input.shadowPosition1, fallbackMap, fallbackSampler, uniforms.shadowParameters[1]);
-				if (detailCoverage > 0.0) staticShadow = mix(staticShadow, ShadowAmount(input.shadowPosition0, detailMap, detailSampler, uniforms.shadowParameters[0]), detailCoverage);
+				if (detailCoverage > 0.0) staticShadow = mix(staticShadow, ShadowTaps(detailDepth, detailUV, detailMap, detailSampler, uniforms.shadowParameters[0]), detailCoverage);
 			}
 			float dynamicShadow = 0.0;
 			if (directionalShadow) dynamicShadow = ShadowAmount(input.shadowPosition2, dynamicMap, dynamicSampler, uniforms.shadowParameters[2]);
@@ -407,33 +496,30 @@ namespace Sapphire::Graphics::Shaders {
 				float distanceSquared = dot(toLight, toLight);
 				if (distanceSquared < positionRange.w * positionRange.w) {
 					float distanceToLight = sqrt(distanceSquared);
-					float pointDiffuse = max(twoSided ? abs(dot(normal, toLight / max(distanceToLight, 0.0001))) : dot(normal, toLight / max(distanceToLight, 0.0001)), 0.0);
+					float3 lightDirection = toLight / max(distanceToLight, 0.0001);
+					float pointDiffuse = max(twoSided ? abs(dot(normal, lightDirection)) : dot(normal, lightDirection), 0.0);
 					if (pointDiffuse <= 0.0) continue;
 					float rangeFade = clamp(1.0 - distanceToLight / positionRange.w, 0.0, 1.0);
 					float attenuation = rangeFade * rangeFade / max(distanceSquared, 1.0);
 					float4 shadowInfo = frame.pointLightShadowInfo[index];
 					float shadowBias = frame.pointLightShadowBias[index].x;
-					float staticPointShadow = uniforms.lightingParameters.z > 0.5 && shadowInfo.z > 0.5 ? PointShadowAmount(-toLight, positionRange.w, shadowBias, uint(shadowInfo.x), pointShadowMap, pointShadowSampler, uniforms.shadowParameters[0].z) : 0.0;
-					float dynamicPointShadow = uniforms.lightingParameters.z > 0.5 && shadowInfo.w > 0.5 ? PointShadowAmount(-toLight, positionRange.w, shadowBias, uint(shadowInfo.y), pointShadowMap, pointShadowSampler, uniforms.shadowParameters[0].z) : 0.0;
-					pointLighting += EvaluateLight(surface, toLight / max(distanceToLight, 0.0001), twoSided) * colorIntensity.rgb * colorIntensity.a * attenuation * (1.0 - staticPointShadow) * (1.0 - dynamicPointShadow);
+					bool staticShadowValid = uniforms.lightingParameters.z > 0.5 && shadowInfo.z > 0.5;
+					bool dynamicShadowValid = uniforms.lightingParameters.z > 0.5 && shadowInfo.w > 0.5;
+					float receiverDistance = staticShadowValid || dynamicShadowValid ? length(-toLight) : 0.0;
+					float staticPointShadow = staticShadowValid ? PointShadowAmount(-toLight, receiverDistance, positionRange.w, shadowBias, uint(shadowInfo.x), pointShadowMap, pointShadowSampler, uniforms.shadowParameters[0].z) : 0.0;
+					float dynamicPointShadow = dynamicShadowValid ? PointShadowAmount(-toLight, receiverDistance, positionRange.w, shadowBias, uint(shadowInfo.y), pointShadowMap, pointShadowSampler, uniforms.shadowParameters[0].z) : 0.0;
+					pointLighting += EvaluateLight(surface, lightDirection, twoSided) * colorIntensity.rgb * colorIntensity.a * attenuation * (1.0 - staticPointShadow) * (1.0 - dynamicPointShadow);
 				}
 			}
 			float3 ambient = frame.ambientLight.a > 0.5 ? frame.ambientLight.rgb : float3(0.0);
-			float3 color = albedo * ambient * ao * (1.0 - metallic) + direct + pointLighting;
+			float3 color = albedo * ambient * ao * (1.0 - metallic) + direct + pointLighting + surfaceRadiance;
+
 			color = frame.fogVolumeParameters.x > 0.5 ? color * fogTransmittance + fogScattering : mix(color, frame.fogColor.rgb, fog);
 			return float4(EncodeColor(color, frame, input.position.xy), opacity);
 		}
 	)";
 
-	inline const std::string shadowVertexShaderSource = deformationShaderSource + R"(
-		struct VertexInput { float3 position [[attribute(0)]]; float3 normal [[attribute(1)]]; float2 uv [[attribute(2)]]; float4 color [[attribute(3)]];
-		#if SKINNED
-		ushort4 boneIndices [[attribute(4)]]; float4 boneWeights [[attribute(5)]];
-		#endif
-		#if INSTANCED
-		float3 instancePosition [[attribute(4)]]; float3 instanceRotation [[attribute(5)]]; float3 instanceScale [[attribute(6)]]; float instanceData [[attribute(7)]];
-		#endif
-		};
+	inline const std::string shadowVertexShaderSource = deformationShaderSource + meshVertexPreparationSource + R"(
 		struct VertexOutput { float4 position [[position]]; float2 uv; };
 		struct ShadowUniforms { float4x4 mvp; float4x4 model; float4 displacementParameters; float4 uvTransform; float4 modifierTime; };
 		vertex VertexOutput main0(VertexInput input [[stage_in]], constant ShadowUniforms& uniforms [[buffer(0)]],
@@ -442,31 +528,22 @@ namespace Sapphire::Graphics::Shaders {
 		#endif
 		texture2d<float> heightMap [[texture(0)]], sampler heightSampler [[sampler(0)]], texture2d<float> maskMap [[texture(1)]], sampler maskSampler [[sampler(1)]]) {
 			VertexOutput output;
-			float2 uv = input.uv * uniforms.uvTransform.xy + uniforms.uvTransform.zw;
-			float3 localPosition = input.position;
-			float3 localNormal = input.normal;
-			float4 color = input.color;
+			float2 uv;
+			float3 localNormal;
+			float4 color;
+			float3 position;
+			float instanceData;
+			PrepareVertex(input, uniforms.uvTransform, uniforms.displacementParameters, uniforms.model,
 			#if SKINNED
-			float4 skinnedPosition = float4(0.0);
-			float3 skinnedNormal = float3(0.0);
-			for (uint influence = 0; influence < 4; ++influence) {
-				float weight = input.boneWeights[influence];
-				skinnedPosition += (boneMatrices[input.boneIndices[influence]] * float4(localPosition, 1.0)) * weight;
-				skinnedNormal += (boneMatrices[input.boneIndices[influence]] * float4(localNormal, 0.0)).xyz * weight;
-			}
-			localPosition = skinnedPosition.xyz;
-			localNormal = normalize(skinnedNormal);
+				boneMatrices,
 			#endif
-			#if INSTANCED
-			localPosition = input.instancePosition + InstanceRotate(localPosition * input.instanceScale, input.instanceRotation);
-			localNormal = InstanceNormal(localNormal, input.instanceScale, input.instanceRotation);
-			#endif
-			float3 position = Deform(localPosition, localNormal, uv, color, uniforms.model, uniforms.displacementParameters, heightMap, heightSampler, maskMap, maskSampler);
-			float instanceData = 0.0;
-			#if INSTANCED
-			instanceData = input.instanceData;
-			#endif
+				heightMap, heightSampler, maskMap, maskSampler, position, localNormal, uv, color, instanceData);
+			#ifdef SAMPLED_MODIFIER
+			float4 modifierData;
+			ModifySampledVertex(position, uniforms.modifierTime.x, uniforms.model, heightMap, modifierData);
+			#else
 			ModifyVertex(position, localNormal, color, instanceData, uniforms.modifierTime.x, uniforms.model);
+			#endif
 			output.position = uniforms.mvp * float4(position, 1.0);
 			output.uv = uv;
 			return output;
@@ -484,6 +561,16 @@ namespace Sapphire::Graphics::Shaders {
 		#else
 		fragment void main0() {}
 		#endif
+	)";
+
+	inline constexpr const char* layerDepthFragmentShaderSource = R"(
+		#include <metal_stdlib>
+		using namespace metal;
+		struct FragmentInput { float4 position [[position]]; float2 uv; float4 color; uint layerInstance [[flat]]; };
+		fragment uint2 main0(FragmentInput input [[stage_in]], constant float4& opacity [[buffer(0)]], texture2d<float> image [[texture(0)]], sampler imageSampler [[sampler(0)]], uint primitiveID [[primitive_id]]) {
+			if (input.color.a * image.sample(imageSampler, input.uv).a * opacity.x <= 0.0) discard_fragment();
+			return uint2(input.layerInstance, primitiveID);
+		}
 	)";
 
 	inline constexpr const char* vertexSource = R"(using namespace metal;
@@ -516,6 +603,80 @@ namespace Sapphire::Graphics::Shaders {
 		fragment float4 main0(FragmentInput input [[stage_in]],
 			texture2d<float> image [[texture(0)]], sampler imageSampler [[sampler(0)]]) {
 			return image.sample(imageSampler, input.uv);
+		}
+	)";
+
+	inline const std::string waterSpectrumSource = R"(
+		#define SAMPLED_MODIFIER 1
+		float3 OceanSample(texture2d<float> atlas, float4 data, int plane, float lod) {
+			constexpr sampler linearSampler(coord::normalized, filter::linear, mip_filter::linear);
+			uint first = uint(floor(data.z)) % 64u;
+			uint next = (first + 1u) % 64u;
+			float2 inside = fract(data.xy) * 128.0 + 1.5;
+			float2 a = float2(first % 8u + uint(plane * 8), first / 8u);
+			float2 b = float2(next % 8u + uint(plane * 8), next / 8u);
+			float2 dimensions = float2(atlas.get_width(), atlas.get_height());
+			float3 left = atlas.sample(linearSampler, (130.0 * a + inside) / dimensions, level(lod)).rgb;
+			float3 right = atlas.sample(linearSampler, (130.0 * b + inside) / dimensions, level(lod)).rgb;
+			return mix(left, right, fract(data.z)) * 2.0 - 1.0;
+		}
+	)";
+
+	inline const std::string waterVertexModifierSource = waterSpectrumSource + R"(
+		void ModifySampledVertex(thread float3& position, float time, float4x4 model, texture2d<float> atlas, thread float4& data) {
+			float2 wind = float2(WIND_X, WIND_Y);
+			float2 across = float2(-wind.y, wind.x);
+			float2 world = (model * float4(position, 1.0)).xy;
+			float height = length(model[2].xyz) * 0.5;
+			data = float4(float2(dot(world, wind), dot(world, across)) / PATCH_METRES,
+				fract(time * sqrt(160.0 / PATCH_METRES) / 16.0) * 64.0, height / PATCH_METRES);
+			position.z += 0.5 * OceanSample(atlas, data, 0, 0.0).r;
+			float2 horizontal = height * CHOP * (wind * OceanSample(atlas, data, 1, 0.0).r + across * OceanSample(atlas, data, 2, 0.0).r);
+			position.x += dot(horizontal, model[0].xy) / max(dot(model[0].xyz, model[0].xyz), 1e-12);
+			position.y += dot(horizontal, model[1].xy) / max(dot(model[1].xyz, model[1].xyz), 1e-12);
+		}
+	)";
+
+	inline const std::string waterSurfaceSource = waterSpectrumSource + R"(
+		void ModifyDepthSurface(thread float3& albedo, thread float3& normal, thread float& roughness, thread float3& radiance,
+			float3 position, float3 view, float opaqueDistance, constant float4* parameters, constant FrameUniforms& frame,
+			texture2d<float> atlas, float4 data) {
+			float4 shoreline = parameters[0];
+			float footprint = max(length(dfdx(data.xy)), length(dfdy(data.xy))) * 128.0;
+			float lod = clamp(log2(max(footprint, 1.0)), 0.0, 1.0);
+			float scale = 64.0 * data.w;
+			float2 dz = OceanSample(atlas, data, 0, lod).gb * scale;
+			float2 dx = OceanSample(atlas, data, 1, lod).gb * scale * parameters[1].z;
+			float2 dy = OceanSample(atlas, data, 2, lod).gb * scale * parameters[1].z;
+			float3 waveNormal = cross(float3(1.0 + dx.x, dy.x, dz.x), float3(dx.y, 1.0 + dy.y, dz.y));
+			float2 wind = parameters[1].xy;
+			float2 xy = wind * waveNormal.x + float2(-wind.y, wind.x) * waveNormal.y;
+			float detail = 1.0 - smoothstep(2.0, 10.0, footprint);
+			normal = normalize(float3(xy * detail, max(waveNormal.z, 0.01)));
+			float rippleTime = frame.modifierTime.x;
+			float depth = opaqueDistance < 0.0 ? shoreline.y : opaqueDistance * max(abs(view.z), 0.25);
+			float shallows = 1.0 - smoothstep(0.0, shoreline.y, depth);
+			float3 waterColor = albedo;
+			albedo = mix(albedo, sqrt(saturate(waterColor)), shallows * 0.58);
+
+			float contactFilter = fwidth(max(opaqueDistance, 0.0));
+			float foam = 0.0;
+			if (shoreline.z > 0.5 && shoreline.x > 0.0 && opaqueDistance >= 0.0) {
+				float pulse = sin(dot(position.xy, float2(3.2, 2.1)) - rippleTime * 4.0);
+				float breakup = sin(dot(position.xy, float2(-4.1, 3.3)) + rippleTime * 3.1);
+				float width = shoreline.x * (0.75 + 0.16 * pulse + 0.09 * breakup);
+				float contact = 1.0 - smoothstep(width * 0.35, width + min(contactFilter, width * 0.25), opaqueDistance);
+				foam = contact * (0.53 + 0.19 * pulse + 0.17 * breakup);
+			}
+			albedo = mix(albedo, mix(waterColor, float3(1.0), 0.48), foam);
+			roughness = mix(roughness, 0.65, foam);
+			float grazing = 1.0 - saturate(dot(normal, view));
+			float fresnel = 0.02 + 0.98 * pow(grazing, 5.0);
+			float3 ambient = frame.ambientLight.rgb * frame.ambientLight.a;
+			float3 daylight = frame.directionalColor.rgb * frame.directionalDirection.w * saturate(-frame.directionalDirection.z);
+			float3 scatter = waterColor * (ambient + daylight) * (0.35 + 0.45 * shallows);
+			float horizon = 1.0 - saturate(reflect(-view, normal).z);
+			radiance = mix(scatter, ambient * (0.4 + 0.6 * horizon), fresnel) * (1.0 - foam);
 		}
 	)";
 }
