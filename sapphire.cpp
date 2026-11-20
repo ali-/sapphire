@@ -32,7 +32,6 @@ namespace Sapphire {
 			Shutdown(nullptr, nullptr);
 			return 1;
 		}
-		SDL_SetWindowRelativeMouseMode(window, true);
 		SDL_GetWindowSize(window, &Screen::width, &Screen::height);
 		SDL_GPUDevice *gpuDevice = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_MSL, SDL_GetHintBoolean("SAPPHIRE_GPU_DEBUG", false), "metal");
 		const bool claimed = gpuDevice && SDL_ClaimWindowForGPUDevice(gpuDevice, window);
@@ -48,6 +47,7 @@ namespace Sapphire {
 				Shutdown(gpuDevice, window, claimed);
 				return 1;
 			}
+			if (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) SDL_SetWindowRelativeMouseMode(window, true);
 
 			const float fixedStep = Time::fixedDeltaTime;
 			const Uint64 fixedStepNs = std::max<Uint64>(1, static_cast<Uint64>(fixedStep * 1'000'000'000.0));
@@ -88,6 +88,7 @@ namespace Sapphire {
 				SDL_Event event;
 				while (SDL_PollEvent(&event)) {
 					Input::ProcessEvent(event);
+					if (event.type == SDL_EVENT_WINDOW_FOCUS_GAINED && event.window.windowID == windowID) SDL_SetWindowRelativeMouseMode(window, true);
 					if (event.type == SDL_EVENT_QUIT) running = false;
 					if (event.type == SDL_EVENT_WINDOW_RESIZED && event.window.windowID == windowID) {
 						Screen::width = event.window.data1;

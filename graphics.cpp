@@ -2160,6 +2160,18 @@ namespace Sapphire::Graphics {
 		return UploadTexture(gpuDevice, width, height, pixels, srgb ? SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, 4);
 	}
 
+	void EnsureGeneratedTexture(const std::string& name, int width, int height, std::vector<std::uint8_t> (*generate)()) {
+		if (textures.count(name)) return;
+		auto pixels = generate();
+		if (width <= 0 || height <= 0 || pixels.size() != static_cast<std::size_t>(width) * height * 4) throw std::invalid_argument("Invalid generated texture dimensions");
+		auto* texture = UploadTexture(gpuDevice, width, height, pixels.data(), SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, 4, 0, true);
+		try {
+			textureReferences.emplace(texture, 1);
+			textures.emplace(name, texture);
+		}
+		catch (...) { ReleaseTexture(gpuDevice, texture); throw; }
+	}
+
 	std::filesystem::path ResourcePath(std::string_view fileName) {
 		return (std::filesystem::path(SDL_GetBasePath()) / ".." / "resources" / std::string(fileName)).lexically_normal();
 	}
@@ -2171,6 +2183,11 @@ namespace Sapphire::Graphics {
 	SDL_GPUTexture* LoadTexture(std::string_view fileName, bool srgb, bool mipmaps) { return LoadTexture(fileName, srgb, mipmaps, false); }
 
 	SDL_GPUTexture* LoadTexture(std::string_view fileName, bool srgb, bool mipmaps, bool blended, bool singleChannel) {
+		if (fileName.substr(0, 10) == "generated:") {
+			auto* texture = textures.at(std::string(fileName));
+			++textureReferences.at(texture);
+			return texture;
+		}
 		const std::string path = ResourcePath(fileName).string();
 		const std::string key = std::string(srgb ? "color:" : "data:") + (mipmaps ? "mips:" : "single:") + (blended ? "blended:" : "masked:") + (singleChannel ? "r8:" : "rgba8:") + path;
 		if (auto found = textures.find(key); found != textures.end()) {

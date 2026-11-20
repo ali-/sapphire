@@ -74,6 +74,9 @@ namespace Sapphire::Graphics::Shaders {
 		#if CUSTOM_FRAGMENT_NORMAL
 		float3 baseWorldPosition;
 		#endif
+		#ifdef SAMPLED_MODIFIER
+		float4 modifierData;
+		#endif
 		#if SINGLE_LAYER
 		uint layerInstance [[flat]];
 		#endif
@@ -101,7 +104,11 @@ namespace Sapphire::Graphics::Shaders {
 			#if CUSTOM_FRAGMENT_NORMAL
 			output.baseWorldPosition = (uniforms.model * float4(position, 1.0)).xyz;
 			#endif
+			#ifdef SAMPLED_MODIFIER
+			ModifySampledVertex(position, uniforms.modifierTime.x, uniforms.model, heightMap, output.modifierData);
+			#else
 			ModifyVertex(position, localNormal, color, instanceData, uniforms.modifierTime.x, uniforms.model);
+			#endif
 			output.position = uniforms.mvp * float4(position, 1.0);
 			#if SINGLE_LAYER
 			output.layerInstance = uniforms.layerParameters.x + instanceID;
@@ -264,6 +271,9 @@ namespace Sapphire::Graphics::Shaders {
 		struct FragmentInput { float4 position [[position]]; float2 uv; float4 color; float3 worldPosition; float3 worldNormal; float4 shadowPosition0; float4 shadowPosition1; float4 shadowPosition2;
 		#if CUSTOM_FRAGMENT_NORMAL
 		float3 baseWorldPosition;
+		#endif
+		#ifdef SAMPLED_MODIFIER
+		float4 modifierData;
 		#endif
 		#ifdef SINGLE_LAYER_VISIBILITY_SLOT
 		uint layerInstance [[flat]];
@@ -448,7 +458,11 @@ namespace Sapphire::Graphics::Shaders {
 				float surfaceViewDepth = nearClip * farClip / (farClip - input.position.z * range);
 				opaqueDistance = max(opaqueViewDepth - surfaceViewDepth, 0.0) / max(dot(-view, frame.cameraForward.xyz), 0.0001);
 			}
-			ModifyDepthSurface(albedo, normal, roughness, surfaceRadiance, input.worldPosition, view, opaqueDistance, uniforms.customData, frame);
+			ModifyDepthSurface(albedo, normal, roughness, surfaceRadiance, input.worldPosition, view, opaqueDistance, uniforms.customData, frame
+			#ifdef SAMPLED_MODIFIER
+				, normalMap, input.modifierData
+			#endif
+			);
 			normal = normalize(normal);
 			roughness = clamp(roughness, 0.045, 1.0);
 			#endif
@@ -524,7 +538,12 @@ namespace Sapphire::Graphics::Shaders {
 				boneMatrices,
 			#endif
 				heightMap, heightSampler, maskMap, maskSampler, position, localNormal, uv, color, instanceData);
+			#ifdef SAMPLED_MODIFIER
+			float4 modifierData;
+			ModifySampledVertex(position, uniforms.modifierTime.x, uniforms.model, heightMap, modifierData);
+			#else
 			ModifyVertex(position, localNormal, color, instanceData, uniforms.modifierTime.x, uniforms.model);
+			#endif
 			output.position = uniforms.mvp * float4(position, 1.0);
 			output.uv = uv;
 			return output;
@@ -587,123 +606,58 @@ namespace Sapphire::Graphics::Shaders {
 		}
 	)";
 
-	inline const std::string waterVertexModifierSource = R"(
-		constant float waveWeights[8] = {0.23, 0.19, 0.16, 0.13, 0.10, 0.08, 0.065, 0.045};
-		constant float stormWeights[8] = {0.31, 0.24, 0.17, 0.095, 0.062, 0.05, 0.041, 0.032};
-		constant float waveFrequencies[8] = {0.54, 0.78, 0.91, 1.16, 1.37, 1.59, 1.83, 2.07};
-		constant float waveHeadings[8] = {0.14, -0.48, 0.75, -0.95, -0.16, 0.53, -0.71, 0.98};
-		constant float stormHeadingOffsets[8] = {0.0, 0.0, 48.0, 0.0, 0.0, 52.0, 0.0, 35.0};
-		constant float wavePhases[8] = {0.0, 1.7, 4.1, 2.8, 5.2, 0.9, 3.5, 5.8};
-
-		void ModifyVertex(thread float3& position, thread float3& normal, thread float4& color, float instanceData, float time, float4x4 model) {
-			float2 world = (model * float4(position, 1.0)).xy;
-			float heightScale = length(model[2].xyz) * WAVE_AMPLITUDE;
-			float storm = smoothstep(0.25, 0.9, WAVE_STEEPNESS);
-			float secondHarmonic = 0.24 * storm;
-			float crestLean = 0.08 * storm;
-			float profileScale = 1.0 / (1.0 + secondHarmonic + crestLean);
-			float compressionLimit = mix(0.72, 0.87, storm);
-			float localHeight = 0.0;
-			float2 horizontal = float2(0.0);
-			float3 tangentX = float3(1.0, 0.0, 0.0);
-			float3 tangentY = float3(0.0, 1.0, 0.0);
-			for (int i = 0; i < 8; ++i) {
-				float headingSpread = mix(1.0, i < 3 ? 0.32 : 0.82, storm);
-				float heading = WAVE_DIRECTION + WAVE_SPREAD * waveHeadings[i] * headingSpread + storm * stormHeadingOffsets[i];
-				float angle = heading * 0.01745329252;
-				float2 direction = float2(cos(angle), sin(angle));
-				float2 crosswind = float2(-direction.y, direction.x);
-				float waveNumber = (6.28318530718 / WAVE_LENGTH) * waveFrequencies[i];
-				float2 carrier = direction * waveNumber;
-				float travel = time * WAVE_SPEED * sqrt(9.81 * waveNumber);
-				float phase = dot(world, carrier) - travel + wavePhases[i];
-				float2 envelopeAxis = waveNumber * (0.14 * direction + 0.26 * crosswind * waveHeadings[i]);
-				float groupTravel = 0.5 * travel * dot(envelopeAxis, direction) / waveNumber;
-				float groupPhase = dot(world, envelopeAxis) - mix(travel * 0.17, groupTravel, storm) + wavePhases[i] * 1.81;
-				float envelope = 0.68 + 0.32 * cos(groupPhase);
-				float2 envelopeGradient = -0.32 * sin(groupPhase) * envelopeAxis;
-				float weight = mix(waveWeights[i], stormWeights[i], storm);
-				float sine = sin(phase);
-				float cosine = cos(phase);
-				float sineTwice = 2.0 * sine * cosine;
-				float cosineTwice = cosine * cosine - sine * sine;
-				float profile = (sine - secondHarmonic * cosineTwice + crestLean * sineTwice) * profileScale;
-				float profileSlope = (cosine + 2.0 * (secondHarmonic * sineTwice + crestLean * cosineTwice)) * profileScale;
-				float horizontalAmplitude = weight * min(WAVE_STEEPNESS * heightScale, compressionLimit / waveNumber);
-				localHeight += WAVE_AMPLITUDE * weight * envelope * profile;
-				horizontal += direction * (horizontalAmplitude * envelope * cosine);
-				float2 verticalSlope = heightScale * weight * (envelope * profileSlope * carrier + profile * envelopeGradient);
-				float2 horizontalSlope = horizontalAmplitude * (cosine * envelopeGradient - envelope * sine * carrier);
-				tangentX += float3(direction * horizontalSlope.x, verticalSlope.x);
-				tangentY += float3(direction * horizontalSlope.y, verticalSlope.y);
-			}
-			float3 worldNormal = cross(tangentX, tangentY);
-			if (heightScale > 0.0001) {
-				normal = float3(dot(model[0].xyz, worldNormal), dot(model[1].xyz, worldNormal), dot(model[2].xyz, worldNormal));
-			}
-
-			float3 offset = float3(horizontal, 0.0);
-			position.x += dot(offset, model[0].xyz) / max(dot(model[0].xyz, model[0].xyz), 0.00000001);
-			position.y += dot(offset, model[1].xyz) / max(dot(model[1].xyz, model[1].xyz), 0.00000001);
-			position.z += localHeight;
+	inline const std::string waterSpectrumSource = R"(
+		#define SAMPLED_MODIFIER 1
+		float3 OceanSample(texture2d<float> atlas, float4 data, int plane, float lod) {
+			constexpr sampler linearSampler(coord::normalized, filter::linear, mip_filter::linear);
+			uint first = uint(floor(data.z)) % 64u;
+			uint next = (first + 1u) % 64u;
+			float2 inside = fract(data.xy) * 128.0 + 1.5;
+			float2 a = float2(first % 8u + uint(plane * 8), first / 8u);
+			float2 b = float2(next % 8u + uint(plane * 8), next / 8u);
+			float2 dimensions = float2(atlas.get_width(), atlas.get_height());
+			float3 left = atlas.sample(linearSampler, (130.0 * a + inside) / dimensions, level(lod)).rgb;
+			float3 right = atlas.sample(linearSampler, (130.0 * b + inside) / dimensions, level(lod)).rgb;
+			return mix(left, right, fract(data.z)) * 2.0 - 1.0;
 		}
 	)";
 
-	inline const std::string waterSurfaceSource = R"(
-		float4 RippleRandom(int2 cell) {
-			uint2 key = uint2(cell);
-			uint state = (key.x * 1597334677u ^ key.y * 3812015801u) * 747796405u + 2891336453u;
-			uint bits = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
-			bits ^= bits >> 22u;
-			return float4(uint4(bits, bits >> 8u, bits >> 16u, bits >> 24u) & 255u) / 255.0;
+	inline const std::string waterVertexModifierSource = waterSpectrumSource + R"(
+		void ModifySampledVertex(thread float3& position, float time, float4x4 model, texture2d<float> atlas, thread float4& data) {
+			float2 wind = float2(WIND_X, WIND_Y);
+			float2 across = float2(-wind.y, wind.x);
+			float2 world = (model * float4(position, 1.0)).xy;
+			float height = length(model[2].xyz) * 0.5;
+			data = float4(float2(dot(world, wind), dot(world, across)) / PATCH_METRES,
+				fract(time * sqrt(160.0 / PATCH_METRES) / 16.0) * 64.0, height / PATCH_METRES);
+			position.z += 0.5 * OceanSample(atlas, data, 0, 0.0).r;
+			float2 horizontal = height * CHOP * (wind * OceanSample(atlas, data, 1, 0.0).r + across * OceanSample(atlas, data, 2, 0.0).r);
+			position.x += dot(horizontal, model[0].xy) / max(dot(model[0].xyz, model[0].xyz), 1e-12);
+			position.y += dot(horizontal, model[1].xy) / max(dot(model[1].xyz, model[1].xyz), 1e-12);
 		}
+	)";
 
-		float2 RippleSlope(float2 position, float time, float coverage) {
-			float visible = 1.0 - smoothstep(0.06, 0.20, max(fwidth(position.x), fwidth(position.y)));
-			if (visible <= 0.0) return float2(0.0);
-			int2 cell = int2(floor(position));
-			float2 slope = float2(0.0);
-			for (int corner = 0; corner < 4; ++corner) {
-				int2 anchor = cell + int2(corner & 1, corner >> 1);
-				float4 random = RippleRandom(anchor);
-				float2 offset = position - float2(anchor) - (random.xy - 0.5) * 0.42;
-				float radius = mix(0.24, 0.58, coverage) * mix(0.82, 1.12, random.z);
-				float inverseRadiusSquared = 1.0 / (radius * radius);
-				float envelope = 1.0 - dot(offset, offset) * inverseRadiusSquared;
-				if (envelope <= 0.0) continue;
-
-				float heading = (random.z - 0.5) * 1.65;
-				float2 direction = float2(cos(heading), sin(heading));
-				float waveNumber = mix(9.0, 17.0, random.y);
-				float seedPhase = random.w * 6.2831853;
-				float phase = dot(offset, direction) * waveNumber - time * mix(0.8, 2.1, random.x) + seedPhase;
-				float lifetime = mix(0.22, 1.0, smoothstep(-0.50, 0.78, sin(time * mix(0.55, 0.95, random.w) + seedPhase)));
-				float2 carrierSlope = direction * (cos(phase) * envelope * envelope);
-				float2 envelopeSlope = offset * (-4.0 * inverseRadiusSquared * envelope * sin(phase) / waveNumber);
-				slope += (carrierSlope + envelopeSlope) * lifetime;
-			}
-			return slope * visible;
-		}
-
+	inline const std::string waterSurfaceSource = waterSpectrumSource + R"(
 		void ModifyDepthSurface(thread float3& albedo, thread float3& normal, thread float& roughness, thread float3& radiance,
-			float3 position, float3 view, float opaqueDistance, constant float4* parameters, constant FrameUniforms& frame) {
+			float3 position, float3 view, float opaqueDistance, constant float4* parameters, constant FrameUniforms& frame,
+			texture2d<float> atlas, float4 data) {
 			float4 shoreline = parameters[0];
-			float4 ripples = parameters[1];
-			float time = frame.modifierTime.x;
-			float rippleTime = time * ripples.z;
-			float2 direction = float2(cos(ripples.w), sin(ripples.w));
-			float2 crosswind = float2(-direction.y, direction.x);
-			float2 ripplePosition = float2(dot(position.xy, direction), dot(position.xy, crosswind));
-			ripplePosition = (ripplePosition - float2(rippleTime, rippleTime * 0.18)) / ripples.x;
-			float2 slope = RippleSlope(ripplePosition, rippleTime, parameters[2].x);
-			float2 worldSlope = direction * slope.x + crosswind * slope.y;
-			float3 swellNormal = normal;
-			normal = normalize(normal - float3(worldSlope * ripples.y, 0.0));
-
+			float footprint = max(length(dfdx(data.xy)), length(dfdy(data.xy))) * 128.0;
+			float lod = clamp(log2(max(footprint, 1.0)), 0.0, 1.0);
+			float scale = 64.0 * data.w;
+			float2 dz = OceanSample(atlas, data, 0, lod).gb * scale;
+			float2 dx = OceanSample(atlas, data, 1, lod).gb * scale * parameters[1].z;
+			float2 dy = OceanSample(atlas, data, 2, lod).gb * scale * parameters[1].z;
+			float3 waveNormal = cross(float3(1.0 + dx.x, dy.x, dz.x), float3(dx.y, 1.0 + dy.y, dz.y));
+			float2 wind = parameters[1].xy;
+			float2 xy = wind * waveNormal.x + float2(-wind.y, wind.x) * waveNormal.y;
+			float detail = 1.0 - smoothstep(2.0, 10.0, footprint);
+			normal = normalize(float3(xy * detail, max(waveNormal.z, 0.01)));
+			float rippleTime = frame.modifierTime.x;
 			float depth = opaqueDistance < 0.0 ? shoreline.y : opaqueDistance * max(abs(view.z), 0.25);
 			float shallows = 1.0 - smoothstep(0.0, shoreline.y, depth);
 			float3 waterColor = albedo;
-			albedo = mix(albedo, mix(waterColor, float3(0.55, 0.72, 0.77), 0.5), shallows * 0.58);
+			albedo = mix(albedo, sqrt(saturate(waterColor)), shallows * 0.58);
 
 			float contactFilter = fwidth(max(opaqueDistance, 0.0));
 			float foam = 0.0;
@@ -716,12 +670,13 @@ namespace Sapphire::Graphics::Shaders {
 			}
 			albedo = mix(albedo, mix(waterColor, float3(1.0), 0.48), foam);
 			roughness = mix(roughness, 0.65, foam);
-			float3 sheenNormal = normalize(mix(swellNormal, normal, 0.45));
-			float grazing = 1.0 - saturate(dot(sheenNormal, view));
+			float grazing = 1.0 - saturate(dot(normal, view));
 			float fresnel = 0.02 + 0.98 * pow(grazing, 5.0);
-			float horizon = 1.0 - saturate(reflect(-view, sheenNormal).z);
-			float sheenStrength = clamp(dot(waterColor, float3(0.2126, 0.7152, 0.0722)) * 8.0, 0.35, 1.0);
-			radiance = frame.ambientLight.rgb * frame.ambientLight.a * sheenStrength * (fresnel + 0.22 * horizon) * (1.0 - foam);
+			float3 ambient = frame.ambientLight.rgb * frame.ambientLight.a;
+			float3 daylight = frame.directionalColor.rgb * frame.directionalDirection.w * saturate(-frame.directionalDirection.z);
+			float3 scatter = waterColor * (ambient + daylight) * (0.35 + 0.45 * shallows);
+			float horizon = 1.0 - saturate(reflect(-view, normal).z);
+			radiance = mix(scatter, ambient * (0.4 + 0.6 * horizon), fresnel) * (1.0 - foam);
 		}
 	)";
 }

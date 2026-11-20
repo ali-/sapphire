@@ -3,6 +3,7 @@
 #include <any>
 #include <limits>
 #include <cmath>
+#include <complex>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -1451,47 +1452,132 @@ namespace Sapphire {
 		extern const std::string waterSurfaceSource;
 	}
 
+	namespace Graphics {
+		void EnsureGeneratedTexture(const std::string& name, int width, int height, std::vector<std::uint8_t> (*generate)());
+	}
+
 	class WaterBody : public Object {
+		static constexpr int resolution = 128;
+		static constexpr int tile = resolution + 2;
+		using Complex = std::complex<float>;
+
+		static std::vector<std::uint8_t> BakeSpectrum() {
+			constexpr int n = resolution, count = n * n, frames = 64;
+			constexpr float tau = 6.28318530718f, dk = tau / 160.0f;
+			constexpr float wind = 10.0f, age = 0.84f, peakK = 9.81f * age * age / (wind * wind);
+			auto omega = [](float k) { return std::sqrt(9.81f * k * (1.0f + k * k / (370.0f * 370.0f))); };
+			const float cp = omega(peakK) / peakK;
+			const float friction = 0.41f * wind / std::log(10.0f / (0.000037f * wind * wind / 9.81f * std::pow(wind / cp, 0.9f)));
+			const float sigma = 0.08f * (1.0f + 4.0f / (age * age * age));
+			struct Mode { Complex seed; int rate; float x, y; };
+			std::vector<Mode> modes(count);
+			std::mt19937 random(48271);
+			std::uniform_real_distribution<float> phase(0.0f, tau);
+			for (int y = 0; y < n; ++y) for (int x = 0; x < n; ++x) {
+				if ((!x && !y) || x == n / 2 || y == n / 2) continue;
+				const float kx = (x < n / 2 ? x : x - n) * dk, ky = (y < n / 2 ? y : y - n) * dk;
+				const float k = std::hypot(kx, ky), c = omega(k) / k, ratio = std::sqrt(k / peakK) - 1.0f;
+				const float cutoff = std::exp(-1.25f * peakK * peakK / (k * k));
+				const float peakShape = std::pow(1.7f, std::exp(-0.5f * ratio * ratio * sigma * sigma));
+				const float gravity = 0.003f * std::sqrt(age) * cp / c * cutoff * peakShape * std::exp(-age * ratio / std::sqrt(10.0f));
+				const float capillary = 0.005f * (1 + (friction >= 0.23f ? 3 : 1) * std::log(friction / 0.23f)) *
+					0.23f / c * std::exp(-0.25f * std::pow(k / 370.0f - 1, 2.0f)) * cutoff;
+				const float spread = std::tanh(std::log(2.0f) / 4 + 4 * std::pow(c / cp, 2.5f) + 0.13f * friction / 0.23f * std::pow(0.23f / c, 2.5f));
+				const float density = (gravity + capillary) * (1 + spread * (2 * kx * kx / (k * k) - 1)) / (tau * k * k * k * k);
+				modes[y * n + x] = {std::polar(std::sqrt(density * 0.5f) * dk, phase(random)), static_cast<int>(std::round(omega(k) * 16 / tau)), kx / k, ky / k};
+			}
+
+			std::array<Complex, n> roots;
+			std::array<int, n> reverse{};
+			for (int i = 0; i < n; ++i) {
+				roots[i] = std::polar(1.0f, tau * i / n);
+				reverse[i] = (reverse[i / 2] >> 1) | ((i & 1) * (n / 2));
+			}
+			auto inverse = [&](Complex* line, int stride) {
+				for (int i = 0; i < n; ++i) if (i < reverse[i]) std::swap(line[i * stride], line[reverse[i] * stride]);
+				for (int half = 1; half < n; half *= 2) {
+					for (int start = 0; start < n; start += 2 * half) for (int j = 0; j < half; ++j) {
+						auto& a = line[(start + j) * stride];
+						auto& b = line[(start + j + half) * stride];
+						const Complex odd = b * roots[j * n / (2 * half)];
+						b = a - odd;
+						a += odd;
+					}
+				}
+			};
+			std::vector<Complex> evolved(count), height(count), field(count);
+			std::vector<float> samples(frames * 3 * count);
+			float peak = 0.0f;
+			for (int frame = 0; frame < frames; ++frame) {
+				for (int i = 0; i < count; ++i) evolved[i] = modes[i].seed * std::conj(roots[(modes[i].rate * frame % frames) * (n / frames)]);
+				for (int y = 0; y < n; ++y) for (int x = 0; x < n; ++x)
+					height[y * n + x] = evolved[y * n + x] + std::conj(evolved[(n - y) % n * n + (n - x) % n]);
+				for (int plane = 0; plane < 3; ++plane) {
+					for (int i = 0; i < count; ++i) field[i] = plane == 0 ? height[i] : height[i] * Complex(0, plane == 1 ? modes[i].x : modes[i].y);
+					for (int row = 0; row < n; ++row) inverse(field.data() + row * n, 1);
+					for (int col = 0; col < n; ++col) inverse(field.data() + col, n);
+					float* values = samples.data() + (frame * 3 + plane) * count;
+					for (int i = 0; i < count; ++i) {
+						values[i] = field[i].real();
+						peak = std::max(peak, std::abs(values[i]));
+					}
+				}
+			}
+			const float scale = 127.5f / peak;
+			auto encode = [scale](float value) { return static_cast<std::uint8_t>(std::clamp(value * scale + 128.0f, 0.0f, 255.0f)); };
+			std::vector<std::uint8_t> pixels(tile * 24 * tile * 8 * 4);
+			for (int frame = 0; frame < frames; ++frame) for (int plane = 0; plane < 3; ++plane) {
+				const float* values = samples.data() + (frame * 3 + plane) * count;
+				for (int y = 0; y < tile; ++y) for (int x = 0; x < tile; ++x) {
+					const int col = (x + n - 1) % n, row = (y + n - 1) % n;
+					const int pixel = ((frame / 8 * tile + y) * tile * 24 + (plane * 8 + frame % 8) * tile + x) * 4;
+					pixels[pixel] = encode(values[row * n + col]);
+					pixels[pixel + 1] = encode(values[row * n + (col + 1) % n] - values[row * n + (col + n - 1) % n]);
+					pixels[pixel + 2] = encode(values[(row + 1) % n * n + col] - values[(row + n - 1) % n * n + col]);
+					pixels[pixel + 3] = 255;
+				}
+			}
+			return pixels;
+		}
+
 		public:
 			using Object::Object;
-			float roughness = 0.25f;
-			float speed = 0.42f;
+			float choppiness = 1.0f;
+			float size = 160.0f;
 			float direction = 0.0f;
 			Vector3 color{0.01f, 0.06f, 0.18f};
 			float opacity = 0.5f;
 			bool foam = true;
 
 			void Initialize() override {
-				if (!std::isfinite(roughness) || !std::isfinite(speed) || speed < 0.0f || !std::isfinite(direction) || !std::isfinite(opacity)) return;
+				if (!std::isfinite(size) || size <= 0.0f || !std::isfinite(choppiness) || !std::isfinite(direction) || !std::isfinite(opacity)) return;
 				if (!std::isfinite(transform.scale.x) || transform.scale.x == 0.0f || !std::isfinite(transform.scale.y) || transform.scale.y == 0.0f || !std::isfinite(transform.scale.z) || transform.scale.z < 0.0f) return;
-				const float seaState = std::clamp(roughness, 0.0f, 1.0f);
-				const float motion = std::min(seaState / 0.25f, 1.0f);
-				const float storm = std::max((seaState - 0.25f) / 0.75f, 0.0f);
-				auto blend = [storm](float calm, float rough) { return calm + (rough - calm) * storm; };
-				const float amplitude = motion * blend(0.48f, 2.65f);
-				const float spread = blend(51.0f, 43.0f);
-				const float wavelength = blend(16.0f, 52.0f);
-				const float waveSpeed = motion * speed;
-				const float rippleSpeed = waveSpeed * blend(0.28f / 0.42f, 0.65f / 1.10f);
-				const float steepness = blend(0.21f, 1.0f);
-				const int subdivisions = static_cast<int>(std::round(blend(512.0f, 576.0f)));
+				const float patch = std::max(size, 0.01f);
+				const float chop = std::clamp(choppiness, 0.0f, 2.5f);
+				const float angle = direction * Math::degreesToRadians;
+				const float windX = std::cos(angle), windY = std::sin(angle);
+				auto divisions = [&](float extent) {
+					return static_cast<int>(std::clamp(std::ceil(std::abs(extent) / patch * 48.0f), 1.0f, 448.0f));
+				};
+				const int columns = divisions(transform.scale.x);
+				const int rows = divisions(transform.scale.y);
 				const float surfaceOpacity = std::clamp(opacity, 0.0f, 1.0f);
-				const int rowSize = subdivisions + 1;
+				const int rowSize = columns + 1;
 				MeshData data;
-				data.vertices.reserve(static_cast<std::size_t>(rowSize) * rowSize);
-				data.indices.reserve(static_cast<std::size_t>(subdivisions) * subdivisions * 6);
-				for (int y = 0; y <= subdivisions; ++y) {
-					for (int x = 0; x <= subdivisions; ++x) {
-					const float u = static_cast<float>(x) / subdivisions;
-					const float v = static_cast<float>(y) / subdivisions;
+				data.vertices.reserve(static_cast<std::size_t>(rowSize) * (rows + 1));
+				data.indices.reserve(static_cast<std::size_t>(columns) * rows * 6);
+				for (int y = 0; y <= rows; ++y) {
+					for (int x = 0; x <= columns; ++x) {
+						const float u = static_cast<float>(x) / columns;
+						const float v = static_cast<float>(y) / rows;
 						data.vertices.push_back({{u - 0.5f, v - 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {u, v}, {1.0f, 1.0f, 1.0f, surfaceOpacity}});
 					}
 				}
-				for (int y = 0; y < subdivisions; ++y) {
-					for (int x = 0; x < subdivisions; ++x) {
-					const std::uint32_t first = y * rowSize + x;
-					const std::uint32_t next = first + rowSize;
-					data.indices.insert(data.indices.end(), {first, next + 1, next, first, first + 1, next + 1});
+				for (int y = 0; y < rows; ++y) {
+					for (int x = 0; x < columns; ++x) {
+						const std::uint32_t first = y * rowSize + x;
+						const std::uint32_t next = first + rowSize;
+						data.indices.insert(data.indices.end(), {first, next + 1, next, first, first + 1, next + 1});
 					}
 				}
 				auto& mesh = AddComponent<Mesh>();
@@ -1501,11 +1587,12 @@ namespace Sapphire {
 				mesh.material.baseColor = color;
 				mesh.material.roughness = 0.20f;
 				mesh.material.depthSurfaceSource = Graphics::Shaders::waterSurfaceSource;
-				mesh.material.customData = {
-					blend(0.30f, 0.65f), 8.0f, foam ? 1.0f : 0.0f, 0.0f,
-					blend(16.0f, 22.0f), motion * blend(0.028f, 0.059f), rippleSpeed, direction * Math::degreesToRadians,
-					blend(0.50f, 0.93f)
-				};
+				Graphics::EnsureGeneratedTexture("generated:water-spectrum", tile * 24, tile * 8, BakeSpectrum);
+				mesh.material.displacementTexturePath = "generated:water-spectrum";
+				mesh.material.normalTexturePath = mesh.material.displacementTexturePath;
+				mesh.material.displacementScale = 0.0f;
+				mesh.material.normalScale = 0.0f;
+				mesh.material.customData = {0.35f, 8.0f, foam ? 1.0f : 0.0f, 0.0f, windX, windY, chop};
 				mesh.material.vertexModifierSource = Graphics::Shaders::waterVertexModifierSource;
 				auto& vertexSource = mesh.material.vertexModifierSource;
 				auto replaceMarker = [&](const char* marker, float value) {
@@ -1515,16 +1602,13 @@ namespace Sapphire {
 						vertexSource.replace(position, length, replacement);
 					}
 				};
-				replaceMarker("WAVE_SPEED", waveSpeed);
-				replaceMarker("WAVE_AMPLITUDE", amplitude);
-				replaceMarker("WAVE_DIRECTION", direction);
-				replaceMarker("WAVE_SPREAD", spread);
-				replaceMarker("WAVE_LENGTH", wavelength);
-				replaceMarker("WAVE_STEEPNESS", steepness);
-
+				replaceMarker("PATCH_METRES", patch);
+				replaceMarker("CHOP", chop);
+				replaceMarker("WIND_X", windX);
+				replaceMarker("WIND_Y", windY);
 				mesh.vertexAnimated = true;
-				const float horizontalPadding = steepness * amplitude * transform.scale.z;
-				mesh.vertexBoundsPadding = {horizontalPadding / std::abs(transform.scale.x), horizontalPadding / std::abs(transform.scale.y), amplitude};
+				const float padding = 0.707107f * chop * transform.scale.z;
+				mesh.vertexBoundsPadding = {padding / std::abs(transform.scale.x), padding / std::abs(transform.scale.y), 0.5f};
 				mesh.castShadows = false;
 			}
 	};
