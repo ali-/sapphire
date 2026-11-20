@@ -1560,12 +1560,11 @@ namespace Sapphire {
 			float choppiness = 1.0f;
 			float size = 160.0f;
 			float direction = 0.0f;
-			Vector3 color{0.01f, 0.06f, 0.18f};
-			float opacity = 0.5f;
+			Vector4 color{0.01f, 0.06f, 0.18f, 0.5f};
 			bool foam = true;
 
 			void Initialize() override {
-				if (!std::isfinite(size) || size <= 0.0f || !std::isfinite(choppiness) || !std::isfinite(direction) || !std::isfinite(opacity)) return;
+				if (!std::isfinite(size) || size <= 0.0f || !std::isfinite(choppiness) || !std::isfinite(direction) || !std::isfinite(color.w)) return;
 				if (!std::isfinite(transform.scale.x) || transform.scale.x == 0.0f || !std::isfinite(transform.scale.y) || transform.scale.y == 0.0f || !std::isfinite(transform.scale.z) || transform.scale.z < 0.0f) return;
 				const float patch = std::max(size, 0.01f);
 				const float chop = std::clamp(choppiness, 0.0f, 2.5f);
@@ -1576,7 +1575,7 @@ namespace Sapphire {
 				};
 				const int columns = divisions(transform.scale.x);
 				const int rows = divisions(transform.scale.y);
-				const float surfaceOpacity = std::clamp(opacity, 0.0f, 1.0f);
+				const float surfaceOpacity = std::clamp(color.w, 0.0f, 1.0f);
 				const int rowSize = columns + 1;
 				MeshData data;
 				data.vertices.reserve(static_cast<std::size_t>(rowSize) * (rows + 1));
@@ -1599,7 +1598,7 @@ namespace Sapphire {
 				mesh.data = std::move(data);
 				mesh.material.transparent = surfaceOpacity < 1.0f;
 				mesh.material.singleLayer = true;
-				mesh.material.baseColor = color;
+				mesh.material.baseColor = {color.x, color.y, color.z};
 				mesh.material.roughness = 0.20f;
 				mesh.material.depthSurfaceSource = Graphics::Shaders::waterSurfaceSource;
 				Graphics::EnsureGeneratedTexture("generated:water-spectrum", tile * 24, tile * 8, BakeSpectrum);
