@@ -2340,7 +2340,7 @@ namespace Sapphire::Graphics {
 			result[1].attributes[4] = {4, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(MeshInstance, position)};
 			result[1].attributes[5] = {5, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(MeshInstance, rotation)};
 			result[1].attributes[6] = {6, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(MeshInstance, scale)};
-			result[1].attributes[7] = {7, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT, offsetof(MeshInstance, customData)};
+			result[1].attributes[7] = {7, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, offsetof(MeshInstance, customData)};
 			result[1].bufferCount = 2;
 			result[1].attributeCount = 8;
 			result[2].buffers[1] = {1, sizeof(SkinInfluence), SDL_GPU_VERTEXINPUTRATE_VERTEX, 0};

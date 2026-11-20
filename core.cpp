@@ -67,6 +67,13 @@ namespace Sapphire {
 		}
 	};
 
+	struct Vector4 {
+		float x = 0.0f;
+		float y = 0.0f;
+		float z = 0.0f;
+		float w = 0.0f;
+	};
+
 	struct Transform {
 		Vector3 position;
 		Vector3 rotation;
@@ -646,7 +653,7 @@ namespace Sapphire {
 		Vector3 position;
 		Vector3 rotation;
 		Vector3 scale{1.0f, 1.0f, 1.0f};
-		float customData = 0.0f;
+		float customData[4]{};
 	};
 
 	class Mesh : public Component {
@@ -1373,8 +1380,8 @@ namespace Sapphire {
 			float sizeEnd = 0.1f;
 			std::size_t maxParticles = 256;
 			Vector3 direction{0.0f, 0.0f, 1.0f};
-			Vector3 startColor{1.0f, 1.0f, 1.0f};
-			Vector3 endColor{-1.0f, -1.0f, -1.0f};
+			Vector4 colorStart{1.0f, 1.0f, 1.0f, 1.0f};
+			Vector4 colorEnd{-1.0f, -1.0f, -1.0f, 1.0f};
 			Material material;
 			using Object::Object;
 	
@@ -1385,8 +1392,7 @@ namespace Sapphire {
 				auto& mesh = AddComponent<Mesh>();
 				mesh.data = Primitive::Plane.Mesh();
 				mesh.material = material;
-				if (endColor.x >= 0.0f) mesh.material.vertexModifierSource = "void ModifyVertex(thread float3& position, thread float3& normal, thread float4& color, float instanceData, float time, float4x4 model) { color.rgb *= mix(float3(" + std::to_string(startColor.x) + ", " + std::to_string(startColor.y) + ", " + std::to_string(startColor.z) + "), float3(" + std::to_string(endColor.x) + ", " + std::to_string(endColor.y) + ", " + std::to_string(endColor.z) + "), clamp(instanceData, 0.0, 1.0)); }";
-				else mesh.material.baseColor = {material.baseColor.x * startColor.x, material.baseColor.y * startColor.y, material.baseColor.z * startColor.z};
+				mesh.material.vertexModifierSource = "void ModifyVertex(thread float3& position, thread float3& normal, thread float4& color, float4 instanceData, float time, float4x4 model) { color *= instanceData; }";
 				mesh.instanced = true;
 				mesh.cullBackfaces = false;
 				mesh.castShadows = false;
@@ -1413,7 +1419,12 @@ namespace Sapphire {
 					const float particleSize = sizeStart + (sizeEnd - sizeStart) * age;
 					mesh.instances[index].scale.x = particleSize;
 					mesh.instances[index].scale.y = particleSize;
-					mesh.instances[index].customData = age;
+					const Vector4 target = colorEnd.x >= 0.0f ? colorEnd : colorStart;
+					auto& data = mesh.instances[index].customData;
+					data[0] = colorStart.x + (target.x - colorStart.x) * age;
+					data[1] = colorStart.y + (target.y - colorStart.y) * age;
+					data[2] = colorStart.z + (target.z - colorStart.z) * age;
+					data[3] = colorStart.w + (target.w - colorStart.w) * age;
 					++index;
 				}
 				emissionRemainder += std::max(rate, 0.0f) * deltaTime;
@@ -1431,6 +1442,10 @@ namespace Sapphire {
 						particles.push_back({Math::Scale(travel, speed), 0.0f});
 						MeshInstance instance{};
 						instance.scale = {sizeStart, sizeStart, sizeStart};
+						instance.customData[0] = colorStart.x;
+						instance.customData[1] = colorStart.y;
+						instance.customData[2] = colorStart.z;
+						instance.customData[3] = colorStart.w;
 						mesh.instances.push_back(instance);
 					}
 					changed = true;

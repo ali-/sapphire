@@ -24,7 +24,7 @@ namespace Sapphire::Graphics::Shaders {
 			return position;
 		}
 		#ifndef CUSTOM_MODIFIER
-		void ModifyVertex(thread float3& position, thread float3& normal, thread float4& color, float instanceData, float time, float4x4 model) {}
+		void ModifyVertex(thread float3& position, thread float3& normal, thread float4& color, float4 instanceData, float time, float4x4 model) {}
 		#endif
 	)";
 
@@ -34,7 +34,7 @@ namespace Sapphire::Graphics::Shaders {
 		ushort4 boneIndices [[attribute(4)]]; float4 boneWeights [[attribute(5)]];
 		#endif
 		#if INSTANCED
-		float3 instancePosition [[attribute(4)]]; float3 instanceRotation [[attribute(5)]]; float3 instanceScale [[attribute(6)]]; float instanceData [[attribute(7)]];
+		float3 instancePosition [[attribute(4)]]; float3 instanceRotation [[attribute(5)]]; float3 instanceScale [[attribute(6)]]; float4 instanceData [[attribute(7)]];
 		#endif
 		};
 		void PrepareVertex(VertexInput input, float4 uvTransform, float4 displacementParameters, float4x4 model,
@@ -42,7 +42,7 @@ namespace Sapphire::Graphics::Shaders {
 		device const float4x4* boneMatrices,
 		#endif
 		texture2d<float> heightMap, sampler heightSampler, texture2d<float> maskMap, sampler maskSampler,
-		thread float3& position, thread float3& normal, thread float2& uv, thread float4& color, thread float& instanceData) {
+		thread float3& position, thread float3& normal, thread float2& uv, thread float4& color, thread float4& instanceData) {
 			uv = input.uv * uvTransform.xy + uvTransform.zw;
 			float3 localPosition = input.position;
 			normal = input.normal;
@@ -63,7 +63,7 @@ namespace Sapphire::Graphics::Shaders {
 			normal = InstanceNormal(normal, input.instanceScale, input.instanceRotation);
 			instanceData = input.instanceData;
 			#else
-			instanceData = 0.0;
+			instanceData = float4(0.0);
 			#endif
 			position = Deform(localPosition, normal, uv, color, model, displacementParameters, heightMap, heightSampler, maskMap, maskSampler);
 		}
@@ -95,7 +95,7 @@ namespace Sapphire::Graphics::Shaders {
 			float3 localNormal;
 			float4 color;
 			float3 position;
-			float instanceData;
+			float4 instanceData;
 			PrepareVertex(input, uniforms.uvTransform, uniforms.displacementParameters, uniforms.model,
 			#if SKINNED
 				boneMatrices,
@@ -532,7 +532,7 @@ namespace Sapphire::Graphics::Shaders {
 			float3 localNormal;
 			float4 color;
 			float3 position;
-			float instanceData;
+			float4 instanceData;
 			PrepareVertex(input, uniforms.uvTransform, uniforms.displacementParameters, uniforms.model,
 			#if SKINNED
 				boneMatrices,
