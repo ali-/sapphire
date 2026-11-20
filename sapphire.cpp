@@ -24,7 +24,7 @@ namespace Sapphire {
 		SDL_Quit();
 	}
 
-	int App(const char* windowTitle, Scene& scene, SDL_WindowFlags windowFlags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_FULLSCREEN) {
+	int App(const char* windowTitle, Scene& scene, float targetFPS = 0.0f, SDL_WindowFlags windowFlags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_FULLSCREEN) {
 		if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) return 1;
 		Input::Initialize();
 		SDL_Window *window = SDL_CreateWindow(windowTitle, Screen::width, Screen::height, windowFlags);
@@ -51,6 +51,8 @@ namespace Sapphire {
 
 			const float fixedStep = Time::fixedDeltaTime;
 			const Uint64 fixedStepNs = std::max<Uint64>(1, static_cast<Uint64>(fixedStep * 1'000'000'000.0));
+			const Uint64 targetFrameNs = std::isfinite(targetFPS) && targetFPS > 0.0f
+				? static_cast<Uint64>(1'000'000'000.0 / targetFPS) : 0;
 			Uint64 accumulator = 0;
 			scene.SetAppActive(true);
 			auto initializeObjects = [&] {
@@ -154,11 +156,19 @@ namespace Sapphire {
 					throw;
 				}
 				if (!swapchainTexture) SDL_Delay(10);
+				else if (targetFrameNs > 0) {
+					const Uint64 deadline = frameStart + targetFrameNs;
+					Uint64 now = SDL_GetTicksNS();
+					if (now < deadline) {
+						const Uint64 remaining = deadline - now;
+						if (remaining > 1'000'000) SDL_DelayNS(remaining - 1'000'000);
+						while ((now = SDL_GetTicksNS()) < deadline) SDL_DelayNS(std::min<Uint64>(deadline - now, 100'000));
+					}
+				}
 			}
 
 			scene.SetAppActive(false);
 			Shutdown(gpuDevice, window, claimed);
-
 			return 0;
 		}
 		catch (const std::exception& error) {
