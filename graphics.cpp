@@ -58,6 +58,8 @@ namespace Sapphire::Graphics {
 
 		struct GpuMesh;
 
+		struct StaticShadowMap;
+
 		struct RenderItem {
 			Mesh* mesh;
 			Skeleton* skeleton = nullptr;
@@ -72,6 +74,7 @@ namespace Sapphire::Graphics {
 			Bounds bounds;
 			mutable GpuMesh* gpu = nullptr;
 			mutable Uint32 lightMask = 0;
+			mutable StaticShadowMap* shadowDetail = nullptr;
 			mutable Vector3 shadowDirection{};
 			mutable Bounds lightBounds{};
 			mutable bool lightBoundsReady = false;
@@ -86,18 +89,18 @@ namespace Sapphire::Graphics {
 			float displacementParameters[4];
 			float uvTransform[4];
 			float modifierTime[4];
-			float shadowMvp[shadowMapCount][16];
-			float shadowState[4];
 			Uint32 layerParameters[4];
 		};
 
 		struct FragmentUniforms {
 			float shadowParameters[shadowMapCount][4];
-			float lightingParameters[4];
+			float shadowScale[shadowMapCount][4];
+			float shadowOffset[shadowMapCount][4];
+			float lightingParameters[3];
+			Uint32 pointLightMask;
 			float baseColor[4];
 			float surfaceParameters[4];
 			float customData[4][4];
-			Uint32 pointLightIndices[4][4];
 		};
 
 		struct FrameUniforms {
@@ -133,7 +136,13 @@ namespace Sapphire::Graphics {
 			FrameUniforms frame;
 			Uint32 densityInputCount[4];
 			FogDensityInputUniforms densityInputs[maxFogDensityInputs + 1];
+			Uint32 sliceMasks[64][4];
 		};
+
+		static_assert(offsetof(FragmentUniforms, pointLightMask) == 156);
+		static_assert(offsetof(FragmentUniforms, baseColor) == 160);
+		static_assert(sizeof(FragmentUniforms) == 256);
+		static_assert(offsetof(FogComputeUniforms, sliceMasks) == sizeof(FrameUniforms) + 16 + sizeof(FogDensityInputUniforms) * (maxFogDensityInputs + 1));
 
 		struct CachedFogDensityTexture {
 			SDL_GPUTexture* texture = nullptr;
@@ -166,8 +175,8 @@ namespace Sapphire::Graphics {
 			bool renderStatic;
 			int staticShadowIndex = -1;
 			int dynamicShadowIndex = -1;
-			bool staticShadowValid = false;
-			bool dynamicShadowValid = false;
+			Uint32 staticShadowFaces = 0;
+			Uint32 dynamicShadowFaces = 0;
 			const Light* source = nullptr;
 		};
 
@@ -180,6 +189,9 @@ namespace Sapphire::Graphics {
 			bool staticValid = false;
 			bool dynamicValid = false;
 			bool relevant = false;
+			Uint32 staticFaces = 0;
+			int staticSlot = -1;
+			int dynamicSlot = -1;
 			std::vector<const RenderItem*> staticCasters;
 			std::vector<const RenderItem*> dynamicCasters;
 		};
@@ -191,6 +203,7 @@ namespace Sapphire::Graphics {
 		};
 
 		struct StaticShadowMap {
+			std::uint64_t generation = 0;
 			SDL_GPUTexture* texture = nullptr;
 			ShadowMapData data;
 			bool ready = false;
@@ -296,6 +309,10 @@ namespace Sapphire::Graphics {
 		Uint32 fogGridWidth = 0;
 		Uint32 fogGridHeight = 0;
 		Uint32 fogGridSlices = 0;
+		std::array<float, 256> fogSliceDistances{};
+		float fogSliceNear = 0.0f;
+		float fogSliceFar = 0.0f;
+		Uint32 fogSliceDistanceCount = 0;
 		bool fogDensityGridSupported = false;
 		bool fogDensityLimitReported = false;
 		bool fogDensityFormatReported = false;
@@ -323,7 +340,7 @@ namespace Sapphire::Graphics {
 		SDL_GPUTexture* fallbackShadowTexture = nullptr;
 		SDL_GPUTexture* pointShadowTexture = nullptr;
 		Uint32 pointShadowResolution = 0;
-		std::vector<std::pair<const Light*, bool>> pointShadowSlots;
+		std::vector<const Light*> pointShadowSlots;
 		std::vector<PointShadowState> pointShadowStates;
 		ShadowMapData fallbackShadowMap;
 		bool fallbackShadowReady = false;
@@ -387,7 +404,6 @@ namespace Sapphire::Graphics {
 		std::vector<const RenderItem*> shadowCasters;
 		std::vector<const RenderItem*> faceCasters;
 		std::vector<PointLightData> pointLights;
-		std::vector<CellKey> visibleCells;
 		struct MeshSource {
 			Mesh* mesh = nullptr;
 			PhysicsBody* body = nullptr;
@@ -955,136 +971,99 @@ namespace Sapphire::Graphics {
 			return item.lightBounds;
 		}
 
+		Bounds EmptyShadowBounds() {
+			const float high = std::numeric_limits<float>::max();
+			const float low = std::numeric_limits<float>::lowest();
+			return {{high, high, high}, {low, low, low}};
+		}
+
+		void IncludeShadowBounds(Bounds& bounds, const Bounds& other) {
+			bounds.minimum.x = std::min(bounds.minimum.x, other.minimum.x);
+			bounds.minimum.y = std::min(bounds.minimum.y, other.minimum.y);
+			bounds.minimum.z = std::min(bounds.minimum.z, other.minimum.z);
+			bounds.maximum.x = std::max(bounds.maximum.x, other.maximum.x);
+			bounds.maximum.y = std::max(bounds.maximum.y, other.maximum.y);
+			bounds.maximum.z = std::max(bounds.maximum.z, other.maximum.z);
+		}
+
+		bool ShadowCasterOverlaps(const Bounds& caster, const Bounds& receiver) {
+			return caster.maximum.x >= receiver.minimum.x && caster.minimum.x <= receiver.maximum.x &&
+				caster.maximum.y >= receiver.minimum.y && caster.minimum.y <= receiver.maximum.y && caster.minimum.z <= receiver.maximum.z;
+		}
+
+		ShadowMapData FinishDirectionalShadow(const ShadowBasis& basis, const Bounds& bounds, float radius) {
+			const float texel = radius * 2.0f / shadowMapResolution;
+			const float centerX = std::round((bounds.minimum.x + bounds.maximum.x) * 0.5f / texel) * texel;
+			const float centerY = std::round((bounds.minimum.y + bounds.maximum.y) * 0.5f / texel) * texel;
+			const Vector3 center = Add(Scale(basis.right, centerX), Scale(basis.up, centerY));
+			ShadowMapData map{};
+			map.depthRange = std::max(bounds.maximum.z - bounds.minimum.z + 2.0f, 0.01f);
+			map.mvp = DirectionalShadowMatrix(basis.right, basis.up, basis.direction, center, radius, bounds.minimum.z - 1.0f, bounds.maximum.z + 1.0f);
+			map.valid = true;
+			return map;
+		}
+
 		ShadowMapData BuildStaticShadowMap(const Vector3& lightDirection, int cellX, int cellY, int cellZ, int cellSize, const std::vector<const RenderItem*>& items, std::vector<const RenderItem*>& casters) {
-			ShadowMapData shadowMap{};
 			casters.clear();
-			if (items.empty()) return shadowMap;
+			if (items.empty()) return {};
 			const auto& basis = GetShadowBasis(lightDirection);
-			const Vector3& direction = basis.direction;
-			const Vector3& right = basis.right;
-			const Vector3& up = basis.up;
-			float minimumX = std::numeric_limits<float>::max();
-			float maximumX = std::numeric_limits<float>::lowest();
-			float minimumY = std::numeric_limits<float>::max();
-			float maximumY = std::numeric_limits<float>::lowest();
-			float minimumDepth = std::numeric_limits<float>::max();
-			float maximumDepth = std::numeric_limits<float>::lowest();
+			Bounds receiver = EmptyShadowBounds();
 			if (cellSize > 0) {
-				for (int corner = 0; corner < 8; ++corner) {
-					const Vector3 point{
-						(corner & 1 ? cellX + 1 : cellX) * static_cast<float>(cellSize),
-						(corner & 2 ? cellY + 1 : cellY) * static_cast<float>(cellSize),
-						(corner & 4 ? cellZ + 1 : cellZ) * static_cast<float>(cellSize)
-					};
-					const float x = Dot(right, point);
-					const float y = Dot(up, point);
-					const float depth = Dot(direction, point);
-					minimumX = std::min(minimumX, x);
-					maximumX = std::max(maximumX, x);
-					minimumY = std::min(minimumY, y);
-					maximumY = std::max(maximumY, y);
-					minimumDepth = std::min(minimumDepth, depth);
-					maximumDepth = std::max(maximumDepth, depth);
-				}
+				const Bounds cell{{cellX * static_cast<float>(cellSize), cellY * static_cast<float>(cellSize), cellZ * static_cast<float>(cellSize)},
+					{(cellX + 1) * static_cast<float>(cellSize), (cellY + 1) * static_cast<float>(cellSize), (cellZ + 1) * static_cast<float>(cellSize)}};
+				const auto x = ProjectBounds(cell, basis.right);
+				const auto y = ProjectBounds(cell, basis.up);
+				const auto z = ProjectBounds(cell, basis.direction);
+				receiver = {{x.first, y.first, z.first}, {x.second, y.second, z.second}};
 			}
 			else {
-				for (const auto* item : items) {
-					const Bounds& projected = LightBounds(*item, direction, right, up);
-					const float minX = projected.minimum.x, maxX = projected.maximum.x;
-					const float minY = projected.minimum.y, maxY = projected.maximum.y;
-					const float minDepth = projected.minimum.z, maxDepth = projected.maximum.z;
-					minimumX = std::min(minimumX, minX);
-					maximumX = std::max(maximumX, maxX);
-					minimumY = std::min(minimumY, minY);
-					maximumY = std::max(maximumY, maxY);
-					minimumDepth = std::min(minimumDepth, minDepth);
-					maximumDepth = std::max(maximumDepth, maxDepth);
-				}
+				for (const auto* item : items) IncludeShadowBounds(receiver, LightBounds(*item, basis.direction, basis.right, basis.up));
 			}
-			const float extent = std::max(maximumX - minimumX, maximumY - minimumY);
+			const float extent = std::max(receiver.maximum.x - receiver.minimum.x, receiver.maximum.y - receiver.minimum.y);
 			const float radius = extent * 0.5f + std::max(1.0f, extent * 4.0f / shadowMapResolution);
 			const float texel = radius * 2.0f / shadowMapResolution;
-			const float centerX = std::round((minimumX + maximumX) * 0.5f / texel) * texel;
-			const float centerY = std::round((minimumY + maximumY) * 0.5f / texel) * texel;
-			const Vector3 center = Add(Scale(right, centerX), Scale(up, centerY));
-			bool hasCaster = false;
-			for (const RenderItem* itemPointer : items) {
-				const RenderItem& item = *itemPointer;
-				if (!item.mesh->castShadows) continue;
-				const Bounds& projected = LightBounds(item, direction, right, up);
-				const float itemMinimumX = projected.minimum.x, itemMaximumX = projected.maximum.x;
-				const float itemMinimumY = projected.minimum.y, itemMaximumY = projected.maximum.y;
-				const float itemMinimumDepth = projected.minimum.z;
-				const bool overlaps = !(itemMaximumX < centerX - radius || itemMinimumX > centerX + radius || itemMaximumY < centerY - radius || itemMinimumY > centerY + radius);
-				if (!overlaps || itemMinimumDepth > maximumDepth) continue;
-				minimumDepth = std::min(minimumDepth, itemMinimumDepth);
-				casters.push_back(&item);
-				hasCaster = true;
+			const float centerX = std::round((receiver.minimum.x + receiver.maximum.x) * 0.5f / texel) * texel;
+			const float centerY = std::round((receiver.minimum.y + receiver.maximum.y) * 0.5f / texel) * texel;
+			Bounds coverage{{centerX - radius, centerY - radius, receiver.minimum.z}, {centerX + radius, centerY + radius, receiver.maximum.z}};
+			for (const auto* item : items) {
+				if (!item->mesh->castShadows) continue;
+				const Bounds& projected = LightBounds(*item, basis.direction, basis.right, basis.up);
+				if (!ShadowCasterOverlaps(projected, coverage)) continue;
+				receiver.minimum.z = std::min(receiver.minimum.z, projected.minimum.z);
+				casters.push_back(item);
 			}
-			if (!hasCaster) return shadowMap;
-			minimumDepth -= 1.0f;
-			maximumDepth += 1.0f;
-			shadowMap.depthRange = std::max(maximumDepth - minimumDepth, 0.01f);
-			shadowMap.mvp = DirectionalShadowMatrix(right, up, direction, center, radius, minimumDepth, maximumDepth);
-			shadowMap.valid = true;
-			return shadowMap;
+			if (casters.empty()) return {};
+			return FinishDirectionalShadow(basis, receiver, radius);
 		}
 
 		ShadowMapData BuildDynamicShadowMap(const Camera& camera, const Culling::Frustum& frustum, float shadowFar, const LightData& light, const std::vector<const RenderItem*>& items, std::vector<const RenderItem*>& casters) {
-			ShadowMapData map{};
 			casters.clear();
 			const float near = std::max(camera.near, 0.01f);
 			const auto corners = FrustumCorners(frustum, near, std::max(near + 0.1f, std::min(camera.far, shadowFar)));
 			const auto& basis = GetShadowBasis(light.direction);
-			const Vector3& direction = basis.direction;
-			const Vector3& right = basis.right;
-			const Vector3& up = basis.up;
-			float receiverMinX = std::numeric_limits<float>::max();
-			float receiverMaxX = std::numeric_limits<float>::lowest();
-			float receiverMinY = receiverMinX;
-			float receiverMaxY = receiverMaxX;
-			float maximumDepth = receiverMaxX;
+			Bounds receiver = EmptyShadowBounds();
 			for (const auto& point : corners) {
-				receiverMinX = std::min(receiverMinX, Dot(right, point));
-				receiverMaxX = std::max(receiverMaxX, Dot(right, point));
-				receiverMinY = std::min(receiverMinY, Dot(up, point));
-				receiverMaxY = std::max(receiverMaxY, Dot(up, point));
-				maximumDepth = std::max(maximumDepth, Dot(direction, point));
+				const Vector3 projected{Dot(basis.right, point), Dot(basis.up, point), Dot(basis.direction, point)};
+				IncludeShadowBounds(receiver, {projected, projected});
 			}
-			float minimumX = std::numeric_limits<float>::max();
-			float maximumX = std::numeric_limits<float>::lowest();
-			float minimumY = minimumX;
-			float maximumY = maximumX;
-			float minimumDepth = minimumX;
-			bool hasCaster = false;
-			for (const RenderItem* itemPointer : items) {
-				const RenderItem& item = *itemPointer;
-				if (!item.mesh->castShadows) continue;
-				const Bounds& projected = LightBounds(item, direction, right, up);
-				const float minX = projected.minimum.x, maxX = projected.maximum.x;
-				const float minY = projected.minimum.y, maxY = projected.maximum.y;
-				const float depth = projected.minimum.z;
-				if (maxX < receiverMinX || minX > receiverMaxX || maxY < receiverMinY || minY > receiverMaxY || depth > maximumDepth) continue;
-				casters.push_back(&item);
-				minimumX = std::min(minimumX, std::max(minX, receiverMinX));
-				maximumX = std::max(maximumX, std::min(maxX, receiverMaxX));
-				minimumY = std::min(minimumY, std::max(minY, receiverMinY));
-				maximumY = std::max(maximumY, std::min(maxY, receiverMaxY));
-				minimumDepth = std::min(minimumDepth, depth);
-				hasCaster = true;
+			Bounds cropped = EmptyShadowBounds();
+			cropped.maximum.z = receiver.maximum.z;
+			for (const auto* item : items) {
+				if (!item->mesh->castShadows) continue;
+				const Bounds& projected = LightBounds(*item, basis.direction, basis.right, basis.up);
+				if (!ShadowCasterOverlaps(projected, receiver)) continue;
+				Bounds overlap = projected;
+				overlap.minimum.x = std::max(overlap.minimum.x, receiver.minimum.x);
+				overlap.maximum.x = std::min(overlap.maximum.x, receiver.maximum.x);
+				overlap.minimum.y = std::max(overlap.minimum.y, receiver.minimum.y);
+				overlap.maximum.y = std::min(overlap.maximum.y, receiver.maximum.y);
+				overlap.maximum.z = receiver.maximum.z;
+				IncludeShadowBounds(cropped, overlap);
+				casters.push_back(item);
 			}
-			if (!hasCaster) return map;
-			const float radius = std::ceil((std::max(maximumX - minimumX, maximumY - minimumY) * 0.5f + 0.25f) * 16.0f) / 16.0f;
-			const float texel = radius * 2.0f / shadowMapResolution;
-			const float centerX = std::round((minimumX + maximumX) * 0.5f / texel) * texel;
-			const float centerY = std::round((minimumY + maximumY) * 0.5f / texel) * texel;
-			const Vector3 center = Add(Scale(right, centerX), Scale(up, centerY));
-			minimumDepth -= 1.0f;
-			maximumDepth += 1.0f;
-			map.depthRange = std::max(maximumDepth - minimumDepth, 0.01f);
-			map.mvp = DirectionalShadowMatrix(right, up, direction, center, radius, minimumDepth, maximumDepth);
-			map.valid = true;
-			return map;
+			if (casters.empty()) return {};
+			const float radius = std::ceil((std::max(cropped.maximum.x - cropped.minimum.x, cropped.maximum.y - cropped.minimum.y) * 0.5f + 0.25f) * 16.0f) / 16.0f;
+			return FinishDirectionalShadow(basis, cropped, radius);
 		}
 
 		GpuMaterial* AcquireMaterial(const Material& material) {
@@ -1451,62 +1430,27 @@ namespace Sapphire::Graphics {
 			}
 		}
 
-		SDL_GPUTexture* CreateShadowTexture(Uint32 resolution) {
+		SDL_GPUTexture* CreateShadowTexture(Uint32 resolution, Uint32 layers = 1) {
 			SDL_GPUTextureCreateInfo textureInfo{};
-			textureInfo.type = SDL_GPU_TEXTURETYPE_2D;
+			textureInfo.type = layers == 1 ? SDL_GPU_TEXTURETYPE_2D : SDL_GPU_TEXTURETYPE_2D_ARRAY;
 			textureInfo.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
 			textureInfo.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
 			textureInfo.width = resolution;
 			textureInfo.height = resolution;
-			textureInfo.layer_count_or_depth = 1;
+			textureInfo.layer_count_or_depth = layers;
 			textureInfo.num_levels = 1;
 			textureInfo.sample_count = SDL_GPU_SAMPLECOUNT_1;
 			return CreateTextureResource(gpuDevice, textureInfo);
 		}
 
-		void EnsurePointShadowTexture(bool layoutChanged, SDL_GPUCommandBuffer* commandBuffer, const std::vector<std::pair<const Light*, bool>>& previousSlots) {
+		void EnsurePointShadowTexture(bool layoutChanged) {
 			const Uint32 resolution = pointShadowSlots.empty() ? 1 : shadowMapResolution;
 			if (!layoutChanged && resolution == pointShadowResolution && pointShadowTexture) return;
-			SDL_GPUTexture* previousTexture = pointShadowTexture;
-			const bool preserve = previousTexture && pointShadowResolution == resolution;
-			pointShadowResolution = resolution;
-			for (auto& state : pointShadowStates) {
-				if (!preserve || std::find(previousSlots.begin(), previousSlots.end(), std::pair<const Light*, bool>{state.source, false}) == previousSlots.end()) state.staticReady = false;
-			}
-			SDL_GPUTextureCreateInfo textureInfo{};
-			textureInfo.type = SDL_GPU_TEXTURETYPE_2D_ARRAY;
-			textureInfo.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
-			textureInfo.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
-			textureInfo.width = resolution;
-			textureInfo.height = resolution;
-			textureInfo.layer_count_or_depth = static_cast<Uint32>(std::max<std::size_t>(pointShadowSlots.size(), 1) * 6);
-			textureInfo.num_levels = 1;
-			textureInfo.sample_count = SDL_GPU_SAMPLECOUNT_1;
-			SDL_GPUTexture* nextTexture = CreateTextureResource(gpuDevice, textureInfo);
-			if (preserve && layoutChanged) {
-				SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(commandBuffer);
-				if (!copy) {
-					ReleaseTexture(gpuDevice, nextTexture);
-					throw std::runtime_error(std::string("Begin point shadow copy pass: ") + SDL_GetError());
-				}
-				for (std::size_t index = 0; index < pointShadowSlots.size(); ++index) {
-					if (pointShadowSlots[index].second) continue;
-					const auto previous = std::find(previousSlots.begin(), previousSlots.end(), pointShadowSlots[index]);
-					if (previous == previousSlots.end()) continue;
-					for (Uint32 face = 0; face < 6; ++face) {
-						SDL_GPUTextureLocation source{};
-						source.texture = previousTexture;
-						source.layer = static_cast<Uint32>(previous - previousSlots.begin()) * 6 + face;
-						SDL_GPUTextureLocation destination{};
-						destination.texture = nextTexture;
-						destination.layer = static_cast<Uint32>(index) * 6 + face;
-						SDL_CopyGPUTextureToTexture(copy, &source, &destination, resolution, resolution, 1, false);
-					}
-				}
-				SDL_EndGPUCopyPass(copy);
-			}
+			SDL_GPUTexture* nextTexture = CreateShadowTexture(resolution, static_cast<Uint32>(std::max<std::size_t>(pointShadowSlots.size(), 1) * 6));
+			if (pointShadowTexture) ReleaseTexture(gpuDevice, pointShadowTexture);
 			pointShadowTexture = nextTexture;
-			if (previousTexture) ReleaseTexture(gpuDevice, previousTexture);
+			pointShadowResolution = resolution;
+			for (auto& state : pointShadowStates) state.staticReady = false;
 		}
 
 		void EnsureShadowResolution(int requestedResolution) {
@@ -1795,6 +1739,7 @@ namespace Sapphire::Graphics {
 		}
 
 		void RenderShadowMap(SDL_GPUCommandBuffer* commandBuffer, SDL_GPUTexture* texture, const ShadowMapData& shadowMap, const std::vector<const RenderItem*>& items, float time, std::uint64_t generation, Uint8 layer = 0, bool cullBackfaces = true) {
+			if (!shadowMap.valid) return;
 			for (const auto* item : items) {
 				item->gpu = &GetMesh(item->mesh, generation);
 				if (item->skeleton) GetSkeleton(item->skeleton);
@@ -1810,10 +1755,6 @@ namespace Sapphire::Graphics {
 			depthInfo.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
 			SDL_GPURenderPass* shadowPass = SDL_BeginGPURenderPass(commandBuffer, nullptr, 0, &depthInfo);
 			if (!shadowPass) throw std::runtime_error(std::string("Begin shadow render pass: ") + SDL_GetError());
-			if (!shadowMap.valid) {
-				SDL_EndGPURenderPass(shadowPass);
-				return;
-			}
 			SDL_GPUGraphicsPipeline* activePipeline = nullptr;
 			GpuMaterial* activeMaterial = nullptr;
 			BufferBindings buffers;
@@ -1878,17 +1819,21 @@ namespace Sapphire::Graphics {
 			SDL_EndGPURenderPass(shadowPass);
 		}
 
-		void RenderPointShadowMap(SDL_GPUCommandBuffer* commandBuffer, int slot, const PointLightData& light, const std::vector<const RenderItem*>& casters, float time, std::uint64_t generation) {
+		Uint32 RenderPointShadowMap(SDL_GPUCommandBuffer* commandBuffer, int slot, const PointLightData& light, const std::vector<const RenderItem*>& casters, float time, std::uint64_t generation) {
 			const float nearClip = std::min(0.1f, light.range * 0.01f);
 			const Matrix4 projection = Perspective(90.0f, 1.0f, nearClip, light.range);
 			const float depthRange = light.range - nearClip;
+			Uint32 faces = 0;
 			for (int face = 0; face < 6; ++face) {
 				faceCasters.clear();
 				Culling::Frustum frustum{light.position, Cross(pointUps[face], pointDirections[face]), pointUps[face], pointDirections[face], 1.0f, 1.0f, light.range};
 				Culling::PrepareFrustum(frustum);
 				for (const auto* item : casters) if (Culling::IsVisible(item->bounds, frustum)) faceCasters.push_back(item);
+				if (faceCasters.empty()) continue;
+				faces |= 1u << face;
 				RenderShadowMap(commandBuffer, pointShadowTexture, BuildPointShadowMap(light.position, light.range, face, projection, depthRange), faceCasters, time, generation, static_cast<Uint8>(slot * 6 + face), false);
 			}
+			return faces;
 		}
 
 		void RenderPointShadows(Scene& scene, SDL_GPUCommandBuffer* commandBuffer, float time, std::uint64_t generation) {
@@ -1896,23 +1841,26 @@ namespace Sapphire::Graphics {
 			for (std::size_t index = 0; index < pointLights.size(); ++index) if (scene.shadowsEnabled && pointLights[index].castShadows) unresolvedMask |= 1u << index;
 			Uint32 relevantMask = 0;
 			for (const auto* item : visibleItems) {
+				if (!unresolvedMask) break;
 				const Uint32 relevant = item->lightMask & unresolvedMask;
 				if (relevant && !item->mesh->GetMaterial(item->materialIndex).unlit) {
 					relevantMask |= relevant;
 					unresolvedMask &= ~relevant;
-					if (!unresolvedMask) break;
 				}
 			}
-			auto activeLight = [&](const Light* source) {
-				return std::find_if(pointLights.begin(), pointLights.end(), [&](const PointLightData& light) { return scene.shadowsEnabled && light.castShadows && light.source == source; });
+			auto releaseSlot = [&](int& slot) {
+				if (slot >= 0) pointShadowSlots[slot] = nullptr;
+				slot = -1;
 			};
-			const auto previousSlots = pointShadowSlots;
-			pointShadowSlots.erase(std::remove_if(pointShadowSlots.begin(), pointShadowSlots.end(), [&](const auto& slot) {
-				const auto light = activeLight(slot.first);
-				return light == pointLights.end() || (!slot.second && !light->renderStatic);
-			}), pointShadowSlots.end());
-			pointShadowStates.erase(std::remove_if(pointShadowStates.begin(), pointShadowStates.end(), [&](const PointShadowState& state) { return activeLight(state.source) == pointLights.end(); }), pointShadowStates.end());
-			for (auto& light : pointLights) {
+			for (auto state = pointShadowStates.begin(); state != pointShadowStates.end();) {
+				const auto light = std::find_if(pointLights.begin(), pointLights.end(), [&](const PointLightData& value) { return scene.shadowsEnabled && value.castShadows && value.source == state->source; });
+				if (light != pointLights.end()) { ++state; continue; }
+				releaseSlot(state->staticSlot);
+				releaseSlot(state->dynamicSlot);
+				state = pointShadowStates.erase(state);
+			}
+			for (std::size_t index = 0; index < pointLights.size(); ++index) {
+				auto& light = pointLights[index];
 				if (!scene.shadowsEnabled || !light.castShadows) continue;
 				auto state = std::find_if(pointShadowStates.begin(), pointShadowStates.end(), [&](const PointShadowState& value) { return value.source == light.source; });
 				if (state == pointShadowStates.end()) {
@@ -1927,50 +1875,58 @@ namespace Sapphire::Graphics {
 					state->staticReady = false;
 					state->staticValid = false;
 				}
-				state->relevant = (relevantMask & (1u << static_cast<Uint32>(&light - pointLights.data()))) != 0;
+				state->relevant = (relevantMask & (1u << index)) != 0;
 				state->dynamicValid = false;
 				state->dynamicCasters.clear();
-				if (!state->relevant) continue;
-				if (light.renderStatic && !state->staticReady) {
-					PointShadowCasters(staticItems, light.position, light.range, state->staticCasters);
-					state->staticValid = !state->staticCasters.empty();
-				}
-				PointShadowCasters(light.renderStatic ? dynamicItems : renderItems, light.position, light.range, state->dynamicCasters);
-				state->dynamicValid = !state->dynamicCasters.empty();
-				for (bool dynamic : {false, true}) {
-					if (dynamic ? !state->dynamicValid : !light.renderStatic || !state->staticValid) continue;
-					const std::pair<const Light*, bool> key{light.source, dynamic};
-					if (std::find(pointShadowSlots.begin(), pointShadowSlots.end(), key) == pointShadowSlots.end()) {
-						pointShadowSlots.push_back(key);
+				if (state->relevant) {
+					if (light.renderStatic && !state->staticReady) {
+						PointShadowCasters(staticItems, light.position, light.range, state->staticCasters);
+						state->staticValid = !state->staticCasters.empty();
+						if (!state->staticValid) state->staticReady = true;
 					}
+					PointShadowCasters(light.renderStatic ? dynamicItems : renderItems, light.position, light.range, state->dynamicCasters);
+					state->dynamicValid = !state->dynamicCasters.empty();
 				}
+				if (!state->relevant || !light.renderStatic || !state->staticValid) {
+					if (state->staticSlot >= 0) state->staticReady = false;
+					releaseSlot(state->staticSlot);
+				}
+				if (!state->relevant || !state->dynamicValid) releaseSlot(state->dynamicSlot);
 			}
-			pointShadowSlots.erase(std::remove_if(pointShadowSlots.begin(), pointShadowSlots.end(), [&](const auto& slot) {
-				const auto state = std::find_if(pointShadowStates.begin(), pointShadowStates.end(), [&](const PointShadowState& value) { return value.source == slot.first; });
-				return state == pointShadowStates.end() || !state->relevant || (slot.second ? !state->dynamicValid : !state->staticValid);
-			}), pointShadowSlots.end());
-			const bool layoutChanged = previousSlots != pointShadowSlots;
-			EnsurePointShadowTexture(layoutChanged, commandBuffer, previousSlots);
+			const std::size_t previousCapacity = pointShadowSlots.size();
+			auto allocateSlot = [&](int& slot, const Light* source) {
+				if (slot >= 0) return;
+				auto free = std::find_if(pointShadowSlots.begin(), pointShadowSlots.end(), [](const Light* entry) { return entry == nullptr; });
+				if (free == pointShadowSlots.end()) {
+					pointShadowSlots.push_back(source);
+					slot = static_cast<int>(pointShadowSlots.size() - 1);
+				}
+				else {
+					slot = static_cast<int>(free - pointShadowSlots.begin());
+					*free = source;
+				}
+			};
+			for (auto& state : pointShadowStates) {
+				if (!state.relevant) continue;
+				if (state.renderStatic && state.staticValid) allocateSlot(state.staticSlot, state.source);
+				if (state.dynamicValid) allocateSlot(state.dynamicSlot, state.source);
+			}
+			if (std::none_of(pointShadowSlots.begin(), pointShadowSlots.end(), [](const Light* entry) { return entry != nullptr; })) pointShadowSlots.clear();
+			EnsurePointShadowTexture(previousCapacity != pointShadowSlots.size());
 			for (auto& light : pointLights) {
 				if (!scene.shadowsEnabled || !light.castShadows) continue;
 				auto state = std::find_if(pointShadowStates.begin(), pointShadowStates.end(), [&](const PointShadowState& value) { return value.source == light.source; });
 				if (state == pointShadowStates.end() || !state->relevant) continue;
-				auto slotIndex = [&](bool dynamic) {
-					const auto slot = std::find(pointShadowSlots.begin(), pointShadowSlots.end(), std::pair<const Light*, bool>{light.source, dynamic});
-					return slot == pointShadowSlots.end() ? -1 : static_cast<int>(slot - pointShadowSlots.begin());
-				};
-				light.staticShadowIndex = slotIndex(false);
-				light.dynamicShadowIndex = slotIndex(true);
-				if (light.renderStatic && light.staticShadowIndex >= 0 && !state->staticReady) {
+				light.staticShadowIndex = state->staticSlot;
+				light.dynamicShadowIndex = state->dynamicSlot;
+				if (light.renderStatic && state->staticSlot >= 0 && !state->staticReady) {
 					if (state->staticCasters.empty()) PointShadowCasters(staticItems, light.position, light.range, state->staticCasters);
-					state->staticValid = !state->staticCasters.empty();
-					if (state->staticValid) RenderPointShadowMap(commandBuffer, light.staticShadowIndex, light, state->staticCasters, time, generation);
+					state->staticFaces = RenderPointShadowMap(commandBuffer, state->staticSlot, light, state->staticCasters, time, generation);
 					state->staticReady = true;
 					state->staticCasters.clear();
 				}
-				if (state->dynamicValid && light.dynamicShadowIndex >= 0) RenderPointShadowMap(commandBuffer, light.dynamicShadowIndex, light, state->dynamicCasters, time, generation);
-				light.staticShadowValid = light.renderStatic && state->staticReady && state->staticValid;
-				light.dynamicShadowValid = state->dynamicValid && light.dynamicShadowIndex >= 0;
+				if (state->staticSlot >= 0 && state->staticReady) light.staticShadowFaces = state->staticFaces;
+				if (state->dynamicSlot >= 0) light.dynamicShadowFaces = RenderPointShadowMap(commandBuffer, state->dynamicSlot, light, state->dynamicCasters, time, generation);
 			}
 		}
 
@@ -2340,7 +2296,7 @@ namespace Sapphire::Graphics {
 			result[1].attributes[4] = {4, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(MeshInstance, position)};
 			result[1].attributes[5] = {5, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(MeshInstance, rotation)};
 			result[1].attributes[6] = {6, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offsetof(MeshInstance, scale)};
-			result[1].attributes[7] = {7, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT, offsetof(MeshInstance, customData)};
+			result[1].attributes[7] = {7, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, offsetof(MeshInstance, customData)};
 			result[1].bufferCount = 2;
 			result[1].attributeCount = 8;
 			result[2].buffers[1] = {1, sizeof(SkinInfluence), SDL_GPU_VERTEXINPUTRATE_VERTEX, 0};
@@ -2527,7 +2483,7 @@ namespace Sapphire::Graphics {
 				const std::string prefix = std::string(instanced ? "#define INSTANCED 1\n" : "") + (vertexSource.empty() ? "" : "#define CUSTOM_MODIFIER 1\n") + (normalSource.empty() ? "" : "#define CUSTOM_FRAGMENT_NORMAL 1\n");
 				const std::string mainSource = prefix + layerVertexPrefix + deformationShaderSource + vertexSource + vertexShaderSource.substr(deformationShaderSource.size());
 				const std::string shadowSource = prefix + deformationShaderSource + vertexSource + shadowVertexShaderSource.substr(deformationShaderSource.size());
-				vertex[instanced] = CreateShader(gpuDevice, mainSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
+				vertex[instanced] = CreateShader(gpuDevice, mainSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 2);
 				shadowVertex[instanced] = CreateShader(gpuDevice, shadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
 				if (!vertex[instanced] || !shadowVertex[instanced]) throw std::runtime_error(std::string("Compile vertex modifier: ") + SDL_GetError());
 			}
@@ -2535,7 +2491,7 @@ namespace Sapphire::Graphics {
 				const std::string skinnedPrefix = std::string("#define SKINNED 1\n") + (vertexSource.empty() ? "" : "#define CUSTOM_MODIFIER 1\n") + (normalSource.empty() ? "" : "#define CUSTOM_FRAGMENT_NORMAL 1\n");
 				const std::string skinnedMainSource = skinnedPrefix + layerVertexPrefix + deformationShaderSource + vertexSource + vertexShaderSource.substr(deformationShaderSource.size());
 				const std::string skinnedShadowSource = skinnedPrefix + deformationShaderSource + vertexSource + shadowVertexShaderSource.substr(deformationShaderSource.size());
-				skinnedVertex = CreateShader(gpuDevice, skinnedMainSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1, 1);
+				skinnedVertex = CreateShader(gpuDevice, skinnedMainSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 2, 1);
 				skinnedShadowVertex = CreateShader(gpuDevice, skinnedShadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1, 1);
 				if (!skinnedVertex || !skinnedShadowVertex) throw std::runtime_error(std::string("Compile skinned vertex modifier: ") + SDL_GetError());
 			}
@@ -2570,15 +2526,15 @@ namespace Sapphire::Graphics {
 	bool Initialize(SDL_GPUDevice* device, SDL_Window* window) {
 		gpuDevice = device;
 		linearOutput = window && SDL_WindowSupportsGPUSwapchainComposition(device, window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR) && SDL_SetGPUSwapchainParameters(device, window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR, SDL_GPU_PRESENTMODE_VSYNC);
-		SDL_GPUShader* vertexShader = CreateShader(gpuDevice, vertexShaderSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
+		SDL_GPUShader* vertexShader = CreateShader(gpuDevice, vertexShaderSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 2);
 		const std::string instanceVertexSource = "#define INSTANCED 1\n" + vertexShaderSource;
-		SDL_GPUShader* instanceVertexShader = CreateShader(gpuDevice, instanceVertexSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
+		SDL_GPUShader* instanceVertexShader = CreateShader(gpuDevice, instanceVertexSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 2);
 		SDL_GPUShader* fragmentShaders[2]{};
 		SDL_GPUShader* shadowVertexShader = CreateShader(gpuDevice, shadowVertexShaderSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
 		const std::string instanceShadowSource = "#define INSTANCED 1\n" + shadowVertexShaderSource;
 		SDL_GPUShader* instanceShadowShader = CreateShader(gpuDevice, instanceShadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
 		const std::string skinnedVertexSource = "#define SKINNED 1\n" + vertexShaderSource;
-		SDL_GPUShader* skinnedVertexShader = CreateShader(gpuDevice, skinnedVertexSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1, 1);
+		SDL_GPUShader* skinnedVertexShader = CreateShader(gpuDevice, skinnedVertexSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 2, 1);
 		const std::string skinnedShadowSource = "#define SKINNED 1\n" + shadowVertexShaderSource;
 		SDL_GPUShader* skinnedShadowVertexShader = CreateShader(gpuDevice, skinnedShadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1, 1);
 		SDL_GPUShader* shadowFragmentShaders[2]{};
@@ -2709,7 +2665,6 @@ namespace Sapphire::Graphics {
 		shadowCasters.clear();
 		faceCasters.clear();
 		pointLights.clear();
-		visibleCells.clear();
 		batchCellSize = -1;
 		for (auto& [key, shadowMap] : staticShadowMaps) if (shadowMap.texture) ReleaseTexture(gpuDevice, shadowMap.texture);
 		staticShadowMaps.clear();
@@ -2738,7 +2693,7 @@ namespace Sapphire::Graphics {
 		fpsElapsed += Time::deltaTime;
 		++fpsFrames;
 		if (fpsElapsed < 0.5f) return;
-		fpsString = std::to_string(static_cast<int>(fpsFrames / fpsElapsed));
+		fpsString = std::to_string(static_cast<int>(std::lround(fpsFrames / fpsElapsed)));
 		fpsElapsed = 0.0f;
 		fpsFrames = 0;
 		auto sorted = frameSamples;
@@ -2776,6 +2731,7 @@ namespace Sapphire::Graphics {
 		UpdateSceneResources(scene);
 		if (++renderGeneration == 0) {
 			for (auto& [mesh, gpuMesh] : gpuMeshes) gpuMesh.renderGeneration = 0;
+			for (auto& [key, map] : staticShadowMaps) map.generation = 0;
 			renderGeneration = 1;
 		}
 		EnsureShadowResolution(scene.shadowResolution);
@@ -2856,6 +2812,7 @@ namespace Sapphire::Graphics {
 			for (const auto* itemPointer : renderItems) {
 				const RenderItem& item = *itemPointer;
 				item.lightMask = 0;
+				item.shadowDetail = nullptr;
 				if (!Culling::IsVisible(item.bounds, frustum)) continue;
 				for (std::size_t index = 0; index < pointLights.size(); ++index) if (IntersectsSphere(item.bounds, pointLights[index].position, pointLights[index].range)) item.lightMask |= 1u << index;
 				const Vector3 center = Scale(Add(item.bounds.minimum, item.bounds.maximum), 0.5f);
@@ -2885,26 +2842,25 @@ namespace Sapphire::Graphics {
 						RenderShadowMap(commandBuffer, fallbackShadowTexture, fallbackShadowMap, casters, frameTime, renderGeneration);
 						fallbackShadowReady = true;
 					}
-					visibleCells.clear();
-					for (const auto* item : visibleItems) visibleCells.emplace_back(item->cellX, item->cellY, item->cellZ);
-					std::sort(visibleCells.begin(), visibleCells.end());
-					visibleCells.erase(std::unique(visibleCells.begin(), visibleCells.end()), visibleCells.end());
-					for (auto map = staticShadowMaps.begin(); map != staticShadowMaps.end();) {
-						if (!std::binary_search(visibleCells.begin(), visibleCells.end(), map->first)) {
-							if (map->second.texture) ReleaseTexture(gpuDevice, map->second.texture);
-							map = staticShadowMaps.erase(map);
-						}
-						else ++map;
-					}
-					for (const auto& key : visibleCells) {
+					for (const auto* item : visibleItems) {
+						if (item->mesh->GetMaterial(item->materialIndex).unlit) continue;
+						const CellKey key{item->cellX, item->cellY, item->cellZ};
 						auto& map = staticShadowMaps[key];
+						item->shadowDetail = &map;
+						if (map.generation == renderGeneration) continue;
+						map.generation = renderGeneration;
 						if (map.ready) continue;
-						map.data = BuildStaticShadowMap(direction, std::get<0>(key), std::get<1>(key), std::get<2>(key), scene.cellSize, staticItems, casters);
+						map.data = BuildStaticShadowMap(direction, item->cellX, item->cellY, item->cellZ, scene.cellSize, staticItems, casters);
 						if (map.data.valid) {
 							if (!map.texture) map.texture = CreateShadowTexture(shadowMapResolution);
 							RenderShadowMap(commandBuffer, map.texture, map.data, casters, frameTime, renderGeneration);
 						}
 						map.ready = true;
+					}
+					for (auto map = staticShadowMaps.begin(); map != staticShadowMaps.end();) {
+						if (map->second.generation == renderGeneration) { ++map; continue; }
+						if (map->second.texture) ReleaseTexture(gpuDevice, map->second.texture);
+						map = staticShadowMaps.erase(map);
 					}
 				}
 				const auto& casters = light->renderStatic ? dynamicItems : renderItems;
@@ -3048,8 +3004,8 @@ namespace Sapphire::Graphics {
 			frame.pointLightColorIntensity[index][3] = pointLights[index].intensity;
 			frame.pointLightShadowInfo[index][0] = static_cast<float>(pointLights[index].staticShadowIndex);
 			frame.pointLightShadowInfo[index][1] = static_cast<float>(pointLights[index].dynamicShadowIndex);
-			frame.pointLightShadowInfo[index][2] = pointLights[index].staticShadowValid ? 1.0f : 0.0f;
-			frame.pointLightShadowInfo[index][3] = pointLights[index].dynamicShadowValid ? 1.0f : 0.0f;
+			frame.pointLightShadowInfo[index][2] = static_cast<float>(pointLights[index].staticShadowFaces);
+			frame.pointLightShadowInfo[index][3] = static_cast<float>(pointLights[index].dynamicShadowFaces);
 			frame.pointLightShadowBias[index][0] = std::max(pointLights[index].shadowBias, 0.0f);
 		}
 		frame.fogParameters[0] = static_cast<float>(pointLights.size());
@@ -3061,6 +3017,31 @@ namespace Sapphire::Graphics {
 		FogComputeUniforms fogComputeUniforms{};
 		fogComputeUniforms.frame = frame;
 		fogComputeUniforms.densityInputCount[0] = densityInputCount;
+		if (!pointLights.empty() && (fogSliceNear != nearClip || fogSliceFar != farClip || fogSliceDistanceCount != frameFogSlices)) {
+			const float fogLogRange = std::log(farClip / nearClip);
+			for (Uint32 slice = 0; slice < frameFogSlices; ++slice) {
+				fogSliceDistances[slice] = nearClip * std::exp(fogLogRange * (static_cast<float>(slice) + 0.5f) / frameFogSlices);
+			}
+			fogSliceNear = nearClip;
+			fogSliceFar = farClip;
+			fogSliceDistanceCount = frameFogSlices;
+		}
+		for (Uint32 index = 0; index < pointLights.size(); ++index) {
+			const auto& point = pointLights[index];
+			const float centerDistance = Length(Subtract(point.position, cameraTransform.position));
+			const float margin = std::max(0.001f, (centerDistance + point.range) * 0.0001f);
+			auto begin = std::lower_bound(fogSliceDistances.begin(), fogSliceDistances.begin() + frameFogSlices, centerDistance - point.range - margin);
+			auto end = std::upper_bound(begin, fogSliceDistances.begin() + frameFogSlices, centerDistance + point.range + margin);
+			if (begin != end) {
+				if (begin != fogSliceDistances.begin()) --begin;
+				if (end != fogSliceDistances.begin() + frameFogSlices) ++end;
+				for (auto slice = begin; slice != end; ++slice) {
+					const auto offset = static_cast<Uint32>(slice - fogSliceDistances.begin());
+					fogComputeUniforms.sliceMasks[offset / 4][offset % 4] |= 1u << index;
+				}
+			}
+		}
+
 		auto setExponentialInput = [](FogDensityInputUniforms& target, float density, float height, float falloff, float endDistance) {
 			target.parameters[0] = static_cast<float>(FogDensityInput::Encoding::ExponentialHeight);
 			target.parameters[1] = density;
@@ -3144,6 +3125,17 @@ namespace Sapphire::Graphics {
 			uniforms.layerParameters[0] = static_cast<Uint32>(nextLayerInstance);
 			nextLayerInstance += instanceCount;
 		};
+		float shadowBasis[3][4]{};
+		if (directionalShadowsActive) {
+			const auto& basis = GetShadowBasis(light->direction);
+			const Vector3 axes[] = {basis.right, basis.up, basis.direction};
+			for (int index = 0; index < 3; ++index) {
+				shadowBasis[index][0] = axes[index].x;
+				shadowBasis[index][1] = axes[index].y;
+				shadowBasis[index][2] = axes[index].z;
+			}
+		}
+		SDL_PushGPUVertexUniformData(commandBuffer, 1, shadowBasis, sizeof(shadowBasis));
 		if (std::any_of(transparent, visibleItems.end(), [](const RenderItem* item) {
 			return item->mesh->GetMaterial(item->materialIndex).UsesSingleLayer();
 		})) {
@@ -3202,6 +3194,7 @@ namespace Sapphire::Graphics {
 		}
 		nextLayerInstance = 1;
 		SDL_PushGPUFragmentUniformData(commandBuffer, 1, &frame, sizeof(frame));
+		SDL_PushGPUVertexUniformData(commandBuffer, 1, shadowBasis, sizeof(shadowBasis));
 		const bool needsSceneDepth = std::any_of(visibleItems.begin(), visibleItems.end(), [](const RenderItem* item) {
 			return !item->mesh->GetMaterial(item->materialIndex).depthSurfaceSource.empty();
 		});
@@ -3262,6 +3255,7 @@ namespace Sapphire::Graphics {
 				pass = SDL_BeginGPURenderPass(commandBuffer, &colorInfo, 1, &depthInfo);
 				if (!pass) throw std::runtime_error(std::string("Resume main render pass: ") + SDL_GetError());
 				SDL_PushGPUFragmentUniformData(commandBuffer, 1, &frame, sizeof(frame));
+				SDL_PushGPUVertexUniformData(commandBuffer, 1, shadowBasis, sizeof(shadowBasis));
 				activePipeline = nullptr;
 				activeTextures = {};
 				activeMaterial = nullptr;
@@ -3270,8 +3264,7 @@ namespace Sapphire::Graphics {
 			}
 			const RenderItem& item = **draw;
 			Mesh* mesh = item.mesh;
-			const auto selected = shadowsActive ? staticShadowMaps.find({item.cellX, item.cellY, item.cellZ}) : staticShadowMaps.end();
-			const StaticShadowMap* detail = selected != staticShadowMaps.end() ? &selected->second : nullptr;
+			const StaticShadowMap* detail = item.shadowDetail;
 			const bool staticEnabled = directionalShadowsActive && light->renderStatic;
 			const ShadowMapData maps[3] = {detail ? detail->data : ShadowMapData{}, fallbackShadowMap, dynamicMap};
 			const bool enabled[3] = {staticEnabled && detail && detail->data.valid, staticEnabled && fallbackShadowMap.valid, directionalShadowsActive && dynamicMap.valid};
@@ -3293,18 +3286,20 @@ namespace Sapphire::Graphics {
 			ObjectUniforms vertex = makeObjectUniforms(item, gpuMeshMaterial);
 			const Uint32 instanceCount = mesh->instanced ? gpuMesh.uploadedInstanceCount : 1;
 			if (singleLayer) assignLayerInstance(vertex, instanceCount);
-			vertex.shadowState[0] = directionalShadowsActive ? 1.0f : 0.0f;
 			FragmentUniforms fragment = gpuMeshMaterial.fragment;
 			if (!mesh->cullBackfaces) fragment.lightingParameters[0] = static_cast<float>(static_cast<Uint32>(fragment.lightingParameters[0]) | 32u);
-			Uint32 lightCount = 0;
-			for (Uint32 mask = item.lightMask; mask; mask &= mask - 1) {
-				const Uint32 index = static_cast<Uint32>(__builtin_ctz(static_cast<unsigned>(mask)));
-				fragment.pointLightIndices[lightCount / 4][lightCount % 4] = index;
-				++lightCount;
-			}
-			fragment.lightingParameters[3] = static_cast<float>(lightCount);
+			fragment.pointLightMask = item.lightMask;
 			for (int index = 0; index < 3; ++index) {
-				if (directionalShadowsActive) std::memcpy(vertex.shadowMvp[index], maps[index].mvp.values, sizeof(vertex.shadowMvp[index]));
+				if (enabled[index]) {
+					const float* matrix = maps[index].mvp.values;
+					for (int axis = 0; axis < 3; ++axis) {
+						const float value = matrix[axis] * shadowBasis[axis][0] + matrix[axis + 4] * shadowBasis[axis][1] + matrix[axis + 8] * shadowBasis[axis][2];
+						fragment.shadowScale[index][axis] = value * (axis == 0 ? 0.5f : axis == 1 ? -0.5f : 1.0f);
+					}
+					fragment.shadowOffset[index][0] = 0.5f + matrix[12] * 0.5f;
+					fragment.shadowOffset[index][1] = 0.5f - matrix[13] * 0.5f;
+					fragment.shadowOffset[index][2] = matrix[14];
+				}
 				fragment.shadowParameters[index][0] = enabled[index] ? 1.0f : 0.0f;
 				fragment.shadowParameters[index][1] = directionalShadowsActive ? std::max(light->shadowBias, 0.0f) / std::max(maps[index].depthRange, 0.01f) : 0.0f;
 				fragment.shadowParameters[index][2] = 1.0f / shadowMapResolution;
