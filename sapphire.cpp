@@ -63,7 +63,8 @@ namespace Sapphire {
 					Skeleton* skeleton = object->GetComponent<Skeleton>();
 					if (skeleton) {
 						skeleton->Validate();
-						skeleton->InitializePose();
+						auto* animator = object->GetComponent<Animator>();
+						if (!animator || (!animator->HasPlayback() && std::none_of(skeleton->bones.begin(), skeleton->bones.end(), [](const Bone& bone) { return bone.animated; }))) skeleton->InitializePose();
 					}
 					if (auto* mesh = object->GetComponent<Mesh>(); mesh && mesh->IsSkinned()) {
 						if (mesh->instanced) throw std::invalid_argument("Skinned meshes cannot be instanced");
@@ -125,6 +126,7 @@ namespace Sapphire {
 					if (!object->initializedForApp) continue;
 					object->UpdateWorldTransform();
 					object->Update();
+					if (object->initializedForApp) if (auto* animator = object->GetComponent<Animator>()) animator->Update(Time::deltaTime);
 					if (object->initializedForApp) object->GUI();
 					if (object->HasChildren()) object->UpdateWorldTransformSubtree();
 				}

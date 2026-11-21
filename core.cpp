@@ -74,6 +74,12 @@ namespace Sapphire {
 		float w = 0.0f;
 	};
 
+	struct BonePose {
+		Vector3 position;
+		Vector4 rotation{0.0f, 0.0f, 0.0f, 1.0f};
+		Vector3 scale{1.0f, 1.0f, 1.0f};
+	};
+
 	struct Transform {
 		Vector3 position;
 		Vector3 rotation;
@@ -215,6 +221,43 @@ namespace Sapphire {
 			return Model(transform, axes);
 		}
 
+		Vector4 Quaternion(const Vector3& rotation) {
+			const float x = rotation.x * degreesToRadians * 0.5f, y = rotation.y * degreesToRadians * 0.5f, z = rotation.z * degreesToRadians * 0.5f;
+			const float cx = std::cos(x), sx = std::sin(x), cy = std::cos(y), sy = std::sin(y), cz = std::cos(z), sz = std::sin(z);
+			return {sx * cy * cz - cx * sy * sz, cx * sy * cz + sx * cy * sz, cx * cy * sz - sx * sy * cz, cx * cy * cz + sx * sy * sz};
+		}
+
+		Vector4 NormalizeQuaternion(Vector4 q) {
+			const float length = std::sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+			if (!std::isfinite(length) || length < 0.000001f) throw std::invalid_argument("Invalid quaternion");
+			return {q.x/length, q.y/length, q.z/length, q.w/length};
+		}
+
+		Vector4 InterpolateQuaternion(Vector4 a, Vector4 b, float t) {
+			float dot = a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w;
+			if (dot < 0.0f) { b = {-b.x, -b.y, -b.z, -b.w}; dot = -dot; }
+			dot = std::clamp(dot, 0.0f, 1.0f);
+			float left = 1.0f - t, right = t;
+			if (dot < 0.9995f) {
+				const float angle = std::acos(dot), denominator = std::sin(angle);
+				left = std::sin((1.0f-t)*angle)/denominator; right = std::sin(t*angle)/denominator;
+			}
+			return NormalizeQuaternion({a.x*left+b.x*right, a.y*left+b.y*right, a.z*left+b.z*right, a.w*left+b.w*right});
+		}
+
+		BonePose InterpolatePose(const BonePose& a, const BonePose& b, float t) {
+			auto mix = [t](const Vector3& x, const Vector3& y) { return Vector3{x.x+(y.x-x.x)*t, x.y+(y.y-x.y)*t, x.z+(y.z-x.z)*t}; };
+			return {mix(a.position, b.position), InterpolateQuaternion(a.rotation, b.rotation, t), mix(a.scale, b.scale)};
+		}
+
+		Matrix4 Model(const BonePose& pose) {
+			const auto q = NormalizeQuaternion(pose.rotation);
+			const float x=q.x, y=q.y, z=q.z, w=q.w;
+			Vector3 axes[3] = {{1-2*(y*y+z*z), 2*(x*y+z*w), 2*(x*z-y*w)}, {2*(x*y-z*w), 1-2*(x*x+z*z), 2*(y*z+x*w)}, {2*(x*z+y*w), 2*(y*z-x*w), 1-2*(x*x+y*y)}};
+			Transform transform; transform.position = pose.position; transform.scale = pose.scale;
+			return Model(transform, axes);
+		}
+
 		Matrix4 NormalMatrix(const Transform& transform, const Vector3* axes) {
 			Transform normalTransform = transform;
 			normalTransform.position = {};
@@ -333,6 +376,8 @@ namespace Sapphire {
 		std::int32_t parentIndex = -1;
 		Transform bindTransform;
 		Transform poseTransform;
+		BonePose animatedPose;
+		bool animated = false;
 	};
 
 	class Skeleton : public Component {
@@ -372,7 +417,7 @@ namespace Sapphire {
 			}
 
 			void InitializePose() {
-				for (auto& bone : bones) bone.poseTransform = bone.bindTransform;
+				for (auto& bone : bones) { bone.poseTransform = bone.bindTransform; bone.animated = false; }
 				inverseBindMatrices.clear();
 				poseGlobalMatrices.clear();
 				poseMatrices.clear();
@@ -380,7 +425,7 @@ namespace Sapphire {
 			}
 
 			void MarkPoseDirty() { ++poseRevision; }
-			void SetPoseTransform(std::size_t boneIndex, const Transform& transform) { bones.at(boneIndex).poseTransform = transform; MarkPoseDirty(); }
+			void SetPoseTransform(std::size_t boneIndex, const Transform& transform) { auto& bone = bones.at(boneIndex); bone.poseTransform = transform; bone.animated = false; MarkPoseDirty(); }
 
 			const std::vector<Math::Matrix4>& PoseMatrices() {
 				if (cachedPoseRevision == poseRevision) return poseMatrices;
@@ -401,7 +446,7 @@ namespace Sapphire {
 						for (auto boneIndex = path.rbegin(); boneIndex != path.rend(); ++boneIndex) {
 							const Bone& bone = bones[*boneIndex];
 							const Transform& transform = bindPose ? bone.bindTransform : bone.poseTransform;
-							const Math::Matrix4 local = Math::Model(transform);
+							const Math::Matrix4 local = !bindPose && bone.animated ? Math::Model(bone.animatedPose) : Math::Model(transform);
 							matrices[*boneIndex] = bone.parentIndex < 0 ? local : Math::Multiply(matrices[bone.parentIndex], local);
 							complete[*boneIndex] = 1;
 						}
@@ -893,6 +938,36 @@ namespace Sapphire {
 			std::vector<std::pair<const void*, Component*>> componentCache;
 			std::unordered_map<std::string, std::any> properties;
 			std::vector<Object*> children;
+	};
+
+	struct AnimationClip {
+		std::uint32_t boneCount = 0;
+		std::uint32_t frameCount = 0;
+		float sampleRate = 0.0f;
+		std::vector<BonePose> samples;
+	};
+
+	class Animator : public Component {
+		public:
+			float blendDuration = 0.15f;
+			bool Default(const std::string& path);
+			bool PlayAnimation(const std::string& path, float duration = -1.0f);
+			bool LoopAnimation(const std::string& path, float duration = -1.0f);
+			void StopAnimation();
+			void Update(float deltaTime);
+			bool HasPlayback() const { return !currentPath.empty(); }
+
+		private:
+			std::unordered_map<std::string, AnimationClip> clips;
+			std::string currentPath;
+			std::string defaultPath;
+			bool looping = false;
+			double time = 0.0;
+			float blendTime = 0.0f;
+			float blendLength = 0.0f;
+			std::vector<BonePose> blendFrom;
+			AnimationClip* Load(const std::string& path);
+			bool Start(const std::string& path, bool loop, float duration);
 	};
 
 	struct FogDensityInput {
@@ -1666,24 +1741,24 @@ namespace Sapphire {
 						file.open(path, std::ios::binary | std::ios::ate);
 					}
 				}
-				if (!file) throw std::runtime_error("Could not open S3D file");
+				if (!file) throw std::runtime_error("Could not open asset file");
 				const auto length = file.tellg();
-				if (length < 8 || static_cast<std::uint64_t>(length) > std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("Invalid S3D file size");
+				if (length < 8 || static_cast<std::uint64_t>(length) > std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("Invalid asset file size");
 				data.resize(static_cast<std::size_t>(length));
 				file.seekg(0);
 				file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
-				if (!file) throw std::runtime_error("Could not read S3D file");
+				if (!file) throw std::runtime_error("Could not read asset file");
 				path = std::filesystem::absolute(path);
 			}
 
 			template <typename T> T Read() {
-				if (sizeof(T) > data.size() - offset) throw std::runtime_error("Truncated S3D file");
+				if (sizeof(T) > data.size() - offset) throw std::runtime_error("Truncated asset file");
 				if constexpr (std::is_floating_point_v<T>) {
 					static_assert(sizeof(T) == sizeof(std::uint32_t));
 					const std::uint32_t bits = Read<std::uint32_t>();
 					T value;
 					std::memcpy(&value, &bits, sizeof(value));
-					if (!std::isfinite(value)) throw std::runtime_error("Non-finite S3D value");
+					if (!std::isfinite(value)) throw std::runtime_error("Non-finite asset value");
 					return value;
 				}
 				else {
@@ -1710,6 +1785,7 @@ namespace Sapphire {
 			Vector3 Vector() { return {Read<float>(), Read<float>(), Read<float>()}; }
 			Transform TransformValue() { return {Vector(), Vector(), Vector()}; }
 			const std::filesystem::path& FilePath() const { return path; }
+			std::size_t Remaining() const { return data.size() - offset; }
 			bool Finished() const { return offset == data.size(); }
 		};
 
@@ -1821,6 +1897,87 @@ namespace Sapphire {
 			}
 			if (!reader.Finished()) throw std::runtime_error("Invalid S3D structure");
 			return records;
+		}
+	}
+
+	AnimationClip* Animator::Load(const std::string& path) {
+		if (auto found = clips.find(path); found != clips.end()) return &found->second;
+		try {
+			S3DReader reader(path);
+			if (reader.Read<std::uint8_t>() != 'S' || reader.Read<std::uint8_t>() != '3' || reader.Read<std::uint8_t>() != 'A' || reader.Read<std::uint8_t>() != 0) throw std::runtime_error("Invalid S3A signature");
+			AnimationClip clip;
+			clip.boneCount = reader.Read<std::uint32_t>();
+			clip.frameCount = reader.Read<std::uint32_t>();
+			clip.sampleRate = reader.Read<float>();
+			if (!clip.boneCount || !clip.frameCount || clip.sampleRate <= 0.0f || static_cast<std::uint64_t>(clip.boneCount) * clip.frameCount != reader.Remaining() / 40 || reader.Remaining() % 40) throw std::runtime_error("Invalid S3A dimensions");
+			clip.samples.resize(static_cast<std::size_t>(clip.boneCount) * clip.frameCount);
+			for (auto& sample : clip.samples) {
+				sample.position = reader.Vector();
+				sample.rotation = Math::NormalizeQuaternion({reader.Read<float>(), reader.Read<float>(), reader.Read<float>(), reader.Read<float>()});
+				sample.scale = reader.Vector();
+			}
+			return &clips.emplace(path, std::move(clip)).first->second;
+		}
+		catch (const std::exception& error) { SDL_Log("Could not load animation %s: %s", path.c_str(), error.what()); return nullptr; }
+	}
+
+	bool Animator::Start(const std::string& path, bool loop, float duration) {
+		Skeleton* skeleton = owner ? owner->GetComponent<Skeleton>() : nullptr;
+		if (!skeleton) { SDL_Log("Animator requires a skeleton on the same object"); return false; }
+		AnimationClip* clip = Load(path);
+		if (!clip || clip->boneCount != skeleton->bones.size()) { if (clip) SDL_Log("Animation bone count does not match skeleton: %s", path.c_str()); return false; }
+		if (loop && looping && currentPath == path) return true;
+		blendFrom.clear();
+		blendFrom.reserve(skeleton->bones.size());
+		for (const auto& bone : skeleton->bones) blendFrom.push_back(bone.animated ? bone.animatedPose : BonePose{bone.poseTransform.position, Math::Quaternion(bone.poseTransform.rotation), bone.poseTransform.scale});
+		currentPath = path;
+		looping = loop;
+		time = 0.0;
+		blendTime = 0.0f;
+		blendLength = std::isfinite(duration) && duration >= 0.0f ? duration : std::max(0.0f, std::isfinite(blendDuration) ? blendDuration : 0.0f);
+		return true;
+	}
+
+	bool Animator::Default(const std::string& path) {
+		if (!Start(path, true, -1.0f)) return false;
+		defaultPath = path;
+		return true;
+	}
+
+	bool Animator::PlayAnimation(const std::string& path, float duration) { return Start(path, false, duration); }
+	bool Animator::LoopAnimation(const std::string& path, float duration) { return Start(path, true, duration); }
+	void Animator::StopAnimation() { if (!defaultPath.empty()) Start(defaultPath, true, -1.0f); else { currentPath.clear(); blendFrom.clear(); } }
+
+	void Animator::Update(float deltaTime) {
+		if (currentPath.empty() || !owner) return;
+		Skeleton* skeleton = owner->GetComponent<Skeleton>();
+		auto found = clips.find(currentPath);
+		if (!skeleton || found == clips.end() || found->second.boneCount != skeleton->bones.size()) return;
+		const AnimationClip& clip = found->second;
+		const double duration = static_cast<double>(clip.frameCount - 1) / clip.sampleRate;
+		const double step = std::isfinite(deltaTime) ? std::max(0.0f, deltaTime) : 0.0;
+		const bool finished = !looping && time + step >= duration;
+		const double used = finished && !defaultPath.empty() ? std::max(0.0, duration - time) : step;
+		time = !looping ? std::min(time + used, duration) : time + used;
+		if (looping && duration > 0.0) time = std::fmod(time, duration);
+		const double frame = std::min(time * clip.sampleRate, static_cast<double>(clip.frameCount - 1));
+		const auto first = static_cast<std::uint32_t>(frame);
+		const auto second = std::min(first + 1, clip.frameCount - 1);
+		blendTime += static_cast<float>(used);
+		const float blend = blendLength > 0.0f ? std::clamp(blendTime / blendLength, 0.0f, 1.0f) : 1.0f;
+		for (std::size_t index = 0; index < skeleton->bones.size(); ++index) {
+			BonePose pose = Math::InterpolatePose(clip.samples[static_cast<std::size_t>(first)*clip.boneCount+index], clip.samples[static_cast<std::size_t>(second)*clip.boneCount+index], static_cast<float>(frame-first));
+			if (blend < 1.0f && blendFrom.size() == skeleton->bones.size()) pose = Math::InterpolatePose(blendFrom[index], pose, blend);
+			skeleton->bones[index].animatedPose = pose;
+			skeleton->bones[index].animated = true;
+		}
+		skeleton->MarkPoseDirty();
+		if (finished) {
+			if (!defaultPath.empty()) {
+				if (Start(defaultPath, true, -1.0f)) Update(static_cast<float>(step - used));
+				else { currentPath.clear(); blendFrom.clear(); }
+			}
+			else if (blend >= 1.0f) { currentPath.clear(); blendFrom.clear(); }
 		}
 	}
 
