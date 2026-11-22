@@ -111,8 +111,8 @@ namespace Sapphire::GUI {
 
 	bool Initialize(SDL_GPUDevice* device, SDL_Window* window) {
 		gpuDevice = device;
-		SDL_GPUShader* vertexShader = Graphics::CreateShader(gpuDevice, Graphics::Shaders::guiVertexShaderSource, SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 0, 1);
-		SDL_GPUShader* fragmentShader = Graphics::CreateShader(gpuDevice, Graphics::Shaders::guiFragmentShaderSource, SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 1);
+		SDL_GPUShader* vertexShader = Graphics::CreateShaderFromSource(gpuDevice, Graphics::Shaders::guiVertexShaderSource, SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
+		SDL_GPUShader* fragmentShader = Graphics::CreateShaderFromSource(gpuDevice, Graphics::Shaders::guiFragmentShaderSource, SDL_GPU_SHADERSTAGE_FRAGMENT, 1);
 
 		if (!vertexShader || !fragmentShader) {
 			if (vertexShader) SDL_ReleaseGPUShader(gpuDevice, vertexShader);

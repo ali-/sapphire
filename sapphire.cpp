@@ -1,4 +1,5 @@
 #include <SDL3/SDL.h>
+#include "shader_backend.cpp"
 #include "core.cpp"
 #include "physics.cpp"
 #include "input.cpp"
@@ -33,10 +34,17 @@ namespace Sapphire {
 			return 1;
 		}
 		SDL_GetWindowSize(window, &Screen::width, &Screen::height);
-		SDL_GPUDevice *gpuDevice = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_MSL, SDL_GetHintBoolean("SAPPHIRE_GPU_DEBUG", false), "metal");
-		const bool claimed = gpuDevice && SDL_ClaimWindowForGPUDevice(gpuDevice, window);
+		const auto& backend = Graphics::gpuBackend;
+		SDL_GPUDevice *gpuDevice = SDL_CreateGPUDevice(backend.shaderFormat, SDL_GetHintBoolean("SAPPHIRE_GPU_DEBUG", false), backend.driver);
+		if (!gpuDevice) {
+			SDL_Log("Could not create SDL GPU device (%s): %s", backend.driver, SDL_GetError());
+			Shutdown(nullptr, window);
+			return 1;
+		}
+		const bool claimed = SDL_ClaimWindowForGPUDevice(gpuDevice, window);
 		if (!claimed) {
-			Shutdown(gpuDevice, window, claimed);
+			SDL_Log("Could not claim window for SDL GPU device (%s): %s", backend.driver, SDL_GetError());
+			Shutdown(gpuDevice, window);
 			return 1;
 		}
 
