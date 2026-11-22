@@ -5,8 +5,9 @@ import os
 import struct
 from array import array
 from collections.abc import Mapping, Sequence
-from bpy.props import BoolProperty, EnumProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
 from bpy_extras.io_utils import ExportHelper
+from mathutils import Matrix
 
 
 def write_string(file, value):
@@ -629,6 +630,113 @@ def armature_for(obj):
     return None
 
 
+def action_curves(action, slot):
+    curves = []
+    for layer in action.layers:
+        for strip in layer.strips:
+            if hasattr(strip, "channelbag"):
+                bag = strip.channelbag(slot)
+                if bag:
+                    curves.extend(bag.fcurves)
+    return curves
+
+
+def animation_actions(armature):
+    prefixes = tuple(bone.path_from_id() for bone in armature.pose.bones)
+    actions = []
+    for action in bpy.data.actions:
+        matching = []
+        for slot in action.slots:
+            if slot.target_id_type != 'OBJECT':
+                continue
+            curves = action_curves(action, slot)
+            if any(curve.data_path.startswith(prefixes) for curve in curves):
+                matching.append(slot)
+        if len(matching) > 1:
+            raise ValueError("Ambiguous animation slots in action: " + action.name)
+        if matching:
+            actions.append((action, matching[0]))
+    return actions
+
+
+def write_animations(context, obj, armature, export_dir, sample_rate):
+    actions = animation_actions(armature)
+    names = set()
+    for action, _ in actions:
+        name = action.name
+        if name in {"", ".", ".."} or any(char in name for char in '/\\\0'):
+            raise ValueError("Invalid animation filename: " + name)
+        key = (name + ".s3a").casefold()
+        if key in names:
+            raise ValueError("Duplicate animation filename: " + name)
+        names.add(key)
+    if not actions:
+        return
+    scene = context.scene
+    had_animation_data = armature.animation_data is not None
+    animation = armature.animation_data_create()
+    original_action = animation.action
+    original_slot = animation.action_slot
+    original_nla = animation.use_nla
+    original_tweak = animation.use_tweak_mode
+    original_pose_position = armature.data.pose_position
+    original_transform = armature.matrix_basis.copy()
+    original_frame, original_subframe = scene.frame_current, scene.frame_subframe
+    original_pose = {bone.name: bone.matrix_basis.copy() for bone in armature.pose.bones}
+    identity = Matrix.Identity(4)
+    bones = list(armature.data.bones)
+    scene_fps = scene.render.fps / scene.render.fps_base
+    if scene_fps <= 0:
+        raise ValueError("Invalid scene frame rate")
+    try:
+        if original_tweak:
+            animation.use_tweak_mode = False
+            original_action = animation.action
+            original_slot = animation.action_slot
+        animation.use_nla = False
+        armature.data.pose_position = 'POSE'
+        for action, slot in actions:
+            animation.action = action
+            animation.action_slot = slot
+            start, end = action.frame_range
+            seconds = max(0.0, (end - start) / scene_fps)
+            intervals = max(1, math.ceil(seconds * sample_rate - 1e-6)) if seconds > 0 else 0
+            rate = intervals / seconds if intervals else sample_rate
+            with open(os.path.join(export_dir, action.name + ".s3a"), "wb") as file:
+                file.write(b"S3A\0")
+                file.write(struct.pack("<IIf", len(bones), intervals + 1, rate))
+                for frame_index in range(intervals + 1):
+                    armature.matrix_basis = original_transform
+                    for pose_bone in armature.pose.bones:
+                        pose_bone.matrix_basis = identity
+                    sample_frame = start + (end - start) * frame_index / intervals if intervals else start
+                    whole = math.floor(sample_frame)
+                    scene.frame_set(whole, subframe=sample_frame - whole)
+                    context.view_layer.update()
+                    mesh_inverse = obj.matrix_world.inverted()
+                    armature_to_mesh = mesh_inverse @ armature.matrix_world
+                    poses = {bone.name: armature_to_mesh @ armature.pose.bones[bone.name].matrix for bone in bones}
+                    for bone in bones:
+                        matrix = poses[bone.parent.name].inverted() @ poses[bone.name] if bone.parent else poses[bone.name]
+                        position, rotation, scale = matrix.decompose()
+                        rotation.normalize()
+                        file.write(struct.pack("<10f", *position, rotation.x, rotation.y, rotation.z, rotation.w, *scale))
+    finally:
+        animation.action = original_action
+        if original_action:
+            animation.action_slot = original_slot
+        animation.use_nla = original_nla
+        animation.use_tweak_mode = original_tweak
+        armature.data.pose_position = original_pose_position
+        scene.frame_set(original_frame, subframe=original_subframe)
+        armature.matrix_basis = original_transform
+        for bone in armature.pose.bones:
+            bone.matrix_basis = original_pose[bone.name]
+        context.view_layer.update()
+        if not had_animation_data:
+            armature.animation_data_clear()
+
+
 def bone_records(obj, armature):
     if not armature or armature.type != "ARMATURE":
         return []
@@ -806,6 +914,7 @@ class ExportSapphireS3D(bpy.types.Operator, ExportHelper):
     filename_ext = ".s3d"
     filter_glob: StringProperty(default="*.s3d", options={"HIDDEN"})
     apply_modifiers: BoolProperty(name="Apply Modifiers", default=False)
+    animation_sample_rate: FloatProperty(name="Animation Samples per Second", default=60.0, min=1.0, max=1000.0)
     exported_textures_directory: StringProperty(name="Exported Textures Directory", default="")
     max_texture_size: EnumProperty(name="Size", items=[("NONE", "None", "No size limit")] + [(str(size), str(size), f"Limit longest side to {size} pixels") for size in (4096, 2048, 1024, 512, 256, 128)], default="NONE")
 
@@ -824,6 +933,15 @@ class ExportSapphireS3D(bpy.types.Operator, ExportHelper):
                     raise ValueError("Missing source mesh " + source + " for " + name)
             models = [obj for obj, _, _ in entries if obj.type == "MESH" and sources[obj.name] == obj.name]
             export_dir = os.path.dirname(os.path.abspath(self.filepath))
+            skinned = [(obj, armature_for(obj)) for obj in models if armature_for(obj)]
+            if self.apply_modifiers and skinned:
+                raise ValueError("Disable Apply Modifiers to export a skinned mesh")
+            if skinned:
+                character, armature = skinned[0]
+                reference = character.matrix_world.inverted() @ armature.matrix_world
+                for obj, other in skinned[1:]:
+                    if other != armature or any(abs(a - b) > 1e-5 for row_a, row_b in zip(reference, obj.matrix_world.inverted() @ other.matrix_world) for a, b in zip(row_a, row_b)):
+                        raise ValueError("Skinned meshes must share an armature and mesh-to-armature transform")
             texture_dir = os.path.abspath(os.path.join(export_dir, os.path.expanduser(self.exported_textures_directory)))
             settings = context.scene.render.image_settings
             original_settings = (settings.file_format, settings.color_mode, settings.color_depth, settings.compression)
@@ -840,6 +958,8 @@ class ExportSapphireS3D(bpy.types.Operator, ExportHelper):
                     file.write(struct.pack("<I", len(entries)))
                     for obj, parent, parameters in entries:
                         write_object(file, obj, parent, parameters, sources[obj.name] if obj.type == "MESH" else "")
+                if skinned:
+                    write_animations(context, character, armature, export_dir, self.animation_sample_rate)
             finally:
                 settings.file_format, settings.color_mode, settings.color_depth, settings.compression = original_settings
         except (OSError, ValueError, RuntimeError, struct.error) as error:
@@ -849,6 +969,7 @@ class ExportSapphireS3D(bpy.types.Operator, ExportHelper):
 
     def draw(self, context):
         self.layout.prop(self, "apply_modifiers")
+        self.layout.prop(self, "animation_sample_rate")
         texture_options = self.layout.column()
         texture_options.label(text="Exported Textures Directory")
         texture_options.prop(self, "exported_textures_directory", text="")

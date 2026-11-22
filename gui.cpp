@@ -58,6 +58,7 @@ namespace Sapphire::GUI {
 
 		bool LoadFont() {
 			std::ifstream file(Graphics::ResourcePath("iosevka.sbf"), std::ios::binary);
+			if (!file) return true;
 			std::vector<std::uint8_t> bytes(std::istreambuf_iterator<char>(file), {});
 			if (bytes.size() < headerSize || std::memcmp(bytes.data(), "SBF1", 4) != 0) return false;
 
@@ -180,6 +181,7 @@ namespace Sapphire::GUI {
 	}
 
 	void Label(int x, int y, std::string_view text) {
+		if (!fontAtlas.texture) return;
 		const int startX = x;
 		const int endCharacter = fontAtlas.firstCharacter + fontAtlas.glyphCount;
 		const int fallback = '?' >= fontAtlas.firstCharacter && '?' < endCharacter ? '?' - fontAtlas.firstCharacter : 0;

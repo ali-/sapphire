@@ -1,6 +1,7 @@
 #include <string>
 
 namespace Sapphire::Graphics::Shaders {
+	inline const std::string particleVertexModifierSource = "void ModifyVertex(inout float3 position, inout float3 normal, inout float4 color, float4 instanceData, float time, float4x4 model) { color *= instanceData; }";
 	inline const std::string deformationShaderSource = R"(
 		float3 InstanceRotate(float3 localPoint, float3 degrees) {
 			float3 angle = degrees * 0.01745329252;
@@ -22,7 +23,7 @@ namespace Sapphire::Graphics::Shaders {
 			return position;
 		}
 		#ifndef CUSTOM_MODIFIER
-		void ModifyVertex(inout float3 position, inout float3 normal, inout float4 color, float instanceData, float time, float4x4 model) {}
+		void ModifyVertex(inout float3 position, inout float3 normal, inout float4 color, float4 instanceData, float time, float4x4 model) {}
 		#endif
 	)";
 
@@ -32,7 +33,7 @@ namespace Sapphire::Graphics::Shaders {
 		uint4 boneIndices: TEXCOORD4; float4 boneWeights: TEXCOORD5;
 		#endif
 		#if INSTANCED
-		float3 instancePosition: TEXCOORD4; float3 instanceRotation: TEXCOORD5; float3 instanceScale: TEXCOORD6; float instanceData: TEXCOORD7;
+		float3 instancePosition: TEXCOORD4; float3 instanceRotation: TEXCOORD5; float3 instanceScale: TEXCOORD6; float4 instanceData: TEXCOORD7;
 		#endif
 		};
 		void PrepareVertex(VertexInput input, float4 uvTransform, float4 displacementParameters, float4x4 model,
@@ -40,7 +41,7 @@ namespace Sapphire::Graphics::Shaders {
 		StructuredBuffer<float4x4> boneMatrices,
 		#endif
 		Texture2D<float4> heightMap, SamplerState heightSampler, Texture2D<float4> maskMap, SamplerState maskSampler,
-		inout float3 position, inout float3 normal, inout float2 uv, inout float4 color, inout float instanceData) {
+		inout float3 position, inout float3 normal, inout float2 uv, inout float4 color, inout float4 instanceData) {
 			uv = input.uv * uvTransform.xy + uvTransform.zw;
 			float3 localPosition = input.position;
 			normal = input.normal;
@@ -68,7 +69,7 @@ namespace Sapphire::Graphics::Shaders {
 	)";
 
 	inline const std::string vertexShaderSource = deformationShaderSource + meshVertexPreparationSource + R"(
-		struct VertexOutput { float4 position: SV_Position; float2 uv : TEXCOORD0; float4 color : TEXCOORD1; float3 worldPosition : TEXCOORD2; float3 worldNormal : TEXCOORD3; float4 shadowPosition0 : TEXCOORD4; float4 shadowPosition1 : TEXCOORD5; float4 shadowPosition2 : TEXCOORD6;
+		struct VertexOutput { float4 position: SV_Position; float2 uv : TEXCOORD0; float4 color : TEXCOORD1; float3 worldPosition : TEXCOORD2; float3 worldNormal : TEXCOORD3; float3 shadowPosition : TEXCOORD4;
 		#if SINGLE_LAYER
 		nointerpolation uint layerInstance : TEXCOORD9;
 		#endif
@@ -79,8 +80,9 @@ namespace Sapphire::Graphics::Shaders {
 		float4 modifierData : TEXCOORD8;
 		#endif
 		};
-		struct ObjectUniforms { float4x4 mvp; float4x4 model; float4x4 normal; float4 displacementParameters; float4 uvTransform; float4 modifierTime; float4x4 shadowMvp[3]; float4 shadowState; uint4 layerParameters; };
+		struct ObjectUniforms { float4x4 mvp; float4x4 model; float4x4 normal; float4 displacementParameters; float4 uvTransform; float4 modifierTime; uint4 layerParameters; };
 		ConstantBuffer<ObjectUniforms> uniforms : register(b0, space1);
+		cbuffer ShadowBasis : register(b1, space1) { float4 shadowBasis[3]; };
 		Texture2D<float4> heightMap : register(t0, space0);
 		SamplerState heightSampler : register(s0, space0);
 		Texture2D<float4> maskMap : register(t1, space0);
@@ -99,7 +101,7 @@ namespace Sapphire::Graphics::Shaders {
 			float3 localNormal;
 			float4 color;
 			float3 position;
-			float instanceData;
+			float4 instanceData;
 			PrepareVertex(input, uniforms.uvTransform, uniforms.displacementParameters, uniforms.model,
 			#if SKINNED
 				boneMatrices,
@@ -121,12 +123,7 @@ namespace Sapphire::Graphics::Shaders {
 			output.color = color;
 			output.worldPosition = (mul(uniforms.model, float4(position, 1.0))).xyz;
 			output.worldNormal = normalize((mul(uniforms.normal, float4(localNormal, 0.0))).xyz);
-			output.shadowPosition0 = output.shadowPosition1 = output.shadowPosition2 = (0.0).xxxx;
-			if (uniforms.shadowState.x > 0.5) {
-				output.shadowPosition0 = mul(uniforms.shadowMvp[0], float4(output.worldPosition, 1.0));
-				output.shadowPosition1 = mul(uniforms.shadowMvp[1], float4(output.worldPosition, 1.0));
-				output.shadowPosition2 = mul(uniforms.shadowMvp[2], float4(output.worldPosition, 1.0));
-			}
+			output.shadowPosition = float3(dot(output.worldPosition, shadowBasis[0].xyz), dot(output.worldPosition, shadowBasis[1].xyz), dot(output.worldPosition, shadowBasis[2].xyz));
 			return output;
 		}
 	)";
@@ -286,7 +283,7 @@ namespace Sapphire::Graphics::Shaders {
 	)";
 
 	inline const std::string fragmentShaderSource = fogCommonShaderSource + R"(
-		struct FragmentInput { float4 position: SV_Position; float2 uv : TEXCOORD0; float4 color : TEXCOORD1; float3 worldPosition : TEXCOORD2; float3 worldNormal : TEXCOORD3; float4 shadowPosition0 : TEXCOORD4; float4 shadowPosition1 : TEXCOORD5; float4 shadowPosition2 : TEXCOORD6;
+		struct FragmentInput { float4 position: SV_Position; float2 uv : TEXCOORD0; float4 color : TEXCOORD1; float3 worldPosition : TEXCOORD2; float3 worldNormal : TEXCOORD3; float3 shadowPosition : TEXCOORD4;
 		#ifdef SINGLE_LAYER_VISIBILITY_SLOT
 		nointerpolation uint layerInstance : TEXCOORD9;
 		#endif
@@ -297,14 +294,14 @@ namespace Sapphire::Graphics::Shaders {
 		float4 modifierData : TEXCOORD8;
 		#endif
 		};
-		struct FragmentUniforms { float4 shadowParameters[3]; float4 lightingParameters; float4 baseColor; float4 surfaceParameters; float4 customData[4]; uint4 pointLightIndices[4]; };
+		struct FragmentUniforms { float4 shadowParameters[3]; float4 shadowScale[3]; float4 shadowOffset[3]; float3 lightingParameters; uint pointLightMask; float4 baseColor; float4 surfaceParameters; float4 customData[4]; };
 		#ifndef CUSTOM_FRAGMENT_NORMAL
 		void ModifyFragmentNormal(inout float3 normal, float3 baseWorldPosition, float3 worldPosition, float2 uv, float time) {}
 		#endif
-		float ShadowProjection(float4 position, float4 parameters, inout float2 uv, inout float depth) {
+		float ShadowProjection(float3 position, float4 scale, float4 offset, float4 parameters, inout float2 uv, inout float depth) {
 			if (parameters.x < 0.5) return 0.0;
-			float3 projected = position.xyz / position.w;
-			uv = float2(projected.x * 0.5 + 0.5, 0.5 - projected.y * 0.5);
+			float3 projected = position * scale.xyz + offset.xyz;
+			uv = projected.xy;
 			depth = projected.z;
 			float border = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
 			if (projected.z < 0.0 || (projected.z > 1.0 && parameters.w < 0.5)) return 0.0;
@@ -317,10 +314,10 @@ namespace Sapphire::Graphics::Shaders {
 			}
 			return 1.0 - visibility * 0.25;
 		}
-		float ShadowAmount(float4 position, Texture2D<float> shadowMap, SamplerComparisonState shadowSampler, float4 parameters) {
+		float ShadowAmount(float3 position, float4 scale, float4 offset, Texture2D<float> shadowMap, SamplerComparisonState shadowSampler, float4 parameters) {
 			float2 uv;
 			float depth;
-			if (ShadowProjection(position, parameters, uv, depth) == 0.0) return 0.0;
+			if (ShadowProjection(position, scale, offset, parameters, uv, depth) == 0.0) return 0.0;
 			return ShadowTaps(depth, uv, shadowMap, shadowSampler, parameters);
 		}
 		float PointShadowVisibility(float3 direction, float receiverDistance, float range, float bias, uint cubeIndex, Texture2DArray<float> shadowMap, SamplerComparisonState shadowSampler) {
@@ -521,16 +518,18 @@ namespace Sapphire::Graphics::Shaders {
 			if (directionalShadow) {
 				float2 detailUV;
 				float detailDepth;
-				float detailCoverage = ShadowProjection(input.shadowPosition0, uniforms.shadowParameters[0], detailUV, detailDepth);
-				if (detailCoverage < 1.0) staticShadow = ShadowAmount(input.shadowPosition1, fallbackMap, fallbackSampler, uniforms.shadowParameters[1]);
+				float detailCoverage = ShadowProjection(input.shadowPosition, uniforms.shadowScale[0], uniforms.shadowOffset[0], uniforms.shadowParameters[0], detailUV, detailDepth);
+				if (detailCoverage < 1.0) staticShadow = ShadowAmount(input.shadowPosition, uniforms.shadowScale[1], uniforms.shadowOffset[1], fallbackMap, fallbackSampler, uniforms.shadowParameters[1]);
 				if (detailCoverage > 0.0) staticShadow = lerp(staticShadow, ShadowTaps(detailDepth, detailUV, detailMap, detailSampler, uniforms.shadowParameters[0]), detailCoverage);
 			}
 			float dynamicShadow = 0.0;
-			if (directionalShadow) dynamicShadow = ShadowAmount(input.shadowPosition2, dynamicMap, dynamicSampler, uniforms.shadowParameters[2]);
+			if (directionalShadow) dynamicShadow = ShadowAmount(input.shadowPosition, uniforms.shadowScale[2], uniforms.shadowOffset[2], dynamicMap, dynamicSampler, uniforms.shadowParameters[2]);
 			float3 direct = frame.directionalDirection.w > 0.0 ? EvaluateLight(surface, -frame.directionalDirection.xyz, twoSided) * frame.directionalColor.rgb * frame.directionalDirection.w * (1.0 - staticShadow) * (1.0 - dynamicShadow) : (0.0).xxx;
 			float3 pointLighting = (0.0).xxx;
-			for (int light = 0; light < int(uniforms.lightingParameters.w); ++light) {
-				uint index = uniforms.pointLightIndices[light / 4][light % 4];
+			uint lightMask = uniforms.pointLightMask;
+			while (lightMask != 0u) {
+				uint index = firstbitlow(lightMask);
+				lightMask &= lightMask - 1u;
 				float4 positionRange = frame.pointLightPositionRange[index];
 				float4 colorIntensity = frame.pointLightColorIntensity[index];
 				float3 toLight = positionRange.xyz - input.worldPosition;
@@ -577,7 +576,7 @@ namespace Sapphire::Graphics::Shaders {
 			float3 localNormal;
 			float4 color;
 			float3 position;
-			float instanceData;
+			float4 instanceData;
 			PrepareVertex(input, uniforms.uvTransform, uniforms.displacementParameters, uniforms.model,
 			#if SKINNED
 				boneMatrices,
@@ -616,9 +615,7 @@ namespace Sapphire::Graphics::Shaders {
 			float4 color : TEXCOORD1;
 			float3 worldPosition : TEXCOORD2;
 			float3 worldNormal : TEXCOORD3;
-			float4 shadowPosition0 : TEXCOORD4;
-			float4 shadowPosition1 : TEXCOORD5;
-			float4 shadowPosition2 : TEXCOORD6;
+			float3 shadowPosition : TEXCOORD4;
 			nointerpolation uint layerInstance : TEXCOORD9;
 		};
 		cbuffer opacityBuffer : register(b0, space3) { float4 opacity; };
