@@ -1,6 +1,8 @@
 #include <string>
 
 namespace Sapphire::Graphics::Shaders {
+	inline const std::string particleVertexModifierSource = "void ModifyVertex(thread float3& position, thread float3& normal, thread float4& color, float4 instanceData, float time, float4x4 model) { color *= instanceData; }";
+
 	inline const std::string deformationShaderSource = R"(
 		#include <metal_stdlib>
 		using namespace metal;

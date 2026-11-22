@@ -1434,6 +1434,9 @@ namespace Sapphire {
 			WorldPartitioner worldPartitioner;
 	};
 
+	namespace Graphics::Shaders {
+		extern const std::string particleVertexModifierSource;
+	}
 
 	class ParticleEmitter : public Object {
 		struct Particle {
@@ -1467,7 +1470,7 @@ namespace Sapphire {
 				auto& mesh = AddComponent<Mesh>();
 				mesh.data = Primitive::Plane.Mesh();
 				mesh.material = material;
-				mesh.material.vertexModifierSource = "void ModifyVertex(thread float3& position, thread float3& normal, thread float4& color, float4 instanceData, float time, float4x4 model) { color *= instanceData; }";
+				mesh.material.vertexModifierSource = Graphics::Shaders::particleVertexModifierSource;
 				mesh.instanced = true;
 				mesh.cullBackfaces = false;
 				mesh.castShadows = false;
