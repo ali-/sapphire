@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +26,7 @@
 #include SAPPHIRE_SHADER_SOURCE
 
 namespace Sapphire::Graphics {
+
 	SDL_GPUBuffer* CreateBuffer(SDL_GPUDevice* gpuDevice, SDL_GPUBufferUsageFlags usage, Uint32 size);
 	SDL_GPUTexture* CreateTexture(SDL_GPUDevice* gpuDevice, int width, int height, const std::uint8_t* pixels);
 	SDL_GPUTexture* CreateTexture(SDL_GPUDevice* gpuDevice, int width, int height, const std::uint8_t* pixels, bool srgb);
@@ -55,6 +57,7 @@ namespace Sapphire::Graphics {
 		constexpr std::uint64_t maxFogDensityGridSamples = 1'048'576;
 		Uint32 shadowMapResolution = 2048;
 		using CellKey = std::tuple<int, int, int>;
+
 
 		struct GpuMesh;
 
@@ -1988,17 +1991,24 @@ namespace Sapphire::Graphics {
 		return blend;
 	}
 
-	SDL_GPUShader* CreateShader(SDL_GPUDevice* gpuDevice, const char* source, SDL_GPUShaderStage stage, SDL_GPUShaderFormat format, Uint32 samplerCount = 0, Uint32 uniformBufferCount = 0, Uint32 storageBufferCount = 0) {
+	SDL_GPUShader* CreateShader(SDL_GPUDevice* gpuDevice, const ShaderCode& shader, SDL_GPUShaderStage stage, Uint32 samplerCount = 0, Uint32 uniformBufferCount = 0, Uint32 storageBufferCount = 0, Uint32 storageTextureCount = 0) {
 		SDL_GPUShaderCreateInfo shaderInfo{};
-		shaderInfo.code_size = std::strlen(source) + 1;
-		shaderInfo.code = reinterpret_cast<const Uint8*>(source);
+		shaderInfo.code_size = shader.size;
+		shaderInfo.code = shader.bytes;
 		shaderInfo.entrypoint = "main0";
-		shaderInfo.format = format;
+		shaderInfo.format = gpuBackend.shaderFormat;
 		shaderInfo.stage = stage;
 		shaderInfo.num_samplers = samplerCount;
 		shaderInfo.num_uniform_buffers = uniformBufferCount;
 		shaderInfo.num_storage_buffers = storageBufferCount;
+		shaderInfo.num_storage_textures = storageTextureCount;
 		return SDL_CreateGPUShader(gpuDevice, &shaderInfo);
+	}
+
+	SDL_GPUShader* CreateShaderFromSource(SDL_GPUDevice* gpuDevice, const char* source, SDL_GPUShaderStage stage, Uint32 samplerCount = 0, Uint32 uniformBufferCount = 0, Uint32 storageBufferCount = 0, Uint32 storageTextureCount = 0) {
+		const ShaderCode shader = PrepareShaderCode(source, stage == SDL_GPU_SHADERSTAGE_VERTEX ? L"vs_6_0" : L"ps_6_0");
+		if (!shader.bytes) return nullptr;
+		return CreateShader(gpuDevice, shader, stage, samplerCount, uniformBufferCount, storageBufferCount, storageTextureCount);
 	}
 
 	SDL_GPUTexture* UploadTexture(SDL_GPUDevice* gpuDevice, int width, int height, const void* pixels, SDL_GPUTextureFormat format, Uint32 stride, Uint32 rowPitch, bool mipmaps, bool masked, bool blended) {
@@ -2440,8 +2450,8 @@ namespace Sapphire::Graphics {
 
 	void PrepareFogBackgroundPipeline() {
 		if (fogBackgroundPipeline) return;
-		SDL_GPUShader* vertex = CreateShader(gpuDevice, fogBackgroundVertexShaderSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL);
-		SDL_GPUShader* fragment = CreateShader(gpuDevice, fogBackgroundFragmentShaderSource.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 1, 2);
+		SDL_GPUShader* vertex = CreateShaderFromSource(gpuDevice, fogBackgroundVertexShaderSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX);
+		SDL_GPUShader* fragment = CreateShaderFromSource(gpuDevice, fogBackgroundFragmentShaderSource.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 2);
 		if (!vertex || !fragment) {
 			if (vertex) SDL_ReleaseGPUShader(gpuDevice, vertex);
 			if (fragment) SDL_ReleaseGPUShader(gpuDevice, fragment);
@@ -2472,8 +2482,8 @@ namespace Sapphire::Graphics {
 
 	void PrepareColliderDebugPipeline() {
 		if (colliderDebugPipeline) return;
-		SDL_GPUShader* vertex = CreateShader(gpuDevice, vertexSource, SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 0, 1);
-		SDL_GPUShader* fragment = CreateShader(gpuDevice, fragmentSource, SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL);
+		SDL_GPUShader* vertex = CreateShaderFromSource(gpuDevice, vertexSource, SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
+		SDL_GPUShader* fragment = CreateShaderFromSource(gpuDevice, fragmentSource, SDL_GPU_SHADERSTAGE_FRAGMENT);
 		if (!vertex || !fragment) throw std::runtime_error(std::string("Create collider debug shader: ") + SDL_GetError());
 		SDL_GPUVertexBufferDescription bufferDescription{0, sizeof(Vector3), SDL_GPU_VERTEXINPUTRATE_VERTEX, 0};
 		SDL_GPUVertexAttribute attribute{0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, 0};
@@ -2527,20 +2537,20 @@ namespace Sapphire::Graphics {
 				const std::string prefix = std::string(instanced ? "#define INSTANCED 1\n" : "") + (vertexSource.empty() ? "" : "#define CUSTOM_MODIFIER 1\n") + (normalSource.empty() ? "" : "#define CUSTOM_FRAGMENT_NORMAL 1\n");
 				const std::string mainSource = prefix + layerVertexPrefix + deformationShaderSource + vertexSource + vertexShaderSource.substr(deformationShaderSource.size());
 				const std::string shadowSource = prefix + deformationShaderSource + vertexSource + shadowVertexShaderSource.substr(deformationShaderSource.size());
-				vertex[instanced] = CreateShader(gpuDevice, mainSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
-				shadowVertex[instanced] = CreateShader(gpuDevice, shadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
+				vertex[instanced] = CreateShaderFromSource(gpuDevice, mainSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, 2, 1);
+				shadowVertex[instanced] = CreateShaderFromSource(gpuDevice, shadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, 2, 1);
 				if (!vertex[instanced] || !shadowVertex[instanced]) throw std::runtime_error(std::string("Compile vertex modifier: ") + SDL_GetError());
 			}
 			if (skinned) {
 				const std::string skinnedPrefix = std::string("#define SKINNED 1\n") + (vertexSource.empty() ? "" : "#define CUSTOM_MODIFIER 1\n") + (normalSource.empty() ? "" : "#define CUSTOM_FRAGMENT_NORMAL 1\n");
 				const std::string skinnedMainSource = skinnedPrefix + layerVertexPrefix + deformationShaderSource + vertexSource + vertexShaderSource.substr(deformationShaderSource.size());
 				const std::string skinnedShadowSource = skinnedPrefix + deformationShaderSource + vertexSource + shadowVertexShaderSource.substr(deformationShaderSource.size());
-				skinnedVertex = CreateShader(gpuDevice, skinnedMainSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1, 1);
-				skinnedShadowVertex = CreateShader(gpuDevice, skinnedShadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1, 1);
+				skinnedVertex = CreateShaderFromSource(gpuDevice, skinnedMainSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, 2, 1, 1);
+				skinnedShadowVertex = CreateShaderFromSource(gpuDevice, skinnedShadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, 2, 1, 1);
 				if (!skinnedVertex || !skinnedShadowVertex) throw std::runtime_error(std::string("Compile skinned vertex modifier: ") + SDL_GetError());
 			}
 			if (singleLayer) {
-				layerFragment = CreateShader(gpuDevice, layerDepthFragmentShaderSource, SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 1, 1);
+				layerFragment = CreateShaderFromSource(gpuDevice, layerDepthFragmentShaderSource, SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1);
 				if (!layerFragment) throw std::runtime_error(std::string("Compile layer depth fragment shader: ") + SDL_GetError());
 			}
 			for (int masked = 0; masked < 2; ++masked) {
@@ -2549,8 +2559,13 @@ namespace Sapphire::Graphics {
 				const Uint32 layerSlot = surfaceSource.empty() ? 9 : 10;
 				const std::string layerPrefix = singleLayer ? "#define SINGLE_LAYER_VISIBILITY_SLOT " + std::to_string(layerSlot) + "\n" : "";
 				const std::string mainSource = prefix + depthPrefix + layerPrefix + fogCommonShaderSource + normalSource + surfaceSource + fragmentShaderSource.substr(fogCommonShaderSource.size());
-				fragment[masked] = CreateShader(gpuDevice, mainSource.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, layerSlot + singleLayer, 2);
-				shadowFragment[masked] = CreateShader(gpuDevice, (prefix + shadowFragmentShaderSource).c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, masked ? 1 : 0);
+#if defined(_WIN32)
+				// DXIL reads the integer visibility target with Load, after the sampled textures.
+				fragment[masked] = CreateShaderFromSource(gpuDevice, mainSource.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, layerSlot, 2, 0, singleLayer);
+#else
+				fragment[masked] = CreateShaderFromSource(gpuDevice, mainSource.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, layerSlot + singleLayer, 2);
+#endif
+				shadowFragment[masked] = CreateShaderFromSource(gpuDevice, (prefix + shadowFragmentShaderSource).c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, masked ? 1 : 0);
 				if (!fragment[masked] || !shadowFragment[masked]) throw std::runtime_error(std::string("Compile modifier pipeline fragment shader: ") + SDL_GetError());
 			}
 			for (int instanced = 0; instanced < 2; ++instanced) BuildMeshPipelines(family, instanced, vertex[instanced], shadowVertex[instanced], fragment, shadowFragment, layerFragment);
@@ -2570,24 +2585,24 @@ namespace Sapphire::Graphics {
 	bool Initialize(SDL_GPUDevice* device, SDL_Window* window) {
 		gpuDevice = device;
 		linearOutput = window && SDL_WindowSupportsGPUSwapchainComposition(device, window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR) && SDL_SetGPUSwapchainParameters(device, window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR, SDL_GPU_PRESENTMODE_VSYNC);
-		SDL_GPUShader* vertexShader = CreateShader(gpuDevice, vertexShaderSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
+		SDL_GPUShader* vertexShader = CreateShaderFromSource(gpuDevice, vertexShaderSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, 2, 1);
 		const std::string instanceVertexSource = "#define INSTANCED 1\n" + vertexShaderSource;
-		SDL_GPUShader* instanceVertexShader = CreateShader(gpuDevice, instanceVertexSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
+		SDL_GPUShader* instanceVertexShader = CreateShaderFromSource(gpuDevice, instanceVertexSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, 2, 1);
 		SDL_GPUShader* fragmentShaders[2]{};
-		SDL_GPUShader* shadowVertexShader = CreateShader(gpuDevice, shadowVertexShaderSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
+		SDL_GPUShader* shadowVertexShader = CreateShaderFromSource(gpuDevice, shadowVertexShaderSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, 2, 1);
 		const std::string instanceShadowSource = "#define INSTANCED 1\n" + shadowVertexShaderSource;
-		SDL_GPUShader* instanceShadowShader = CreateShader(gpuDevice, instanceShadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1);
+		SDL_GPUShader* instanceShadowShader = CreateShaderFromSource(gpuDevice, instanceShadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, 2, 1);
 		const std::string skinnedVertexSource = "#define SKINNED 1\n" + vertexShaderSource;
-		SDL_GPUShader* skinnedVertexShader = CreateShader(gpuDevice, skinnedVertexSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1, 1);
+		SDL_GPUShader* skinnedVertexShader = CreateShaderFromSource(gpuDevice, skinnedVertexSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, 2, 1, 1);
 		const std::string skinnedShadowSource = "#define SKINNED 1\n" + shadowVertexShaderSource;
-		SDL_GPUShader* skinnedShadowVertexShader = CreateShader(gpuDevice, skinnedShadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERFORMAT_MSL, 2, 1, 1);
+		SDL_GPUShader* skinnedShadowVertexShader = CreateShaderFromSource(gpuDevice, skinnedShadowSource.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, 2, 1, 1);
 		SDL_GPUShader* shadowFragmentShaders[2]{};
 		for (int masked = 0; masked < 2; ++masked) {
 			const std::string define = masked ? "#define ALPHA_MASKED 1\n" : "#define ALPHA_MASKED 0\n";
 			const std::string source = define + fragmentShaderSource;
 			const std::string shadowSource = define + shadowFragmentShaderSource;
-			fragmentShaders[masked] = CreateShader(gpuDevice, source.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, 9, 2);
-			shadowFragmentShaders[masked] = CreateShader(gpuDevice, shadowSource.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, SDL_GPU_SHADERFORMAT_MSL, masked ? 1 : 0);
+			fragmentShaders[masked] = CreateShaderFromSource(gpuDevice, source.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, 9, 2);
+			shadowFragmentShaders[masked] = CreateShaderFromSource(gpuDevice, shadowSource.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, masked ? 1 : 0);
 		}
 		const auto releaseShaders = [&]() {
 			if (vertexShader) SDL_ReleaseGPUShader(gpuDevice, vertexShader);
@@ -2626,11 +2641,13 @@ namespace Sapphire::Graphics {
 					emptyFogInfo.sample_count = SDL_GPU_SAMPLECOUNT_1;
 					emptyFogVolumeTexture = CreateTextureResource(gpuDevice, emptyFogInfo);
 					if (SDL_GPUTextureSupportsFormat(gpuDevice, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, SDL_GPU_TEXTURETYPE_3D, fogTextureUsage)) {
+						const ShaderCode shader = PrepareShaderCode(fogComputeShaderSource.c_str(), L"cs_6_0");
+						if (!shader.bytes) throw std::runtime_error(SDL_GetError());
 						SDL_GPUComputePipelineCreateInfo computeInfo{};
-						computeInfo.code_size = fogComputeShaderSource.size() + 1;
-						computeInfo.code = reinterpret_cast<const Uint8*>(fogComputeShaderSource.c_str());
+						computeInfo.code_size = shader.size;
+						computeInfo.code = shader.bytes;
 						computeInfo.entrypoint = "main0";
-						computeInfo.format = SDL_GPU_SHADERFORMAT_MSL;
+						computeInfo.format = gpuBackend.shaderFormat;
 						computeInfo.num_samplers = maxFogDensityInputs;
 						computeInfo.num_readwrite_storage_textures = 1;
 						computeInfo.num_uniform_buffers = 1;
@@ -3152,7 +3169,11 @@ namespace Sapphire::Graphics {
 				SDL_GPUTextureCreateInfo visibility{};
 				visibility.type = SDL_GPU_TEXTURETYPE_2D;
 				visibility.format = layerVisibilityFormat;
+#if defined(_WIN32)
+				visibility.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_GRAPHICS_STORAGE_READ;
+#else
 				visibility.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+#endif
 				visibility.width = width;
 				visibility.height = height;
 				visibility.layer_count_or_depth = visibility.num_levels = 1;
@@ -3298,7 +3319,7 @@ namespace Sapphire::Graphics {
 			if (!mesh->cullBackfaces) fragment.lightingParameters[0] = static_cast<float>(static_cast<Uint32>(fragment.lightingParameters[0]) | 32u);
 			Uint32 lightCount = 0;
 			for (Uint32 mask = item.lightMask; mask; mask &= mask - 1) {
-				const Uint32 index = static_cast<Uint32>(__builtin_ctz(static_cast<unsigned>(mask)));
+				const Uint32 index = static_cast<Uint32>(std::countr_zero(static_cast<unsigned>(mask)));
 				fragment.pointLightIndices[lightCount / 4][lightCount % 4] = index;
 				++lightCount;
 			}
@@ -3335,8 +3356,12 @@ namespace Sapphire::Graphics {
 				SDL_BindGPUFragmentSamplers(pass, 9, &depthBinding, 1);
 			}
 			if (singleLayer) {
+#if defined(_WIN32)
+				SDL_BindGPUFragmentStorageTextures(pass, 0, &layerVisibilityTexture, 1);
+#else
 				const SDL_GPUTextureSamplerBinding layerBinding{layerVisibilityTexture, sampler};
 				SDL_BindGPUFragmentSamplers(pass, material.depthSurfaceSource.empty() ? 9 : 10, &layerBinding, 1);
+#endif
 			}
 			SDL_GPUTextureSamplerBinding vertexBindings[2] = {{activeGpuMaterial->textures[4], sampler}, {activeGpuMaterial->textures[5], sampler}};
 			if (activeMaterial != activeGpuMaterial) SDL_BindGPUVertexSamplers(pass, 0, vertexBindings, 2);
