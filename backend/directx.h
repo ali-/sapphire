@@ -1,3 +1,63 @@
+#pragma once
+#include <SDL3/SDL_gpu.h>
+#include <cstring>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <dxcapi.h>
+#include <wrl/client.h>
+#undef near
+#undef far
+
+namespace Sapphire::Graphics {
+    struct GPUBackend { const char* driver; SDL_GPUShaderFormat shaderFormat; };
+    inline constexpr GPUBackend gpuBackend{"direct3d12", SDL_GPU_SHADERFORMAT_DXIL};
+    struct ShaderCode {
+        const Uint8* bytes = nullptr;
+        std::size_t size = 0;
+        Microsoft::WRL::ComPtr<IDxcBlob> bytecode;
+    };
+    static Microsoft::WRL::ComPtr<IDxcBlob> CompileShader(const char* source, const wchar_t* profile) {
+        using Microsoft::WRL::ComPtr;
+        static thread_local ComPtr<IDxcCompiler3> compiler;
+        if (!compiler && FAILED(DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(compiler.GetAddressOf())))) {
+            SDL_SetError("Could not initialize DirectX Shader Compiler");
+            return {};
+        }
+        const DxcBuffer input{source, std::strlen(source), DXC_CP_UTF8};
+        const wchar_t* arguments[] = {L"-E", L"main0", L"-T", profile, L"-HV", L"2021", L"-Zpc"};
+        ComPtr<IDxcResult> result;
+        if (FAILED(compiler->Compile(&input, arguments, SDL_arraysize(arguments), nullptr, IID_PPV_ARGS(result.GetAddressOf())))) {
+            SDL_SetError("DirectX Shader Compiler could not process shader source");
+            return {};
+        }
+        ComPtr<IDxcBlob> bytecode;
+        HRESULT status;
+        if (FAILED(result->GetStatus(&status)) || FAILED(status) || FAILED(result->GetResult(bytecode.GetAddressOf()))) {
+            ComPtr<IDxcBlobUtf8> errors;
+            result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(errors.GetAddressOf()), nullptr);
+            SDL_SetError("HLSL compilation failed: %s", errors && errors->GetStringLength() ? errors->GetStringPointer() : "no compiler diagnostics");
+        }
+        return bytecode;
+    }
+    static ShaderCode PrepareShaderCode(const char* source, const wchar_t* profile) {
+        ShaderCode shader;
+        shader.bytecode = CompileShader(source, profile);
+        if (shader.bytecode) {
+            shader.bytes = static_cast<const Uint8*>(shader.bytecode->GetBufferPointer());
+            shader.size = shader.bytecode->GetBufferSize();
+        }
+        return shader;
+    }
+    static Uint32 VisibilitySamplerCount(Uint32 slot, bool) { return slot; }
+    static Uint32 VisibilityStorageCount(bool singleLayer) { return singleLayer; }
+    static SDL_GPUTextureUsageFlags VisibilityTextureUsage() { return SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_GRAPHICS_STORAGE_READ; }
+    static void BindVisibilityTexture(SDL_GPURenderPass* pass, SDL_GPUTexture* texture, SDL_GPUSampler*, bool) {
+        SDL_BindGPUFragmentStorageTextures(pass, 0, &texture, 1);
+    }
+}
+
 #include <string>
 
 namespace Sapphire::Graphics::Shaders {

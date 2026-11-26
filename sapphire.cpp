@@ -1,5 +1,5 @@
 #include <SDL3/SDL.h>
-#include "shader_backend.cpp"
+#include SAPPHIRE_BACKEND_HEADER
 #include "core.cpp"
 #include "physics.cpp"
 #include "input.cpp"

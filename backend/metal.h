@@ -1,3 +1,23 @@
+#pragma once
+#include <SDL3/SDL_gpu.h>
+#include <cstring>
+
+namespace Sapphire::Graphics {
+    struct GPUBackend { const char* driver; SDL_GPUShaderFormat shaderFormat; };
+    inline constexpr GPUBackend gpuBackend{"metal", SDL_GPU_SHADERFORMAT_MSL};
+    struct ShaderCode { const Uint8* bytes = nullptr; std::size_t size = 0; };
+    static ShaderCode PrepareShaderCode(const char* source, const wchar_t*) {
+        return {reinterpret_cast<const Uint8*>(source), std::strlen(source) + 1};
+    }
+    static Uint32 VisibilitySamplerCount(Uint32 slot, bool singleLayer) { return slot + singleLayer; }
+    static Uint32 VisibilityStorageCount(bool) { return 0; }
+    static SDL_GPUTextureUsageFlags VisibilityTextureUsage() { return SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER; }
+    static void BindVisibilityTexture(SDL_GPURenderPass* pass, SDL_GPUTexture* texture, SDL_GPUSampler* sampler, bool hasDepthSurface) {
+        const SDL_GPUTextureSamplerBinding binding{texture, sampler};
+        SDL_BindGPUFragmentSamplers(pass, hasDepthSurface ? 10 : 9, &binding, 1);
+    }
+}
+
 #include <string>
 
 namespace Sapphire::Graphics::Shaders {

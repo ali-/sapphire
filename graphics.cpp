@@ -22,7 +22,6 @@
 #include <vector>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_gpu.h>
-#include SAPPHIRE_SHADER_SOURCE
 
 namespace Sapphire::Graphics {
 
@@ -2514,12 +2513,7 @@ namespace Sapphire::Graphics {
 				const Uint32 layerSlot = surfaceSource.empty() ? 9 : 10;
 				const std::string layerPrefix = singleLayer ? "#define SINGLE_LAYER_VISIBILITY_SLOT " + std::to_string(layerSlot) + "\n" : "";
 				const std::string mainSource = prefix + depthPrefix + layerPrefix + fogCommonShaderSource + normalSource + surfaceSource + fragmentShaderSource.substr(fogCommonShaderSource.size());
-#if defined(_WIN32)
-				// DXIL reads the integer visibility target with Load, after the sampled textures.
-				fragment[masked] = CreateShaderFromSource(gpuDevice, mainSource.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, layerSlot, 2, 0, singleLayer);
-#else
-				fragment[masked] = CreateShaderFromSource(gpuDevice, mainSource.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, layerSlot + singleLayer, 2);
-#endif
+				fragment[masked] = CreateShaderFromSource(gpuDevice, mainSource.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, VisibilitySamplerCount(layerSlot, singleLayer), 2, 0, VisibilityStorageCount(singleLayer));
 				shadowFragment[masked] = CreateShaderFromSource(gpuDevice, (prefix + shadowFragmentShaderSource).c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, masked ? 1 : 0);
 				if (!fragment[masked] || !shadowFragment[masked]) throw std::runtime_error(std::string("Compile modifier pipeline fragment shader: ") + SDL_GetError());
 			}
@@ -3160,11 +3154,7 @@ namespace Sapphire::Graphics {
 				SDL_GPUTextureCreateInfo visibility{};
 				visibility.type = SDL_GPU_TEXTURETYPE_2D;
 				visibility.format = layerVisibilityFormat;
-#if defined(_WIN32)
-				visibility.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_GRAPHICS_STORAGE_READ;
-#else
-				visibility.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
-#endif
+				visibility.usage = VisibilityTextureUsage();
 				visibility.width = width;
 				visibility.height = height;
 				visibility.layer_count_or_depth = visibility.num_levels = 1;
@@ -3350,12 +3340,7 @@ namespace Sapphire::Graphics {
 				SDL_BindGPUFragmentSamplers(pass, 9, &depthBinding, 1);
 			}
 			if (singleLayer) {
-#if defined(_WIN32)
-				SDL_BindGPUFragmentStorageTextures(pass, 0, &layerVisibilityTexture, 1);
-#else
-				const SDL_GPUTextureSamplerBinding layerBinding{layerVisibilityTexture, sampler};
-				SDL_BindGPUFragmentSamplers(pass, material.depthSurfaceSource.empty() ? 9 : 10, &layerBinding, 1);
-#endif
+				BindVisibilityTexture(pass, layerVisibilityTexture, sampler, !material.depthSurfaceSource.empty());
 			}
 			SDL_GPUTextureSamplerBinding vertexBindings[2] = {{activeGpuMaterial->textures[4], sampler}, {activeGpuMaterial->textures[5], sampler}};
 			if (activeMaterial != activeGpuMaterial) SDL_BindGPUVertexSamplers(pass, 0, vertexBindings, 2);
