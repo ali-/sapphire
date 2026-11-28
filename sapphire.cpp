@@ -22,11 +22,13 @@ namespace Sapphire {
 		if (gpuDevice && window && claimed) SDL_ReleaseWindowFromGPUDevice(gpuDevice, window);
 		if (gpuDevice) SDL_DestroyGPUDevice(gpuDevice);
 		if (window) SDL_DestroyWindow(window);
+		Audio::Shutdown();
 		SDL_Quit();
 	}
 
 	int App(const char* windowTitle, Scene& scene, float targetFPS = 0.0f, SDL_WindowFlags windowFlags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_FULLSCREEN) {
-		if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) return 1;
+		if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) return 1;
+		if (!Audio::Initialize()) { SDL_Quit(); return 1; }
 		Input::Initialize();
 		SDL_Window *window = SDL_CreateWindow(windowTitle, Screen::width, Screen::height, windowFlags);
 		if (!window) {
@@ -139,6 +141,10 @@ namespace Sapphire {
 					if (object->HasChildren()) object->UpdateWorldTransformSubtree();
 				}
 				scene.UpdateTransforms();
+				Object* listener = nullptr;
+				for (auto& object : scene.Objects()) if (object.get() == scene.soundListener) { listener = object.get(); break; }
+				if (!listener) scene.soundListener = nullptr;
+				for (auto& object : scene.Objects()) if (auto* sound = object->GetComponent<SoundEmitter>()) sound->UpdateSound(listener);
 
 				SDL_GPUCommandBuffer *commandBuffer = SDL_AcquireGPUCommandBuffer(gpuDevice);
 				if (!commandBuffer) throw std::runtime_error(std::string("Acquire frame command buffer: ") + SDL_GetError());
@@ -177,12 +183,14 @@ namespace Sapphire {
 				}
 			}
 
+			for (auto& object : scene.Objects()) if (auto* sound = object->GetComponent<SoundEmitter>()) sound->StopSound();
 			scene.SetAppActive(false);
 			Shutdown(gpuDevice, window, claimed);
 			return 0;
 		}
 		catch (const std::exception& error) {
 			SDL_Log("Engine failure: %s", error.what());
+			for (auto& object : scene.Objects()) if (auto* sound = object->GetComponent<SoundEmitter>()) sound->StopSound();
 			scene.SetAppActive(false);
 			Shutdown(gpuDevice, window, claimed);
 			return 1;
