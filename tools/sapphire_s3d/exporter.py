@@ -225,6 +225,9 @@ def normalize_references(records, export_path, maximum, scene):
             if not reference or not reference.lower().endswith(".png"):
                 continue
             source = os.path.abspath(os.path.join(os.path.dirname(export_path), reference))
+            if not os.path.exists(source):
+                record["textures"][index] = ""
+                continue
             if source not in normalized:
                 width, height, color_type = png_info(source)
                 target_width, target_height = limited_size(width, height, maximum)
@@ -354,6 +357,9 @@ def reference_direct_images(materials, records, export_path, texture_dir, maximu
         def reference(image, channel, alpha=False):
             nonlocal extra_index
             pointer = image.as_pointer()
+            if image.source == "FILE" and not image.packed_file and not image.has_data and not os.path.isfile(bpy.path.abspath(image.filepath, library=image.library)):
+                referenced.add(pointer)
+                return ""
             if channel in named and named[channel][0] != pointer:
                 while "image" + str(extra_index) in named:
                     extra_index += 1
@@ -375,7 +381,8 @@ def reference_direct_images(materials, records, export_path, texture_dir, maximu
                 image = direct_image(linked_input(principled, socket_name))
                 if image:
                     records[index]["textures"][slot] = reference(image, channel, alpha=base_alpha if channel == "base" else False)
-                    records[index]["color" if slot == 0 else "roughness"] = (1.0, 1.0, 1.0) if slot == 0 else 1.0
+                    if records[index]["textures"][slot]:
+                        records[index]["color" if slot == 0 else "roughness"] = (1.0, 1.0, 1.0) if slot == 0 else 1.0
             if base_alpha and records[index]["textures"][0]:
                 records[index]["opacity"] = 1.0
                 records[index]["base_alpha"] = True

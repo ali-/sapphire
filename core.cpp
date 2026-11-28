@@ -1,3 +1,4 @@
+#include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
 #include <any>
@@ -29,6 +30,11 @@ namespace Sapphire {
 	class Object;
 	class Scene;
 
+	namespace Screen {
+		inline int height = 720;
+		inline int width = 1280;
+	};
+
 	namespace Time {
 		inline float deltaTime = 0.0f;
 		inline float fixedDeltaTime = 1.0f / 60.0f;
@@ -38,11 +44,6 @@ namespace Sapphire {
 	namespace Math {
 		inline constexpr float degreesToRadians = 0.01745329252f;
 	}
-
-	namespace Screen {
-		inline int height = 720;
-		inline int width = 1280;
-	};
 
 	struct Vector3 {
 		float x = 0.0f;
@@ -947,9 +948,63 @@ namespace Sapphire {
 		std::vector<BonePose> samples;
 	};
 
+	namespace Audio {
+		inline SDL_AudioDeviceID device = 0;
+		bool Initialize() {
+			device = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, nullptr);
+			if (!device) SDL_Log("Could not open audio device: %s", SDL_GetError());
+			return device != 0;
+		}
+		void Shutdown() { if (device) SDL_CloseAudioDevice(device); device = 0; }
+	}
+
+	class SoundEmitter : public Component {
+		struct Playback {
+			SDL_AudioStream* stream = nullptr;
+			std::vector<float> stereo;
+			std::vector<float> mono;
+			std::size_t position = 0;
+			float left = 0.0f, right = 0.0f;
+			bool positional = true, looping = false, finished = false;
+			std::string path;
+			~Playback() { if (stream) SDL_DestroyAudioStream(stream); }
+		};
+		std::unique_ptr<Playback> playback;
+		static void SDLCALL Supply(void* userdata, SDL_AudioStream* stream, int additional, int) {
+			auto& sound = *static_cast<Playback*>(userdata);
+			std::array<float, 2048> buffer{};
+			int frames = (additional + 7) / 8;
+			while (frames > 0 && !sound.finished) {
+				int count = 0;
+				while (count < std::min(frames, 1024)) {
+					if (sound.position >= sound.mono.size()) {
+						if (!sound.looping) { sound.finished = true; break; }
+						sound.position = 0;
+					}
+					const std::size_t i = sound.position++;
+					buffer[count * 2] = (sound.positional ? sound.mono[i] : sound.stereo[i * 2]) * sound.left;
+					buffer[count * 2 + 1] = (sound.positional ? sound.mono[i] : sound.stereo[i * 2 + 1]) * sound.right;
+					++count;
+				}
+				if (!count || !SDL_PutAudioStreamData(stream, buffer.data(), count * 2 * sizeof(float))) break;
+				frames -= count;
+			}
+		}
+		bool Start(const std::string& path, bool loop);
+	public:
+		float range = 10.0f;
+		float volume = 1.0f;
+		float speed = 1.0f;
+		bool PlaySound(const std::string& path) { return Start(path, false); }
+		bool LoopSound(const std::string& path) { return Start(path, true); }
+		void StopSound() { playback.reset(); }
+		void UpdateSound(const Object* listener);
+	};
+
 	class Animator : public Component {
 		public:
 			float blendDuration = 0.15f;
+			float speed = 1.0f;
 			bool Default(const std::string& path);
 			bool PlayAnimation(const std::string& path, float duration = -1.0f);
 			bool LoopAnimation(const std::string& path, float duration = -1.0f);
@@ -1347,6 +1402,7 @@ namespace Sapphire {
 	class Scene {
 		public:
 			Camera* activeCamera = nullptr;
+			Object* soundListener = nullptr;
 			Vector3 gravity{0.0f, 0.0f, -9.81f};
 			int cellSize = 20;
 			bool worldPartition = true;
@@ -1434,11 +1490,83 @@ namespace Sapphire {
 			WorldPartitioner worldPartitioner;
 	};
 
+	bool SoundEmitter::Start(const std::string& path, bool loop) {
+		if (playback && loop) {
+			SDL_LockAudioStream(playback->stream);
+			const bool same = playback->looping && !playback->finished && playback->path == path;
+			SDL_UnlockAudioStream(playback->stream);
+			if (same) return true;
+		}
+		if (!Audio::device) { SDL_Log("Audio device is not initialized"); return false; }
+		SDL_AudioSpec source{};
+		Uint8* data = nullptr;
+		Uint32 length = 0;
+		std::filesystem::path resolved(path);
+		if (!SDL_LoadWAV(resolved.string().c_str(), &source, &data, &length)) {
+			const char* base = SDL_GetBasePath();
+			if (!resolved.is_relative() || !base || !SDL_LoadWAV((std::filesystem::path(base) / ".." / "resources" / resolved).string().c_str(), &source, &data, &length)) {
+				SDL_Log("Could not load sound %s: %s", path.c_str(), SDL_GetError());
+				return false;
+			}
+		}
+		auto next = std::make_unique<Playback>();
+		SDL_AudioSpec format{SDL_AUDIO_F32, 2, 48000};
+		Uint8* converted = nullptr;
+		int convertedLength = 0;
+		bool ok = length <= static_cast<Uint32>(std::numeric_limits<int>::max()) && SDL_ConvertAudioSamples(&source, data, static_cast<int>(length), &format, &converted, &convertedLength);
+		SDL_free(data);
+		if (!ok || convertedLength < 8) { SDL_free(converted); SDL_Log("Could not convert sound %s: %s", path.c_str(), SDL_GetError()); return false; }
+		const float* samples = reinterpret_cast<const float*>(converted);
+		next->stereo.assign(samples, samples + convertedLength / sizeof(float));
+		SDL_free(converted);
+		next->mono.resize(next->stereo.size() / 2);
+		for (std::size_t i = 0; i < next->mono.size(); ++i) next->mono[i] = (next->stereo[i * 2] + next->stereo[i * 2 + 1]) * 0.5f;
+		next->looping = loop;
+		next->path = path;
+		next->stream = SDL_CreateAudioStream(&format, nullptr);
+		if (!next->stream || !SDL_SetAudioStreamFrequencyRatio(next->stream, std::isfinite(speed) ? std::clamp(speed, 0.01f, 100.0f) : 1.0f) || !SDL_SetAudioStreamGetCallback(next->stream, Supply, next.get()) || !SDL_BindAudioStream(Audio::device, next->stream)) {
+			SDL_Log("Could not start sound %s: %s", path.c_str(), SDL_GetError());
+			return false;
+		}
+		playback = std::move(next);
+		const Object* listener = nullptr;
+		if (owner && owner->scene) {
+			auto& objects = owner->scene->Objects();
+			for (const auto& object : objects) if (object.get() == owner->scene->soundListener) { listener = object.get(); break; }
+		}
+		UpdateSound(listener);
+		return true;
+	}
+
+	void SoundEmitter::UpdateSound(const Object* listener) {
+		if (!playback) return;
+		SDL_SetAudioStreamFrequencyRatio(playback->stream, std::isfinite(speed) ? std::clamp(speed, 0.01f, 100.0f) : 1.0f);
+		float gain = std::isfinite(volume) ? std::clamp(volume, 0.0f, 1.0f) : 0.0f;
+		float pan = 0.0f;
+		const bool positional = range > 0.0f;
+		if (positional) {
+			if (!listener || !owner) gain = 0.0f;
+			else {
+				const Vector3 offset = Math::Subtract(owner->transform.position, listener->transform.position);
+				const float distance = std::sqrt(Math::Dot(offset, offset));
+				gain *= std::clamp(1.0f - distance / range, 0.0f, 1.0f);
+				Vector3 axes[3];
+				Math::GetAxes(listener->transform, axes);
+				if (distance > 0.0001f) pan = std::clamp(Math::Dot(offset, axes[0]) / distance, -1.0f, 1.0f);
+			}
+		}
+		SDL_LockAudioStream(playback->stream);
+		playback->positional = positional;
+		playback->left = gain * (pan > 0.0f ? 1.0f - pan : 1.0f);
+		playback->right = gain * (pan < 0.0f ? 1.0f + pan : 1.0f);
+		SDL_UnlockAudioStream(playback->stream);
+	}
+
 	namespace Graphics::Shaders {
 		extern const std::string particleVertexModifierSource;
 	}
 
-	class ParticleEmitter : public Object {
+	class ParticleSystem : public Object {
 		struct Particle {
 			Vector3 velocity;
 			float age = 0.0f;
@@ -1958,7 +2086,8 @@ namespace Sapphire {
 		if (!skeleton || found == clips.end() || found->second.boneCount != skeleton->bones.size()) return;
 		const AnimationClip& clip = found->second;
 		const double duration = static_cast<double>(clip.frameCount - 1) / clip.sampleRate;
-		const double step = std::isfinite(deltaTime) ? std::max(0.0f, deltaTime) : 0.0;
+		const double playbackSpeed = std::isfinite(speed) ? std::max(0.0f, speed) : 1.0;
+		const double step = std::isfinite(deltaTime) ? std::max(0.0f, deltaTime) * playbackSpeed : 0.0;
 		const bool finished = !looping && time + step >= duration;
 		const double used = finished && !defaultPath.empty() ? std::max(0.0, duration - time) : step;
 		time = !looping ? std::min(time + used, duration) : time + used;
@@ -1977,7 +2106,7 @@ namespace Sapphire {
 		skeleton->MarkPoseDirty();
 		if (finished) {
 			if (!defaultPath.empty()) {
-				if (Start(defaultPath, true, -1.0f)) Update(static_cast<float>(step - used));
+				if (Start(defaultPath, true, -1.0f)) Update(playbackSpeed > 0.0 ? static_cast<float>((step - used) / playbackSpeed) : 0.0f);
 				else { currentPath.clear(); blendFrom.clear(); }
 			}
 			else if (blend >= 1.0f) { currentPath.clear(); blendFrom.clear(); }
